@@ -1,37 +1,3 @@
 # ai-reliability-platform
 
-整个平台
-
-Alert
-
-↓
-
-Gateway
-
-↓
-
-Event
-
-↓
-
-Collector
-
-↓
-
-Skills
-
-↓
-
-Workflow
-
-↓
-
-LLM
-
-↓
-
-Decision
-
-↓
-
-Healing
+一个基于 Multi-Agent + MCP + Workflow Engine 的 AI Reliability Platform，支持告警降噪、根因分析、自动治愈、AI Observability。
