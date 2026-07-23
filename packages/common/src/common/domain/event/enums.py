@@ -59,3 +59,36 @@ class SignalStatus(StrEnum):
     FIRING = "firing"
     RECOVERING = "recovering"
     RESOLVED = "resolved"
+
+class ResourceKind(StrEnum):
+    """Type of monitored resource."""
+
+    POD = "pod"
+
+    NODE = "node"
+
+    DEPLOYMENT = "deployment"
+
+    SERVICE = "service"
+
+    NAMESPACE = "namespace"
+
+    CONTAINER = "container"
+
+    HOST = "host"
+
+    VM = "vm"
+
+    DATABASE = "database"
+
+    REDIS = "redis"
+
+    MYSQL = "mysql"
+
+    POSTGRESQL = "postgresql"
+
+    ELASTICSEARCH = "elasticsearch"
+
+    KAFKA = "kafka"
+
+    CUSTOM = "custom"
