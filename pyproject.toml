@@ -1,0 +1,42 @@
+#为什么这样写？
+#增加依赖：uv add httpx
+#开发依赖：开发依赖：
+[project]
+name = "ai-reliability-platform"
+version = "0.1.0"
+description = "Enterprise AI Reliability Platform"
+readme = "README.md"
+requires-python = ">=3.12"
+
+dependencies = [
+    "fastapi>=0.116.0",
+    "uvicorn[standard]>=0.35.0",
+    "pydantic>=2.11.0",
+    "pydantic-settings>=2.10.0",
+    "python-json-logger>=3.3.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.0",
+    "ruff>=0.12.0",
+    "mypy>=1.17.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "I",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
