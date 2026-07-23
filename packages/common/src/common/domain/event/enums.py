@@ -42,3 +42,20 @@ class EventSource(StrEnum):
     DATADOG = "datadog"
     ELK = "elk"
     CUSTOM = "custom"
+
+class SignalType(StrEnum):
+    """Type of monitoring signal."""
+
+    ALERT = "alert"
+    METRIC = "metric"
+    LOG = "log"
+    TRACE = "trace"
+    EVENT = "event"
+
+
+class SignalStatus(StrEnum):
+    """Current status of a signal."""
+
+    FIRING = "firing"
+    RECOVERING = "recovering"
+    RESOLVED = "resolved"
