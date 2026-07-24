@@ -32,6 +32,30 @@ class HealingAgent(BaseAgent):
     Auto healing suggestion agent.
     """
 
+    @property
+    def agent_type(self):
+
+        return "remediation"
+
+
+
+    @property
+    def depends_on(self):
+
+        return [
+            "root_cause"
+        ]
+
+
+
+    @property
+    def provides(self):
+
+        return [
+            "remediation_plan"
+        ]
+
+
 
     def __init__(
         self,
@@ -41,10 +65,12 @@ class HealingAgent(BaseAgent):
         self.llm_client = llm_client
 
 
+
     @property
     def name(self) -> str:
 
         return "healing"
+
 
 
     async def run(
@@ -53,21 +79,56 @@ class HealingAgent(BaseAgent):
     ) -> AgentResult:
 
 
+        #
+        # Get RCA result
+        #
+
+        rca_result = context.variables.get(
+            "rca",
+            {},
+        )
+
+
+
+        #
+        # Build healing prompt
+        #
+
         prompt = build_healing_prompt(
             context.event,
+            rca_result,
         )
+
 
 
         response = await self.llm_client.chat(
             ChatRequest(
+
                 system_prompt=(
                     "You are an SRE healing assistant."
                 ),
+
                 user_prompt=prompt,
+
             )
         )
 
 
-        return parse_healing_result(
+
+        result = parse_healing_result(
             response.content,
         )
+
+
+
+        #
+        # Save healing result
+        #
+
+        context.variables[
+            "healing"
+        ] = result.data
+
+
+
+        return result

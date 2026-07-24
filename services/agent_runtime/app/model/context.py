@@ -20,6 +20,19 @@ from services.agent_runtime.app.tools.manager import (
     ToolManager,
 )
 
+from services.agent_runtime.app.skills.registry.skill_registry import (
+    SkillRegistry,
+)
+
+from services.agent_runtime.app.observability.execution import (
+    AgentExecutionRecord,
+)
+
+from services.agent_runtime.app.evaluation.models import (
+    EvaluationResult,
+)
+
+
 
 class AgentContext(BaseModel):
 
@@ -55,3 +68,16 @@ class AgentContext(BaseModel):
 
 
     tools: ToolManager | None = None
+
+
+    skills: SkillRegistry | None = None
+
+
+    executions: list[AgentExecutionRecord] = Field(
+        default_factory=list
+    )
+
+
+    evaluations: list[EvaluationResult] = Field(
+        default_factory=list
+    )

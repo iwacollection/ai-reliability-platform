@@ -9,9 +9,10 @@ from services.agent_runtime.app.model.result import (
 )
 
 
+
 class ActionPlanner:
     """
-    Convert AgentResult to ActionPlan.
+    Convert healing result into execution plan.
     """
 
 
@@ -21,32 +22,68 @@ class ActionPlanner:
     ) -> ActionPlan:
 
 
-        action = result.data.get(
-            "action",
-            "none",
+        action = (
+            result.data
+            .get(
+                "action",
+                "none"
+            )
         )
 
 
-        target = result.data.get(
-            "target",
-            "unknown",
+        target = (
+            result.data
+            .get(
+                "target",
+                "unknown"
+            )
+        )
+
+
+        risk = (
+            result.data
+            .get(
+                "risk",
+                "medium"
+            )
         )
 
 
         try:
 
-            action_type = ActionType(
-                action
+            action_type = (
+                ActionType(action)
             )
 
         except ValueError:
 
-            action_type = ActionType.NONE
+            action_type = (
+                ActionType.NONE
+            )
 
 
 
         return ActionPlan(
+
             type=action_type,
+
             target=target,
-            risk=ActionRisk.MEDIUM,
+
+            risk=ActionRisk(risk),
+
+            approved=False,
+
+            metadata={
+                "reason":
+                result.data.get(
+                    "reason",
+                    ""
+                ),
+
+                "approval_required":
+                result.data.get(
+                    "approval_required",
+                    True,
+                ),
+            },
         )

@@ -1,33 +1,19 @@
 from services.agent_runtime.app.action.models import (
     ActionPlan,
+    ActionType,
 )
 
 from services.agent_runtime.app.action.executor import (
     BaseExecutor,
 )
 
-from services.agent_runtime.app.tools.manager import (
-    ToolManager,
-)
-
-
 
 class MockExecutor(BaseExecutor):
     """
-    Executor using Tool framework.
+    Fake remediation executor.
 
-    Current mode:
-    Kubernetes dry-run.
+    Simulate Kubernetes / ArgoCD operations.
     """
-
-
-    def __init__(
-        self,
-        tool_manager: ToolManager,
-    ) -> None:
-
-        self.tool_manager = tool_manager
-
 
 
     async def execute(
@@ -36,24 +22,81 @@ class MockExecutor(BaseExecutor):
     ) -> dict:
 
 
-        if action.type.value == "restart_pod":
+        if action.type == ActionType.RESTART_POD:
+
+            return {
+                "success": True,
+                "mode": "dry_run",
+                "action": "restart_pod",
+                "resource": "pod",
+                "target": action.target,
+                "message": (
+                    "Pod restart simulated"
+                ),
+            }
 
 
-            result = await self.tool_manager.call(
-                "kubernetes",
-                action="restart",
-                resource="pod",
-                target=action.target,
-            )
+
+        elif action.type == ActionType.INCREASE_MEMORY_LIMIT:
+
+            return {
+                "success": True,
+                "mode": "dry_run",
+                "action": (
+                    "increase_memory_limit"
+                ),
+                "resource": "deployment",
+                "target": action.target,
+                "message": (
+                    "Deployment resource "
+                    "limit update simulated"
+                ),
+                "next_step": (
+                    "ArgoCD sync required"
+                ),
+            }
 
 
-            return result
+
+        elif action.type == ActionType.ROLLBACK_APPLICATION:
+
+            return {
+                "success": True,
+                "mode": "dry_run",
+                "action": (
+                    "rollback_application"
+                ),
+                "resource": "application",
+                "target": action.target,
+                "message": (
+                    "ArgoCD rollback simulated"
+                ),
+            }
 
 
 
-        return {
-            "success": False,
-            "message": (
-                "Unsupported action"
-            ),
-        }
+        elif action.type == ActionType.SCALE_WORKLOAD:
+
+            return {
+                "success": True,
+                "mode": "dry_run",
+                "action": (
+                    "scale_workload"
+                ),
+                "resource": "deployment",
+                "target": action.target,
+                "message": (
+                    "Scaling operation simulated"
+                ),
+            }
+
+
+
+        else:
+
+            return {
+                "success": False,
+                "message": (
+                    "Unsupported action"
+                ),
+            }

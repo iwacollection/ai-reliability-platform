@@ -30,7 +30,36 @@ from services.agent_runtime.app.agents.rca.parser import (
 class RCAAgent(BaseAgent):
     """
     Root cause analysis agent.
+
+    Analyze incident based on alert
+    and collected evidence.
     """
+
+
+    @property
+    def agent_type(self):
+
+        return "analysis"
+
+
+
+    @property
+    def depends_on(self):
+
+        return [
+            "kubernetes_evidence",
+            "deployment_change",
+        ]
+
+
+
+    @property
+    def provides(self):
+
+        return [
+            "root_cause"
+        ]
+
 
 
     def __init__(
@@ -41,10 +70,14 @@ class RCAAgent(BaseAgent):
         self.llm_client = llm_client
 
 
+
     @property
-    def name(self) -> str:
+    def name(
+        self,
+    ) -> str:
 
         return "rca"
+
 
 
     async def run(
@@ -53,31 +86,107 @@ class RCAAgent(BaseAgent):
     ) -> AgentResult:
 
 
-        metrics = {}
+        #
+        # Collect evidence
+        #
+
+        evidence = []
 
 
-        if context.tools:
+        kubernetes_evidence = context.variables.get(
+            "evidence",
+            [],
+        )
 
-            metrics = await context.tools.call(
-                "prometheus",
-                query="service_health",
+
+        deployment_change = context.variables.get(
+            "deployment_change",
+        )
+
+
+        evidence.extend(
+            kubernetes_evidence
+        )
+
+
+        if deployment_change:
+
+            evidence.append(
+                deployment_change
             )
 
 
+
+        #
+        # Load historical memory
+        #
+
+        history = None
+
+
+        if context.memory:
+
+
+            service = (
+                context
+                .event
+                .resources[0]
+                .name
+            )
+
+
+            memory_key = (
+                f"incident:{service}:"
+                f"{context.event.signal.name}"
+            )
+
+
+            history = await context.memory.get(
+                memory_key
+            )
+
+
+
+        if history:
+
+            print()
+
+            print(
+                "Historical Memory"
+            )
+
+            print(
+                history
+            )
+
+
+
+        #
+        # Build RCA prompt
+        # Include memory
+        #
+
         prompt = build_rca_prompt(
             context.event,
-            metrics,
+            evidence,
+            history,
         )
+
 
 
         response = await self.llm_client.chat(
             ChatRequest(
+
                 system_prompt=(
-                    "You are an SRE RCA assistant."
+                    "You are an SRE RCA assistant. "
+                    "Analyze incidents using evidence "
+                    "and historical incidents."
                 ),
+
                 user_prompt=prompt,
             )
         )
+
 
 
         result = parse_rca_result(
@@ -85,10 +194,43 @@ class RCAAgent(BaseAgent):
         )
 
 
-        # 保存观测数据
+
+        #
+        # Save current RCA result
+        #
+
         context.variables[
-            "rca_metrics"
-        ] = metrics
+            "rca"
+        ] = result.data
+
+
+
+        #
+        # Save to memory
+        #
+
+        if context.memory:
+
+
+            service = (
+                context
+                .event
+                .resources[0]
+                .name
+            )
+
+
+            memory_key = (
+                f"incident:{service}:"
+                f"{context.event.signal.name}"
+            )
+
+
+            await context.memory.save(
+                memory_key,
+                result.data,
+            )
+
 
 
         return result

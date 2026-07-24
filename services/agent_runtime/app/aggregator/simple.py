@@ -1,42 +1,56 @@
-from services.agent_runtime.app.aggregator.base import (
-    BaseAggregator,
-)
-
 from services.agent_runtime.app.model.result import (
     AgentResult,
 )
 
 
-class SimpleAggregator(BaseAggregator):
+class SimpleAggregator:
     """
-    Simple result aggregator.
+    Aggregate agent results.
     """
 
 
     def aggregate(
         self,
         results: list[AgentResult],
-    ) -> dict:
+    ):
 
-        if not results:
+        priority = [
+            "healing",
+            "rca",
+            "diagnosis",
+            "noise",
+        ]
 
-            return {
-                "incident": False,
-                "confidence": 0,
-            }
+
+        result_map = {
+            r.agent: r
+            for r in results
+        }
 
 
-        best = max(
-            results,
-            key=lambda x: x.score,
-        )
+        for name in priority:
+
+            if name in result_map:
+
+                result = result_map[name]
+
+                return {
+                    "incident": (
+                        result.success
+                    ),
+
+                    "confidence": (
+                        result.score
+                    ),
+
+                    "source_agent": (
+                        result.agent
+                    )
+                }
 
 
         return {
-            "incident": (
-                best.message
-                == "Real Alert"
-            ),
-            "confidence": best.score,
-            "source_agent": best.agent,
+            "incident": False,
+            "confidence": 0,
+            "source_agent": "none",
         }

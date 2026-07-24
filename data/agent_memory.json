@@ -1,0 +1,13 @@
+{
+  "incident:payment-api:PodHighCPU": {
+    "root_cause": "Deployment configuration change increased memory usage and caused container OOMKilled.",
+    "confidence": 0.96,
+    "evidence": [
+      "pod_status=CrashLoopBackOff",
+      "restart_count=15",
+      "reason=OOMKilled",
+      "deployment revision changed",
+      "memory configuration changed"
+    ]
+  }
+}

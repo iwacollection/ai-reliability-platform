@@ -1,6 +1,6 @@
-from __future__ import annotations
-
-from services.agent_runtime.app.agent.base import BaseAgent
+from services.agent_runtime.app.agent.base import (
+    BaseAgent,
+)
 
 
 class AgentRegistry:
@@ -8,9 +8,16 @@ class AgentRegistry:
     Registry for all agents.
     """
 
-    def __init__(self) -> None:
 
-        self._agents: dict[str, BaseAgent] = {}
+    def __init__(
+        self,
+    ) -> None:
+
+        self._agents: dict[
+            str,
+            BaseAgent
+        ] = {}
+
 
 
     def register(
@@ -23,17 +30,14 @@ class AgentRegistry:
         ] = agent
 
 
+
     def get(
         self,
         name: str,
     ) -> BaseAgent:
 
-        if name not in self._agents:
-            raise KeyError(
-                f"Agent '{name}' not found."
-            )
-
         return self._agents[name]
+
 
 
     def list_agents(
@@ -45,6 +49,7 @@ class AgentRegistry:
         )
 
 
+
     def names(
         self,
     ) -> list[str]:
@@ -52,3 +57,32 @@ class AgentRegistry:
         return list(
             self._agents.keys()
         )
+
+
+
+    def metadata(
+        self,
+        name: str,
+    ) -> dict:
+
+        agent = self.get(
+            name
+        )
+
+        return agent.metadata()
+
+
+
+    def all_metadata(
+        self,
+    ) -> dict[str, dict]:
+
+        result = {}
+
+        for name in self.names():
+
+            result[name] = self.metadata(
+                name
+            )
+
+        return result

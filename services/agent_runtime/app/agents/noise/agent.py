@@ -18,6 +18,25 @@ class NoiseAgent(BaseAgent):
     Noise detection agent.
     """
 
+    @property
+    def agent_type(self):
+
+        return "general"
+
+
+    @property
+    def depends_on(self):
+
+        return []
+
+
+    @property
+    def provides(self):
+
+        return [
+            "alert_classification"
+        ]
+
     def __init__(
         self,
         llm_client: LLMClient,

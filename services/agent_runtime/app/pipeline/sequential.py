@@ -39,6 +39,11 @@ class SequentialPipeline(BasePipeline):
 
         for agent in self.registry.list_agents():
 
+            print(
+                "EXECUTE AGENT:",
+                agent.name
+            )
+
             start = time.perf_counter()
 
             try:

@@ -1,23 +1,98 @@
-from common.domain.event import StandardEvent
+from common.domain.event import (
+    StandardEvent,
+)
 
 
 def build_rca_prompt(
     event: StandardEvent,
-    metrics: dict,
+    evidence: list,
+    history: dict | None = None,
 ) -> str:
     """
-    Build RCA prompt with observability data.
+    Build RCA analysis prompt.
     """
+
+
+    resource = (
+        event.resources[0].name
+        if event.resources
+        else "unknown"
+    )
+
+
+    evidence_text = ""
+
+
+    for item in evidence:
+
+        source = item.get(
+            "source",
+            "unknown",
+        )
+
+        resource_name = item.get(
+            "resource",
+            "unknown",
+        )
+
+        facts = item.get(
+            "facts",
+            [],
+        )
+
+
+        evidence_text += f"""
+
+Source:
+{source}
+
+Resource:
+{resource_name}
+
+Facts:
+"""
+
+
+        for fact in facts:
+
+            evidence_text += f"- {fact}\n"
+
+
+
+    #
+    # Historical memory
+    #
+
+    history_text = ""
+
+
+    if history:
+
+        history_text = f"""
+
+Historical Similar Incident:
+
+{history}
+
+
+Use this historical incident as reference.
+Do not blindly copy it.
+Combine it with current evidence.
+
+
+"""
+
 
 
     return f"""
 You are an SRE root cause analysis assistant.
 
-Analyze this alert using the provided metrics.
+Analyze this production incident.
 
 
 Alert:
 
+Name:
 {event.signal.name}
 
 
@@ -28,15 +103,25 @@ Message:
 
 Resource:
 
-{event.resources[0].name if event.resources else "unknown"}
+{resource}
 
 
-Observability Metrics:
-
-{metrics}
+Collected Evidence:
 
 
-Analyze the possible root cause.
+{evidence_text}
+
+
+
+{history_text}
+
+
+Analyze:
+
+1. What is the root cause?
+2. Which evidence supports the conclusion?
+3. Give confidence score.
+
 
 
 Return JSON only:
@@ -44,6 +129,8 @@ Return JSON only:
 
 {{
     "root_cause": "",
-    "confidence": 0.0
+    "confidence": 0.0,
+    "evidence": []
 }}
+
 """

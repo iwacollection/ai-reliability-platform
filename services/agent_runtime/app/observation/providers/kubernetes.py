@@ -8,7 +8,6 @@ from services.agent_runtime.app.observation.models import (
 )
 
 
-
 class KubernetesProvider(
     BaseObservationProvider
 ):
@@ -27,6 +26,14 @@ class KubernetesProvider(
     ) -> ObservationResult:
 
 
+        namespace = (
+            request.parameters.get(
+                "namespace",
+                "default",
+            )
+        )
+
+
         return ObservationResult(
 
             source=self.name,
@@ -35,19 +42,28 @@ class KubernetesProvider(
 
             data={
 
-                "pod":
-                request.resource,
+                "namespace": namespace,
 
-                "status":
-                "CrashLoopBackOff",
+                "pod": request.resource,
 
-                "restart_count":
-                15,
+                "status": "CrashLoopBackOff",
 
-                "last_reason":
-                "OOMKilled",
+                "containers": [
+
+                    {
+
+                        "name": request.resource,
+
+                        "restart_count": 15,
+
+                        "reason": "OOMKilled",
+
+                    }
+
+                ],
 
             },
 
             message="mock kubernetes response"
+
         )
