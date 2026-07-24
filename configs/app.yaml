@@ -1,0 +1,12 @@
+app:
+  name: AI Reliability Platform
+  version: 0.1.0
+
+llm:
+  provider: mock
+  temperature: 0.0
+  timeout: 30
+
+runtime:
+  pipeline: sequential
+  max_workers: 4

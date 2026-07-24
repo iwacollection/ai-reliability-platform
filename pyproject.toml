@@ -14,6 +14,7 @@ dependencies = [
     "pydantic>=2.11.0",
     "pydantic-settings>=2.10.0",
     "python-json-logger>=3.3.0",
+    "pyyaml>=6.0.3",
 ]
 
 [dependency-groups]
@@ -35,6 +36,10 @@ select = [
 ]
 
 [tool.pytest.ini_options]
+pythonpath = [
+    ".",
+    "packages/common/src"
+]
 testpaths = ["tests"]
 
 [tool.mypy]
