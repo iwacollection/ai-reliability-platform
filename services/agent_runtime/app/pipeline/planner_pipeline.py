@@ -35,6 +35,11 @@ from services.agent_runtime.app.evaluation.registry import (
     EvaluationRegistry,
 )
 
+from services.agent_runtime.app.llm.context import (
+    set_llm_context,
+    clear_llm_context,
+)
+
 
 
 class PlannerPipeline(BasePipeline):
@@ -53,11 +58,8 @@ class PlannerPipeline(BasePipeline):
     ) -> None:
 
         self.registry = registry
-
         self.planner = planner
-
         self.tracer = tracer
-
         self.evaluators = evaluators
 
 
@@ -73,17 +75,15 @@ class PlannerPipeline(BasePipeline):
         )
 
 
-        results = []
+        results: list[AgentResult] = []
 
 
 
         for agent_name in order:
 
 
-            agent = (
-                self.registry.get(
-                    agent_name
-                )
+            agent = self.registry.get(
+                agent_name
             )
 
 
@@ -100,39 +100,88 @@ class PlannerPipeline(BasePipeline):
 
 
 
+            agent_trace_id = str(
+                uuid.uuid4()
+            )
+
+
+            input_data = {
+
+                "event":
+                    context.event.signal.name,
+
+
+                "severity":
+                    str(
+                        context.event.signal.severity
+                    ),
+
+
+                "resources":[
+
+                    resource.name
+
+                    for resource
+
+                    in context.event.resources
+
+                ],
+
+            }
+
+
+
             trace = self.tracer.start(
 
                 agent=agent.name,
 
-                trace_id=str(
-                    uuid.uuid4()
-                ),
+                trace_id=agent_trace_id,
 
-                input_data={
-
-                    "event":
-                    context.event.signal.name
-
-                },
+                input_data=input_data,
 
             )
+
+
+            context.trace = trace
 
 
 
             execution_record = AgentExecutionRecord(
 
+
+                request_id=context.request_id,
+
+
+                event_id=str(
+                    context.event.header.event_id
+                ),
+
+
+                trace_id=agent_trace_id,
+
+
                 agent=agent.name,
 
-                input_data={
 
-                    "event":
-                    context.event.signal.name
+                input_data=input_data,
 
-                },
 
                 start_time=datetime.now(
                     UTC
                 ),
+
+            )
+
+
+
+            #
+            # Bind LLM observability context
+            #
+            set_llm_context(
+
+                execution_record.metadata,
+
+                trace,
 
             )
 
@@ -194,6 +243,7 @@ class PlannerPipeline(BasePipeline):
             execution_record.end_time = end_time
 
 
+
             execution_record.duration_ms = round(
 
                 (
@@ -214,7 +264,9 @@ class PlannerPipeline(BasePipeline):
 
             execution_time = round(
 
-                time.perf_counter() - start,
+                time.perf_counter()
+                -
+                start,
 
                 4,
 
@@ -223,22 +275,30 @@ class PlannerPipeline(BasePipeline):
 
 
             result.data[
-
                 "execution_time"
-
             ] = execution_time
 
 
 
             execution_record.output_data = (
-                result.data
+                result.model_dump()
             )
 
 
 
-            #
-            # Skill / Tool attribution
-            #
+            llm_calls = execution_record.metadata.get(
+                "llm_calls",
+                [],
+            )
+
+
+            if llm_calls:
+
+                execution_record.llm_calls = len(
+                    llm_calls
+                )
+
+
 
             skill_calls = context.metadata.get(
                 "current_skill_calls",
@@ -253,10 +313,6 @@ class PlannerPipeline(BasePipeline):
                 )
 
 
-
-            #
-            # Memory attribution
-            #
 
             if agent.name == "rca":
 
@@ -282,12 +338,8 @@ class PlannerPipeline(BasePipeline):
                 if context.memory:
 
 
-                    memory_data = await (
-
-                        context.memory.get(
-                            memory_key
-                        )
-
+                    memory_data = await context.memory.get(
+                        memory_key
                     )
 
 
@@ -303,19 +355,11 @@ class PlannerPipeline(BasePipeline):
 
 
 
-            #
-            # Save execution record
-            #
-
             context.executions.append(
                 execution_record
             )
 
 
-
-            #
-            # Evaluation
-            #
 
             for evaluator in self.evaluators.list():
 
@@ -351,15 +395,17 @@ class PlannerPipeline(BasePipeline):
 
 
 
+            clear_llm_context()
+
+
+
             results.append(
                 result
             )
 
 
             context.results[
-
                 agent.name
-
             ] = result.model_dump()
 
 

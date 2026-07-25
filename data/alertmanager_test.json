@@ -1,0 +1,19 @@
+{
+  "receiver": "default",
+  "status": "firing",
+  "alerts": [
+    {
+      "status": "firing",
+      "labels": {
+        "alertname": "PodHighCPU",
+        "severity": "critical",
+        "namespace": "payment",
+        "pod": "payment-api"
+      },
+      "annotations": {
+        "summary": "CPU usage > 90%"
+      },
+      "startsAt": "2026-07-25T14:00:00Z"
+    }
+  ]
+}

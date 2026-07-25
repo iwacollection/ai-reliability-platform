@@ -1,0 +1,19 @@
+{
+  "header": {
+    "schema_version": "v1",
+    "source": "alertmanager",
+    "occurred_at": "2026-07-25T14:00:00Z"
+  },
+  "signal": {
+    "type": "alert",
+    "name": "PodHighCPU",
+    "severity": "critical",
+    "message": "CPU > 90%"
+  },
+  "resources": [
+    {
+      "kind": "pod",
+      "name": "payment-api"
+    }
+  ]
+}

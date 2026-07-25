@@ -8,6 +8,7 @@ from pydantic import (
 
 from common.domain.event import StandardEvent
 
+
 from services.agent_runtime.app.memory.base import (
     BaseMemory,
 )
@@ -24,8 +25,16 @@ from services.agent_runtime.app.skills.registry.skill_registry import (
     SkillRegistry,
 )
 
+from services.agent_runtime.app.mcp.registry import (
+    MCPRegistry,
+)
+
 from services.agent_runtime.app.observability.execution import (
     AgentExecutionRecord,
+)
+
+from services.agent_runtime.app.observability.models import (
+    TraceEvent,
 )
 
 from services.agent_runtime.app.evaluation.models import (
@@ -41,7 +50,18 @@ class AgentContext(BaseModel):
     )
 
 
+    # =========================
+    # Request Trace Information
+    # =========================
+
+    request_id: str | None = None
+
+
+    trace: TraceEvent | None = None
+
+
     event: StandardEvent
+
 
 
     incident: IncidentState = Field(
@@ -49,9 +69,11 @@ class AgentContext(BaseModel):
     )
 
 
+
     variables: dict[str, Any] = Field(
         default_factory=dict
     )
+
 
 
     results: dict[str, Any] = Field(
@@ -59,23 +81,41 @@ class AgentContext(BaseModel):
     )
 
 
+
     metadata: dict[str, Any] = Field(
         default_factory=dict
     )
 
 
+
+    # =========================
+    # Runtime Components
+    # =========================
+
     memory: BaseMemory | None = None
+
 
 
     tools: ToolManager | None = None
 
 
+
     skills: SkillRegistry | None = None
 
+
+
+    mcp: MCPRegistry | None = None
+
+
+
+    # =========================
+    # Observability
+    # =========================
 
     executions: list[AgentExecutionRecord] = Field(
         default_factory=list
     )
+
 
 
     evaluations: list[EvaluationResult] = Field(

@@ -1,5 +1,25 @@
-from services.gateway.app.publisher.memory import MemoryPublisher
+from services.gateway.app.publisher.runtime import (
+    RuntimePublisher,
+)
+
+
+from services.gateway.app.publisher.memory import (
+    MemoryPublisher,
+)
+
 
 
 def create_publisher():
-    return MemoryPublisher()
+    """
+    Create event publisher.
+
+    Default:
+
+    Gateway
+        |
+        v
+    Agent Runtime
+    """
+
+
+    return RuntimePublisher()

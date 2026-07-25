@@ -2,7 +2,13 @@ from datetime import datetime, UTC
 
 from services.agent_runtime.app.observability.models import (
     TraceEvent,
+    TraceSpan,
 )
+
+from services.agent_runtime.app.observability.store import (
+    TraceStore,
+)
+
 
 
 class TraceCollector:
@@ -13,7 +19,7 @@ class TraceCollector:
 
     def __init__(self):
 
-        self._traces: list[TraceEvent] = []
+        self.store = TraceStore()
 
 
 
@@ -45,12 +51,102 @@ class TraceCollector:
         )
 
 
-        self._traces.append(
+        self.store.save(
             event
         )
 
 
         return event
+
+
+
+    def start_span(
+        self,
+        trace: TraceEvent,
+        span_type: str,
+        name: str,
+        input_data: dict | None = None,
+    ) -> TraceSpan:
+        """
+        Start child execution span.
+
+        Used for:
+        - tool
+        - skill
+        - llm
+        - mcp
+        """
+
+
+        span = TraceSpan(
+
+            type=span_type,
+
+            name=name,
+
+            start_time=datetime.now(
+                UTC
+            ),
+
+            input_data=(
+                input_data
+                or {}
+            ),
+
+        )
+
+
+        trace.spans.append(
+            span
+        )
+
+
+        return span
+
+
+
+    def finish_span(
+        self,
+        span: TraceSpan,
+        success: bool = True,
+        output_data: dict | None = None,
+        error: str | None = None,
+    ) -> None:
+        """
+        Finish child execution span.
+        """
+
+
+        end_time = datetime.now(
+            UTC
+        )
+
+
+        span.end_time = end_time
+
+
+        span.duration_ms = (
+
+            end_time
+
+            -
+
+            span.start_time
+
+        ).total_seconds() * 1000
+
+
+
+        span.success = success
+
+
+        span.output_data = (
+            output_data
+            or {}
+        )
+
+
+        span.error = error
 
 
 
@@ -76,10 +172,15 @@ class TraceCollector:
 
 
         trace.duration_ms = (
+
             end_time
+
             -
+
             trace.start_time
+
         ).total_seconds() * 1000
+
 
 
         trace.success = success
@@ -92,8 +193,11 @@ class TraceCollector:
 
 
         trace.output_data = (
+
             output_data
+
             or {}
+
         )
 
 
@@ -102,4 +206,4 @@ class TraceCollector:
         self,
     ) -> list[TraceEvent]:
 
-        return self._traces
+        return self.store.list()

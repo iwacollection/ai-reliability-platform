@@ -22,6 +22,10 @@ from services.agent_runtime.app.llm.client import (
     LLMClient,
 )
 
+from services.agent_runtime.app.llm.observed_client import (
+    ObservedLLMClient,
+)
+
 from services.agent_runtime.app.llm.provider_factory import (
     create_llm_provider,
 )
@@ -45,6 +49,7 @@ def create_agent_registry() -> AgentRegistry:
     registry = AgentRegistry()
 
 
+
     # =========================
     # LLM Dependency
     # =========================
@@ -52,9 +57,16 @@ def create_agent_registry() -> AgentRegistry:
     provider = create_llm_provider()
 
 
-    llm_client = LLMClient(
+
+    base_llm_client = LLMClient(
         provider,
     )
+
+
+    llm_client = ObservedLLMClient(
+        base_llm_client,
+    )
+
 
 
     # =========================
@@ -64,6 +76,7 @@ def create_agent_registry() -> AgentRegistry:
     observation_manager = (
         create_observation_manager()
     )
+
 
 
     # =========================
@@ -77,11 +90,13 @@ def create_agent_registry() -> AgentRegistry:
     )
 
 
+
     registry.register(
         DiagnosisAgent(
             observation_manager,
         )
     )
+
 
 
     registry.register(
@@ -91,14 +106,18 @@ def create_agent_registry() -> AgentRegistry:
     )
 
 
+
     registry.register(
         HealingAgent(
             llm_client,
         )
     )
 
+
+
     registry.register(
         ChangeAgent()
     )
+
 
     return registry

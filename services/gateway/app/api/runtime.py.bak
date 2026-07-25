@@ -1,0 +1,108 @@
+from fastapi import APIRouter, Body
+
+from common.domain.event import StandardEvent
+
+from services.agent_runtime.app.model.context import (
+    AgentContext,
+)
+
+from services.agent_runtime.app.runtime.runtime import (
+    AgentRuntime,
+)
+
+
+router = APIRouter()
+
+
+runtime = AgentRuntime()
+
+
+
+@router.post(
+    "/execute",
+    summary="Execute Agent Runtime",
+)
+async def execute_runtime(
+    payload: dict = Body(...),
+):
+    """
+    Execute Agent Runtime pipeline.
+
+    Flow:
+
+    StandardEvent
+        |
+        v
+    AgentContext
+        |
+        v
+    PlannerPipeline
+        |
+        v
+    Agents
+    """
+
+
+    event = StandardEvent.model_validate(
+        payload
+    )
+
+
+    context = AgentContext(
+
+        event=event,
+
+        memory=runtime.memory,
+
+        tools=runtime.tools,
+
+        skills=runtime.skills,
+
+    )
+
+
+    results = await runtime.pipeline.execute(
+        context
+    )
+
+
+    return {
+
+        "success": True,
+
+
+        "results": [
+
+            result.model_dump()
+
+            for result in results
+
+        ],
+
+
+        "executions": [
+
+            execution.model_dump()
+
+            for execution in context.executions
+
+        ],
+
+
+        "evaluations": [
+
+            evaluation.model_dump()
+
+            for evaluation in context.evaluations
+
+        ],
+
+        "traces": [
+
+            trace.model_dump()
+
+            for trace in runtime.tracer.list()
+
+        ],
+
+    }

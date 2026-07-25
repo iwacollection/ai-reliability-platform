@@ -1,0 +1,41 @@
+{
+  "header": {
+    "event_id": "65182c67-31b9-4dbf-837a-2d4cb422594b",
+    "trace_id": "d60039c7-beec-40bc-8f5d-da6fbdaa787a",
+    "correlation_id": null,
+    "schema_version": "v1",
+    "source": "alertmanager",
+    "occurred_at": "2026-07-25T14:40:39.580501Z",
+    "received_at": "2026-07-25T14:40:39.580501Z"
+  },
+  "signal": {
+    "id": "0302f919-8141-44d7-a0cc-ee313f652a8c",
+    "type": "alert",
+    "name": "PodHighCPU",
+    "message": "CPU usage > 90%",
+    "severity": "critical",
+    "status": "firing",
+    "value": null,
+    "threshold": null,
+    "unit": null,
+    "labels": {
+      "alertname": "PodHighCPU",
+      "severity": "critical",
+      "namespace": "payment",
+      "pod": "payment-api"
+    },
+    "metadata": {}
+  },
+  "resources": [
+    {
+      "id": "e1319807-ac9e-4c51-9dc1-149882c50505",
+      "kind": "pod",
+      "name": "payment-api",
+      "namespace": "payment",
+      "cluster": null,
+      "region": null,
+      "labels": {},
+      "attributes": {}
+    }
+  ]
+}

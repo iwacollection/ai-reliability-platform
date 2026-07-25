@@ -27,6 +27,11 @@ from services.agent_runtime.app.runtime.runtime import (
 )
 
 
+from services.agent_runtime.app.runtime.action_runtime import (
+    ActionRuntime,
+)
+
+
 from services.agent_runtime.app.evaluation.scenario.models import (
     ScenarioDefinition,
 )
@@ -62,6 +67,7 @@ class ScenarioReplayEngine:
         Convert scenario definition
         into runtime event.
         """
+
 
         return StandardEvent(
 
@@ -123,9 +129,11 @@ class ScenarioReplayEngine:
         scenario: ScenarioDefinition,
     ):
 
+
         event = self.build_event(
             scenario
         )
+
 
 
         context = AgentContext(
@@ -141,9 +149,51 @@ class ScenarioReplayEngine:
         )
 
 
+
         results = await self.runtime.pipeline.execute(
             context
         )
+
+
+
+        action_result = None
+
+
+
+        #
+        # Execute healing workflow
+        #
+
+        healing_result = context.results.get(
+            "healing"
+        )
+
+
+
+        if healing_result:
+
+
+            action_runtime = ActionRuntime()
+
+
+
+            plan, execution = await action_runtime.execute(
+                healing_result
+            )
+
+
+
+            action_result = {
+
+                "plan":
+                plan.model_dump(),
+
+
+                "execution":
+                execution,
+
+            }
+
 
 
         return {
@@ -158,5 +208,9 @@ class ScenarioReplayEngine:
 
             "context":
             context,
+
+
+            "action":
+            action_result,
 
         }

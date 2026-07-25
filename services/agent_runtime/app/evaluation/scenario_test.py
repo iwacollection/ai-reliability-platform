@@ -152,6 +152,44 @@ async def main():
 
 
 
+        #
+        # Action / Policy Check
+        #
+
+        action_result = item.get(
+            "action"
+        )
+
+
+        if action_result:
+
+
+            print()
+
+            print(
+                "Action Plan"
+            )
+
+
+            print(
+                action_result["plan"]
+            )
+
+
+
+            print()
+
+            print(
+                "Execution Result"
+            )
+
+
+            print(
+                action_result["execution"]
+            )
+
+
+
 if __name__ == "__main__":
 
     asyncio.run(main())

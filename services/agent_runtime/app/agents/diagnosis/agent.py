@@ -1,3 +1,6 @@
+from datetime import UTC, datetime
+
+
 from services.agent_runtime.app.agent.base import (
     BaseAgent,
 )
@@ -20,6 +23,10 @@ from services.agent_runtime.app.observation.models import (
 
 from services.agent_runtime.app.observation.normalizer import (
     EvidenceNormalizer,
+)
+
+from services.agent_runtime.app.observability.models import (
+    TraceSpan,
 )
 
 
@@ -108,18 +115,125 @@ class DiagnosisAgent(BaseAgent):
             )
 
 
-            skill_result = await skill.execute(
 
-                {
-                    "resource": resource
-                }
-
-            )
+            skill_span = None
 
 
-            evidence.append(
-                skill_result
-            )
+
+            #
+            # Skill Trace
+            #
+
+            if context.trace:
+
+
+                skill_span = TraceSpan(
+
+                    type="skill",
+
+                    name=skill.name,
+
+                    start_time=datetime.now(
+                        UTC
+                    ),
+
+                    input_data={
+
+                        "resource":
+                        resource
+
+                    },
+
+                )
+
+
+                context.trace.spans.append(
+                    skill_span
+                )
+
+
+
+            try:
+
+
+                skill_result = await skill.execute(
+
+                    context,
+
+                    {
+                        "resource": resource
+                    }
+
+                )
+
+
+
+                if skill_span:
+
+
+                    skill_span.end_time = datetime.now(
+                        UTC
+                    )
+
+
+                    skill_span.duration_ms = (
+
+                        skill_span.end_time
+
+                        -
+
+                        skill_span.start_time
+
+                    ).total_seconds() * 1000
+
+
+                    skill_span.success = True
+
+
+                    skill_span.output_data = (
+                        skill_result
+                    )
+
+
+
+                evidence.append(
+                    skill_result
+                )
+
+
+
+            except Exception as exc:
+
+
+                if skill_span:
+
+
+                    skill_span.end_time = datetime.now(
+                        UTC
+                    )
+
+
+                    skill_span.duration_ms = (
+
+                        skill_span.end_time
+
+                        -
+
+                        skill_span.start_time
+
+                    ).total_seconds() * 1000
+
+
+                    skill_span.success = False
+
+
+                    skill_span.error = str(
+                        exc
+                    )
+
+
+                raise
+
 
 
             #
@@ -136,7 +250,7 @@ class DiagnosisAgent(BaseAgent):
 
 
             skill_calls.append(
-                "kubernetes_diagnosis"
+                skill.name
             )
 
 
