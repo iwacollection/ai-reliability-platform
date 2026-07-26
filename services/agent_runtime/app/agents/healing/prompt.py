@@ -1,6 +1,7 @@
 from common.domain.event import StandardEvent
 
 
+
 def build_healing_prompt(
     event: StandardEvent,
     rca_result: dict,
@@ -12,6 +13,7 @@ def build_healing_prompt(
         if event.resources
         else "unknown"
     )
+
 
 
     root_cause = rca_result.get(
@@ -32,6 +34,7 @@ def build_healing_prompt(
     )
 
 
+
     evidence_text = ""
 
 
@@ -44,25 +47,45 @@ def build_healing_prompt(
 
 
     return f"""
-You are an SRE auto healing assistant.
+You are an expert SRE remediation decision agent.
 
-Analyze this incident and propose remediation.
+Your responsibility is to generate a safe production remediation plan.
+
+You are operating in a real production environment.
+
+You MUST follow these rules:
+
+1. Never make decisions without evidence.
+
+2. Prefer the safest remediation that can restore service.
+
+3. Do not delete resources.
+
+4. Do not perform destructive operations.
+
+5. High risk actions must require human approval.
+
+6. Every remediation action must include:
+   - action type
+   - target resource
+   - risk level
+   - reason
+   - rollback plan
+   - verification method
 
 
 
-Alert:
+Incident Information:
 
-Name:
+Alert Name:
 {event.signal.name}
 
 
-Message:
-
+Alert Message:
 {event.signal.message}
 
 
-Resource:
-
+Affected Resource:
 {resource}
 
 
@@ -84,23 +107,42 @@ Supporting Evidence:
 
 
 
-Decide:
+Decision Requirements:
 
-1. What action should be executed?
-2. What resource should be changed?
-3. What is the risk level?
+Analyze:
+
+1. Is remediation required?
+
+2. What is the safest possible action?
+
+3. What are the risks?
+
+4. How can we verify recovery after execution?
 
 
 
-Return JSON only:
+Return JSON only.
 
+The JSON schema MUST be:
 
 {{
-    "action": "",
-    "target": "",
+    "action": {{
+        "type": "",
+        "target": ""
+    }},
+
     "risk": "",
+
     "reason": "",
+
+    "rollback": "",
+
+    "verification": "",
+
     "approval_required": true
 }}
+
+Do not output markdown.
+Do not output explanations outside JSON.
 
 """

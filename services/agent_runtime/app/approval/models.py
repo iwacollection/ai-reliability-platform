@@ -2,7 +2,11 @@ from datetime import UTC, datetime
 
 from enum import Enum
 
-from pydantic import BaseModel, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+)
 
 
 from services.agent_runtime.app.action.models import (
@@ -40,23 +44,35 @@ class ApprovalRequest(BaseModel):
     """
 
 
+    model_config = ConfigDict(
+        use_enum_values=True
+    )
+
+
+
     id: str
+
 
 
     action: ActionPlan
 
 
+
     reason: str = ""
 
 
-    status: ApprovalStatus = (
-        ApprovalStatus.PENDING
+
+    status: ApprovalStatus = Field(
+        default=ApprovalStatus.PENDING,
+        validate_default=True,
     )
+
 
 
     requester: str = (
         "ai_agent"
     )
+
 
 
     created_at: datetime = Field(
@@ -65,10 +81,12 @@ class ApprovalRequest(BaseModel):
     )
 
 
+
     updated_at: datetime = Field(
         default_factory=lambda:
             datetime.now(UTC)
     )
+
 
 
     metadata: dict = Field(

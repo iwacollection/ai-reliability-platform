@@ -1,13 +1,16 @@
 import json
 
+
 from services.agent_runtime.app.llm.base import (
     BaseLLMProvider,
 )
+
 
 from services.agent_runtime.app.llm.models import (
     ChatRequest,
     ChatResponse,
 )
+
 
 
 class MockProvider(BaseLLMProvider):
@@ -34,13 +37,9 @@ class MockProvider(BaseLLMProvider):
         )
 
 
+
         #
         # Healing
-        #
-        # 注意：
-        # 必须放在 RCA 前面
-        # 避免 healing prompt
-        # 包含 evidence/root cause 时被 RCA 捕获
         #
         if (
             "healing" in prompt
@@ -54,12 +53,16 @@ class MockProvider(BaseLLMProvider):
             result = {
 
 
-                "action":
-                "increase_memory_limit",
+                "action": {
+
+                    "type":
+                    "increase_memory_limit",
 
 
-                "target":
-                "payment-api",
+                    "target":
+                    "payment-api",
+
+                },
 
 
                 "risk":
@@ -68,8 +71,23 @@ class MockProvider(BaseLLMProvider):
 
                 "reason":
                 (
-                    "Pod terminated because "
-                    "container memory limit exceeded."
+                    "Pod memory limit is insufficient "
+                    "and caused OOMKilled incidents."
+                ),
+
+
+                "rollback":
+                (
+                    "Restore previous memory limit "
+                    "configuration if the workload becomes unstable."
+                ),
+
+
+                "verification":
+                (
+                    "Verify pod restart count decreases, "
+                    "OOMKilled events disappear, "
+                    "and memory usage returns to normal range."
                 ),
 
 
@@ -90,10 +108,6 @@ class MockProvider(BaseLLMProvider):
         ):
 
 
-            #
-            # Detect deployment change
-            #
-
             has_change = (
 
                 "deployment_revision_changed"
@@ -110,6 +124,7 @@ class MockProvider(BaseLLMProvider):
                 in prompt
 
             )
+
 
 
             if has_change:
@@ -143,6 +158,7 @@ class MockProvider(BaseLLMProvider):
                         "memory configuration changed",
 
                     ],
+
                 }
 
 
@@ -172,6 +188,7 @@ class MockProvider(BaseLLMProvider):
                         "last_reason=OOMKilled",
 
                     ],
+
                 }
 
 

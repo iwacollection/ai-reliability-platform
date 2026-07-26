@@ -43,6 +43,16 @@ from services.agent_runtime.app.approval.service import (
 )
 
 
+from services.sandbox.executor.local import (
+    LocalSandboxExecutor,
+)
+
+
+from services.sandbox.policy.validator import (
+    SandboxPolicyValidator,
+)
+
+
 
 class AgentRuntime:
     """
@@ -58,10 +68,12 @@ class AgentRuntime:
         self.memory = MemoryStore()
 
 
+
         #
         # Tool System
         #
         self.tools = create_tool_manager()
+
 
 
         #
@@ -70,10 +82,12 @@ class AgentRuntime:
         self.skills = create_skill_registry()
 
 
+
         #
         # MCP System
         #
         self.mcp = create_mcp_registry()
+
 
 
         #
@@ -82,10 +96,12 @@ class AgentRuntime:
         self.tracer = TraceCollector()
 
 
+
         #
         # Evaluation
         #
         self.evaluators = create_evaluation_registry()
+
 
 
         #
@@ -94,10 +110,27 @@ class AgentRuntime:
         self.policy = create_policy_engine()
 
 
+
         #
         # Approval
         #
         self.approval = ApprovalService()
+
+
+
+        #
+        # Sandbox System
+        #
+        # AI generated actions
+        # must pass sandbox
+        #
+        self.sandbox = LocalSandboxExecutor()
+
+
+        self.sandbox_policy = (
+            SandboxPolicyValidator()
+        )
+
 
 
         #
@@ -106,7 +139,9 @@ class AgentRuntime:
         self.registry = create_agent_registry()
 
 
+
         self.planner = AgentPlanner()
+
 
 
         #

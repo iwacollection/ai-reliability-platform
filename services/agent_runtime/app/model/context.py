@@ -42,6 +42,20 @@ from services.agent_runtime.app.evaluation.models import (
 )
 
 
+from services.sandbox.executor.base import (
+    BaseSandboxExecutor,
+)
+
+from services.sandbox.policy.validator import (
+    SandboxPolicyValidator,
+)
+
+
+from services.agent_runtime.app.approval.service import (
+    ApprovalService,
+)
+
+
 
 class AgentContext(BaseModel):
 
@@ -105,6 +119,26 @@ class AgentContext(BaseModel):
 
 
     mcp: MCPRegistry | None = None
+
+
+
+    # =========================
+    # Sandbox Runtime
+    # =========================
+
+    sandbox: BaseSandboxExecutor | None = None
+
+
+
+    sandbox_policy: SandboxPolicyValidator | None = None
+
+
+
+    # =========================
+    # Approval Workflow
+    # =========================
+
+    approval: ApprovalService | None = None
 
 
 

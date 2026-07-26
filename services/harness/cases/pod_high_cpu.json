@@ -1,0 +1,115 @@
+{
+    "case_id": "pod_high_cpu_001",
+
+    "name": "Pod High CPU Incident",
+
+    "description": "Production pod CPU usage exceeds threshold.",
+
+
+    "input": {
+
+        "header": {
+
+            "event_id": "71be7fed-c6dd-4699-8311-785d4389b996",
+
+            "trace_id": "659e7a8a-2c1b-4a22-830b-6e8ff6ff440a",
+
+            "schema_version": "v1",
+
+            "source": "alertmanager",
+
+            "occurred_at": "2026-07-26T00:00:00Z",
+
+            "received_at": "2026-07-26T00:00:00Z"
+
+        },
+
+
+        "signal": {
+
+            "id": "05b4ae07-6d04-4330-942e-4212194abc22",
+
+            "type": "alert",
+
+            "name": "PodHighCPU",
+
+            "message": "CPU usage > 90%",
+
+            "severity": "critical",
+
+            "status": "firing",
+
+            "labels": {
+
+                "alertname": "PodHighCPU",
+
+                "severity": "critical",
+
+                "namespace": "payment",
+
+                "pod": "payment-api"
+
+            }
+
+        },
+
+
+        "resources": [
+
+            {
+
+                "id": "6f54a663-1a1b-4eb7-b15c-82b256612d26",
+
+                "kind": "pod",
+
+                "name": "payment-api",
+
+                "namespace": "payment"
+
+            }
+
+        ]
+
+    },
+
+
+    "expected": {
+
+
+        "noise": {
+
+            "real_alert": true,
+
+            "min_confidence": 0.8
+
+        },
+
+
+        "diagnosis": {
+
+            "required_spans": [
+
+                "kubernetes",
+
+                "prometheus"
+
+            ]
+
+        },
+
+
+        "rca": {
+
+            "min_confidence": 0.8
+
+        },
+
+
+        "healing": {
+
+            "require_action": true
+
+        }
+
+    }
+}

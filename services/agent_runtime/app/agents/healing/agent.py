@@ -18,6 +18,11 @@ from services.agent_runtime.app.model.result import (
     AgentResult,
 )
 
+from services.agent_runtime.app.action.models import (
+    ActionPlan,
+    ActionRisk,
+)
+
 from services.agent_runtime.app.agents.healing.prompt import (
     build_healing_prompt,
 )
@@ -27,10 +32,12 @@ from services.agent_runtime.app.agents.healing.parser import (
 )
 
 
+
 class HealingAgent(BaseAgent):
     """
     Auto healing suggestion agent.
     """
+
 
     @property
     def agent_type(self):
@@ -122,12 +129,156 @@ class HealingAgent(BaseAgent):
 
 
         #
+        # Healing result
+        #
+
+        healing_data = result.data
+
+
+
+        action_data = healing_data.get(
+            "action"
+        )
+
+
+
+        action_plan = None
+
+
+
+        #
+        # Convert dict to ActionPlan
+        #
+
+        if action_data:
+
+
+            action_plan = ActionPlan(
+
+                type=action_data.get(
+                    "type"
+                ),
+
+                target=action_data.get(
+                    "target",
+                    "",
+                ),
+
+                risk=ActionRisk(
+                    healing_data.get(
+                        "risk",
+                        "medium",
+                    )
+                ),
+
+            )
+
+
+            healing_data[
+                "action"
+            ] = action_plan.model_dump()
+
+
+
+        #
+        # Policy + Approval + Sandbox
+        #
+
+        if action_plan and context.sandbox_policy:
+
+
+            #
+            # Policy validation
+            #
+
+            policy_result = (
+                context.sandbox_policy.validate(
+                    action_plan.model_dump()
+                )
+            )
+
+
+            healing_data[
+                "policy"
+            ] = policy_result.model_dump()
+
+
+
+            #
+            # Need approval
+            #
+
+            if (
+                policy_result.allowed
+                and
+                policy_result.require_approval
+                and
+                context.approval
+            ):
+
+
+                approval_request = (
+                    await context.approval.create_approval(
+                        action=action_plan,
+                        reason=(
+                            healing_data.get(
+                                "reason",
+                                "Healing action requires approval",
+                            )
+                        ),
+                    )
+                )
+
+
+                healing_data[
+                    "approval"
+                ] = approval_request.model_dump()
+
+
+
+            #
+            # Execute directly
+            #
+
+            elif (
+
+                policy_result.allowed
+
+                and
+
+                not policy_result.require_approval
+
+                and
+
+                context.sandbox
+
+            ):
+
+
+                sandbox_result = (
+                    await context.sandbox.execute(
+                        action_plan.model_dump()
+                    )
+                )
+
+
+                healing_data[
+                    "sandbox"
+                ] = sandbox_result.model_dump()
+
+
+
+        #
         # Save healing result
         #
 
         context.variables[
             "healing"
-        ] = result.data
+        ] = healing_data
+
+
+
+        result.data = healing_data
 
 
 

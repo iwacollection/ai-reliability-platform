@@ -1,6 +1,12 @@
 from enum import Enum
 
-from pydantic import BaseModel
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+)
+
 
 
 class ActionType(str, Enum):
@@ -37,14 +43,28 @@ class ActionRisk(str, Enum):
 
 
 
+
 class ActionPlan(BaseModel):
+
+
+    model_config = ConfigDict(
+        use_enum_values=True
+    )
+
+
 
     type: ActionType
 
+
     target: str
+
 
     risk: ActionRisk
 
+
     approved: bool = False
 
-    metadata: dict = {}
+
+    metadata: dict = Field(
+        default_factory=dict
+    )

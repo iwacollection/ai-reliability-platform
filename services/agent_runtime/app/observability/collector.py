@@ -201,6 +201,14 @@ class TraceCollector:
         )
 
 
+        #
+        # Persist final trace state
+        #
+        self.store.update(
+            trace
+        )
+
+
 
     def list(
         self,
