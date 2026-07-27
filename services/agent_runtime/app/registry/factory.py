@@ -18,6 +18,7 @@ from services.agent_runtime.app.agents.diagnosis.agent import (
     DiagnosisAgent,
 )
 
+
 from services.agent_runtime.app.llm.client import (
     LLMClient,
 )
@@ -29,6 +30,17 @@ from services.agent_runtime.app.llm.observed_client import (
 from services.agent_runtime.app.llm.provider_factory import (
     create_llm_provider,
 )
+
+
+from services.agent_runtime.app.llm.gateway.gateway import (
+    LLMGateway,
+)
+
+
+from services.agent_runtime.app.llm.gateway.router import (
+    LLMRouter,
+)
+
 
 from services.agent_runtime.app.observation.factory import (
     create_observation_manager,
@@ -54,6 +66,7 @@ def create_agent_registry() -> AgentRegistry:
     # LLM Dependency
     # =========================
 
+
     provider = create_llm_provider()
 
 
@@ -63,8 +76,34 @@ def create_agent_registry() -> AgentRegistry:
     )
 
 
-    llm_client = ObservedLLMClient(
+
+    observed_llm_client = ObservedLLMClient(
         base_llm_client,
+    )
+
+
+
+    #
+    # LLM Gateway
+    #
+    # Gateway owns:
+    #
+    # - routing
+    # - provider selection
+    #
+    #
+
+    llm_gateway = LLMGateway(
+
+        clients={
+
+            "openai":
+                observed_llm_client,
+
+        },
+
+        router=LLMRouter(),
+
     )
 
 
@@ -72,6 +111,7 @@ def create_agent_registry() -> AgentRegistry:
     # =========================
     # Observation Dependency
     # =========================
+
 
     observation_manager = (
         create_observation_manager()
@@ -83,9 +123,10 @@ def create_agent_registry() -> AgentRegistry:
     # Register Agents
     # =========================
 
+
     registry.register(
         NoiseAgent(
-            llm_client,
+            llm_gateway,
         )
     )
 
@@ -101,7 +142,7 @@ def create_agent_registry() -> AgentRegistry:
 
     registry.register(
         RCAAgent(
-            llm_client,
+            llm_gateway,
         )
     )
 
@@ -109,7 +150,7 @@ def create_agent_registry() -> AgentRegistry:
 
     registry.register(
         HealingAgent(
-            llm_client,
+            llm_gateway,
         )
     )
 

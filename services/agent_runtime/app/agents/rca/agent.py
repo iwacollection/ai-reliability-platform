@@ -2,12 +2,15 @@ from services.agent_runtime.app.agent.base import (
     BaseAgent,
 )
 
-from services.agent_runtime.app.llm.client import (
-    LLMClient,
+from services.agent_runtime.app.llm.gateway.gateway import (
+    LLMGateway,
 )
 
-from services.agent_runtime.app.llm.models import (
-    ChatRequest,
+from services.agent_runtime.app.llm.gateway.models import (
+    LLMGatewayRequest,
+    LLMInvocationContext,
+    LLMTaskType,
+    LLMPriority,
 )
 
 from services.agent_runtime.app.model.context import (
@@ -25,6 +28,7 @@ from services.agent_runtime.app.agents.rca.prompt import (
 from services.agent_runtime.app.agents.rca.parser import (
     parse_rca_result,
 )
+
 
 
 class RCAAgent(BaseAgent):
@@ -64,10 +68,10 @@ class RCAAgent(BaseAgent):
 
     def __init__(
         self,
-        llm_client: LLMClient,
+        llm_gateway: LLMGateway,
     ) -> None:
 
-        self.llm_client = llm_client
+        self.llm_gateway = llm_gateway
 
 
 
@@ -163,7 +167,6 @@ class RCAAgent(BaseAgent):
 
         #
         # Build RCA prompt
-        # Include memory
         #
 
         prompt = build_rca_prompt(
@@ -174,17 +177,38 @@ class RCAAgent(BaseAgent):
 
 
 
-        response = await self.llm_client.chat(
-            ChatRequest(
+        response = await self.llm_gateway.chat(
+
+            LLMGatewayRequest(
 
                 system_prompt=(
+
                     "You are an SRE RCA assistant. "
+
                     "Analyze incidents using evidence "
+
                     "and historical incidents."
+
                 ),
 
-                user_prompt=prompt,
+
+                prompt=prompt,
+
+
+                context=LLMInvocationContext(
+
+                    agent="rca",
+
+                    task=LLMTaskType.RCA,
+
+                    priority=LLMPriority.HIGH,
+
+                    require_json=True,
+
+                ),
+
             )
+
         )
 
 

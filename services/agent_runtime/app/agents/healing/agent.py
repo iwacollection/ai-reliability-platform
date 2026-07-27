@@ -2,30 +2,40 @@ from services.agent_runtime.app.agent.base import (
     BaseAgent,
 )
 
-from services.agent_runtime.app.llm.client import (
-    LLMClient,
+
+from services.agent_runtime.app.llm.gateway.gateway import (
+    LLMGateway,
 )
 
-from services.agent_runtime.app.llm.models import (
-    ChatRequest,
+
+from services.agent_runtime.app.llm.gateway.models import (
+    LLMGatewayRequest,
+    LLMInvocationContext,
+    LLMTaskType,
+    LLMPriority,
 )
+
 
 from services.agent_runtime.app.model.context import (
     AgentContext,
 )
 
+
 from services.agent_runtime.app.model.result import (
     AgentResult,
 )
+
 
 from services.agent_runtime.app.action.models import (
     ActionPlan,
     ActionRisk,
 )
 
+
 from services.agent_runtime.app.agents.healing.prompt import (
     build_healing_prompt,
 )
+
 
 from services.agent_runtime.app.agents.healing.parser import (
     parse_healing_result,
@@ -66,10 +76,10 @@ class HealingAgent(BaseAgent):
 
     def __init__(
         self,
-        llm_client: LLMClient,
+        llm_gateway: LLMGateway,
     ) -> None:
 
-        self.llm_client = llm_client
+        self.llm_gateway = llm_gateway
 
 
 
@@ -108,16 +118,34 @@ class HealingAgent(BaseAgent):
 
 
 
-        response = await self.llm_client.chat(
-            ChatRequest(
+        response = await self.llm_gateway.chat(
+
+            LLMGatewayRequest(
 
                 system_prompt=(
+
                     "You are an SRE healing assistant."
+
                 ),
 
-                user_prompt=prompt,
+
+                prompt=prompt,
+
+
+                context=LLMInvocationContext(
+
+                    agent="healing",
+
+                    task=LLMTaskType.REMEDIATION,
+
+                    priority=LLMPriority.HIGH,
+
+                    require_json=True,
+
+                ),
 
             )
+
         )
 
 
@@ -187,10 +215,6 @@ class HealingAgent(BaseAgent):
         if action_plan and context.sandbox_policy:
 
 
-            #
-            # Policy validation
-            #
-
             policy_result = (
                 context.sandbox_policy.validate(
                     action_plan.model_dump()
@@ -204,16 +228,18 @@ class HealingAgent(BaseAgent):
 
 
 
-            #
-            # Need approval
-            #
-
             if (
+
                 policy_result.allowed
+
                 and
+
                 policy_result.require_approval
+
                 and
+
                 context.approval
+
             ):
 
 
@@ -235,10 +261,6 @@ class HealingAgent(BaseAgent):
                 ] = approval_request.model_dump()
 
 
-
-            #
-            # Execute directly
-            #
 
             elif (
 
