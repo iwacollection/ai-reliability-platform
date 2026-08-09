@@ -1,0 +1,1073 @@
+import ast
+import inspect
+import textwrap
+from dataclasses import dataclass
+from uuid import UUID
+
+import httpx
+import pytest
+from fastapi import FastAPI, HTTPException
+from fastapi.routing import APIRoute
+
+from services.agent_runtime.app.action.production_pilot_ceremony_models import (
+    PRODUCTION_PILOT_ACTIVATION_ACKNOWLEDGEMENT,
+)
+from services.agent_runtime.app.action.production_pilot_ceremony_service import (
+    ProductionPilotCeremonyError,
+)
+from services.agent_runtime.app.action.production_pilot_pre_enable_evidence import (
+    PRODUCTION_PILOT_PRE_ENABLE_SIGN_OFF_ACKNOWLEDGEMENT,
+)
+from services.agent_runtime.app.runtime.runtime import AgentRuntime
+from services.agent_runtime.app.security.api import ApiSecurityAdapter
+from services.agent_runtime.app.security.authentication import (
+    BaseAuthenticationProvider,
+)
+from services.agent_runtime.app.security.models import (
+    OperatorIdentity,
+    OperatorRole,
+    ProtectedOperation,
+)
+from services.agent_runtime.app.security.service import (
+    AuthenticationProviderRegistry,
+    AuthenticationService,
+)
+from services.agent_runtime.app.security.policy import SecurityPolicyEngine
+from services.agent_runtime.tests.api_security_support import (
+    ApiTestSecurityHarness,
+    api_test_credential,
+    create_api_test_authentication_service,
+    wire_api_test_security,
+)
+
+
+TEST_RESOURCE_ID = UUID(
+    "00000000-0000-4000-8000-000000000101"
+)
+INVALID_CREDENTIAL = (
+    "security-matrix-invalid-credential-0000000001"
+)
+PROVIDER_FAILURE_CREDENTIAL = (
+    "security-matrix-provider-failure-0000000001"
+)
+
+
+READ_ROLES = frozenset(
+    {
+        OperatorRole.VIEWER,
+        OperatorRole.ANALYST,
+        OperatorRole.APPROVER,
+        OperatorRole.EXECUTOR,
+        OperatorRole.RECONCILER,
+        OperatorRole.ADMIN,
+    }
+)
+
+
+EXPECTED_OPERATION_ROLES = {
+    ProtectedOperation.EXECUTE_RUNTIME_ANALYSIS: frozenset(
+        {
+            OperatorRole.ANALYST,
+            OperatorRole.ADMIN,
+            OperatorRole.SERVICE,
+        }
+    ),
+    ProtectedOperation.PREPARE_REMEDIATION: frozenset(
+        {
+            OperatorRole.ANALYST,
+            OperatorRole.ADMIN,
+            OperatorRole.SERVICE,
+        }
+    ),
+    ProtectedOperation.READ_REMEDIATION_PREPARATION: (
+        READ_ROLES
+    ),
+    ProtectedOperation.READ_INCIDENT: READ_ROLES,
+    ProtectedOperation.READ_INCIDENT_WORKFLOWS: READ_ROLES,
+    ProtectedOperation.READ_APPROVAL: READ_ROLES,
+    ProtectedOperation.READ_APPROVAL_WORKFLOW: READ_ROLES,
+    ProtectedOperation.DECIDE_APPROVAL: frozenset(
+        {
+            OperatorRole.APPROVER,
+            OperatorRole.ADMIN,
+        }
+    ),
+    ProtectedOperation.RESUME_ACTION: frozenset(
+        {
+            OperatorRole.EXECUTOR,
+            OperatorRole.ADMIN,
+        }
+    ),
+    ProtectedOperation.RECONCILE_ACTION: frozenset(
+        {
+            OperatorRole.RECONCILER,
+            OperatorRole.ADMIN,
+        }
+    ),
+    ProtectedOperation.READ_VERIFICATION: READ_ROLES,
+}
+
+
+@dataclass(frozen=True)
+class RouteSecurityContract:
+    method: str
+    path_template: str
+    endpoint_name: str
+    operation: ProtectedOperation
+    allowed_status: int
+    body_kind: str | None = None
+    audited_operator: bool = False
+
+    @property
+    def allowed_roles(self) -> frozenset[OperatorRole]:
+        return EXPECTED_OPERATION_ROLES[self.operation]
+
+    def concrete_path(self) -> str:
+        resource_id = str(TEST_RESOURCE_ID)
+        return self.path_template.format(
+            incident_id=resource_id,
+            approval_id=resource_id,
+            execution_id=resource_id,
+            verification_id=resource_id,
+            artifact_id=resource_id,
+        )
+
+
+ROUTE_CONTRACTS = (
+    RouteSecurityContract(
+        "POST",
+        "/execute",
+        "execute_runtime",
+        ProtectedOperation.EXECUTE_RUNTIME_ANALYSIS,
+        422,
+        body_kind="execute",
+    ),
+    RouteSecurityContract(
+        "POST",
+        "/production-actions/prepare",
+        "prepare_production_action",
+        ProtectedOperation.PREPARE_REMEDIATION,
+        422,
+        body_kind="preparation",
+    ),
+    RouteSecurityContract(
+        "POST",
+        "/production-actions/pilot-rehearsal",
+        "rehearse_production_pilot",
+        ProtectedOperation.RESUME_ACTION,
+        200,
+        audited_operator=True,
+    ),
+    RouteSecurityContract(
+        "POST",
+        "/production-actions/pilot-crash-recovery-rehearsal",
+        "rehearse_production_pilot_crash_recovery",
+        ProtectedOperation.RESUME_ACTION,
+        200,
+        audited_operator=True,
+    ),
+    RouteSecurityContract(
+        "GET",
+        "/production-actions/{approval_id}/pilot-pre-enable-evidence",
+        "get_production_pilot_pre_enable_evidence",
+        ProtectedOperation.READ_REMEDIATION_PREPARATION,
+        200,
+    ),
+    RouteSecurityContract(
+        "POST",
+        "/production-actions/{approval_id}/pilot-pre-enable-sign-off",
+        "sign_off_production_pilot_pre_enable_evidence",
+        ProtectedOperation.RESUME_ACTION,
+        200,
+        body_kind="pre_enable_sign_off",
+        audited_operator=True,
+    ),
+    RouteSecurityContract(
+        "POST",
+        "/production-actions/{approval_id}/pilot-activation-checklist",
+        "record_production_pilot_activation_checklist",
+        ProtectedOperation.DECIDE_APPROVAL,
+        409,
+        body_kind="pilot_checklist",
+        audited_operator=True,
+    ),
+    RouteSecurityContract(
+        "GET",
+        "/production-actions/pilot-readiness",
+        "get_production_pilot_readiness",
+        ProtectedOperation.READ_REMEDIATION_PREPARATION,
+        200,
+    ),
+    RouteSecurityContract(
+        "GET",
+        "/production-actions/preflight-artifacts/{artifact_id}",
+        "get_production_preparation",
+        ProtectedOperation.READ_REMEDIATION_PREPARATION,
+        404,
+    ),
+    RouteSecurityContract(
+        "GET",
+        "/incidents/{incident_id}",
+        "get_incident",
+        ProtectedOperation.READ_INCIDENT,
+        404,
+    ),
+    RouteSecurityContract(
+        "GET",
+        "/incidents/{incident_id}/workflows",
+        "get_incident_workflows",
+        ProtectedOperation.READ_INCIDENT_WORKFLOWS,
+        404,
+    ),
+    RouteSecurityContract(
+        "GET",
+        "/approvals/{approval_id}",
+        "get_approval",
+        ProtectedOperation.READ_APPROVAL,
+        404,
+    ),
+    RouteSecurityContract(
+        "GET",
+        "/workflows/approvals/{approval_id}",
+        "get_approval_workflow",
+        ProtectedOperation.READ_APPROVAL_WORKFLOW,
+        404,
+    ),
+    RouteSecurityContract(
+        "POST",
+        "/approvals/{approval_id}/approve",
+        "approve_approval",
+        ProtectedOperation.DECIDE_APPROVAL,
+        404,
+        body_kind="approval",
+        audited_operator=True,
+    ),
+    RouteSecurityContract(
+        "POST",
+        "/approvals/{approval_id}/reject",
+        "reject_approval",
+        ProtectedOperation.DECIDE_APPROVAL,
+        404,
+        body_kind="approval",
+        audited_operator=True,
+    ),
+    RouteSecurityContract(
+        "POST",
+        "/approvals/{approval_id}/resume",
+        "resume_approved_action",
+        ProtectedOperation.RESUME_ACTION,
+        404,
+        audited_operator=True,
+    ),
+    RouteSecurityContract(
+        "POST",
+        "/action-executions/{execution_id}/reconcile",
+        "reconcile_action_execution",
+        ProtectedOperation.RECONCILE_ACTION,
+        404,
+        body_kind="reconciliation",
+        audited_operator=True,
+    ),
+    RouteSecurityContract(
+        "GET",
+        "/verifications/{verification_id}",
+        "get_verification",
+        ProtectedOperation.READ_VERIFICATION,
+        404,
+    ),
+)
+
+
+def _contract_id(contract: RouteSecurityContract) -> str:
+    return f"{contract.method}-{contract.endpoint_name}"
+
+
+class EmptyProductionActionQuery:
+    async def get(
+        self,
+        artifact_id,
+    ):
+        return None
+
+
+class BlockedProductionPilotCeremony:
+    async def record_checklist(self, **kwargs):
+        raise ProductionPilotCeremonyError(
+            "Production Pilot ceremony is not configured for matrix testing"
+        )
+
+
+class MatrixBoundedResult:
+    def model_dump(self, mode="python"):
+        return {
+            "matrix": True,
+            "read_only": True,
+        }
+
+
+class MatrixProductionPilotPreEnableEvidence:
+    async def get(self, approval_id):
+        return MatrixBoundedResult()
+
+    async def sign_off(self, **kwargs):
+        return MatrixBoundedResult()
+
+
+@pytest.fixture
+def api_environment(monkeypatch, tmp_path):
+    """Create one authenticated API backed only by pytest-local stores."""
+
+    monkeypatch.chdir(tmp_path)
+
+    for name in (
+        "PROMETHEUS_URL",
+        "KUBERNETES_API_URL",
+        "KUBERNETES_SERVICE_HOST",
+        "KUBERNETES_SERVICE_PORT",
+        "KUBERNETES_SERVICE_PORT_HTTPS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    monkeypatch.setenv(
+        "PROMETHEUS_ALLOW_MOCK_FALLBACK",
+        "true",
+    )
+    monkeypatch.setenv(
+        "KUBERNETES_ALLOW_DRY_RUN_FALLBACK",
+        "true",
+    )
+
+    from services.agent_runtime.app.api import runtime as api_module
+
+    isolated_runtime = AgentRuntime()
+    isolated_runtime.production_action_query = (
+        EmptyProductionActionQuery()
+    )
+    isolated_runtime.production_pilot_ceremony = (
+        BlockedProductionPilotCeremony()
+    )
+    isolated_runtime.production_pilot_pre_enable_evidence = (
+        MatrixProductionPilotPreEnableEvidence()
+    )
+    security = wire_api_test_security(
+        monkeypatch,
+        api_module,
+        isolated_runtime,
+    )
+
+    app = FastAPI()
+    app.include_router(api_module.router)
+
+    return app, isolated_runtime, security, api_module
+
+
+def api_client(app: FastAPI) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    )
+
+
+def request_body(contract: RouteSecurityContract) -> dict | None:
+    if contract.body_kind == "execute":
+        # A permitted caller must reach StandardEvent validation and receive
+        # 422. A denied caller must be rejected before that validation.
+        return {}
+
+    if contract.body_kind == "approval":
+        return {
+            "reason": "Security matrix approval decision",
+            "metadata": {
+                "test": "security_matrix",
+            },
+        }
+
+    if contract.body_kind == "preparation":
+        return {
+            "preflight": {
+                "incident_id": str(TEST_RESOURCE_ID),
+                "cluster": "production-tw",
+                "namespace": "payments",
+                "pod_name": "payment-api-0",
+                "container": "payment-api",
+            },
+        }
+
+    if contract.body_kind == "reconciliation":
+        return {
+            "outcome": "failed",
+            "reason": (
+                "Security matrix confirms that the Action did not apply"
+            ),
+            "result": {
+                "success": False,
+                "evidence": "security_matrix",
+            },
+            "error_type": "ActionNotObserved",
+            "error_message": "No mutation was observed",
+            "metadata": {
+                "test": "security_matrix",
+            },
+        }
+
+    if contract.body_kind == "pilot_checklist":
+        return {
+            "executor_operator_id": "security-matrix-executor",
+            "exact_target_verified": True,
+            "separate_credentials_verified": True,
+            "rollback_reviewed": True,
+            "monitoring_ready": True,
+            "kill_switch_tested": True,
+            "budget_available_verified": True,
+            "runbook_reviewed": True,
+            "acknowledgement": (
+                PRODUCTION_PILOT_ACTIVATION_ACKNOWLEDGEMENT
+            ),
+        }
+
+    if contract.body_kind == "pre_enable_sign_off":
+        return {
+            "expected_evidence_sha256": "a" * 64,
+            "acknowledgement": (
+                PRODUCTION_PILOT_PRE_ENABLE_SIGN_OFF_ACKNOWLEDGEMENT
+            ),
+        }
+
+    return None
+
+
+def request_headers(
+    contract: RouteSecurityContract,
+    *,
+    security: ApiTestSecurityHarness | None = None,
+    role: OperatorRole | None = None,
+    authorization: str | None = None,
+    spoof_operator: bool = False,
+) -> dict[str, str]:
+    headers: dict[str, str] = {}
+
+    if security is not None and role is not None:
+        headers.update(security.headers(role))
+
+    if authorization is not None:
+        headers["Authorization"] = authorization
+
+    if contract.audited_operator:
+        if spoof_operator:
+            headers["X-Operator-ID"] = "spoofed-security-admin"
+        elif security is not None and role is not None:
+            headers["X-Operator-ID"] = security.principal_id(role)
+        else:
+            headers["X-Operator-ID"] = "untrusted-operator-claim"
+
+        headers["Idempotency-Key"] = (
+            "security-matrix-"
+            f"{contract.endpoint_name}-"
+            f"{role.value if role is not None else 'anonymous'}"
+        )
+
+    return headers
+
+
+async def send_contract_request(
+    client: httpx.AsyncClient,
+    contract: RouteSecurityContract,
+    headers: dict[str, str],
+) -> httpx.Response:
+    kwargs: dict = {
+        "headers": headers,
+    }
+    body = request_body(contract)
+
+    if body is not None:
+        kwargs["json"] = body
+
+    return await client.request(
+        contract.method,
+        contract.concrete_path(),
+        **kwargs,
+    )
+
+
+def _api_require_operation(endpoint) -> ProtectedOperation:
+    """Return the single first-statement security operation of a route."""
+
+    source = textwrap.dedent(
+        inspect.getsource(endpoint)
+    )
+    tree = ast.parse(source)
+    function = tree.body[0]
+
+    assert isinstance(
+        function,
+        (ast.AsyncFunctionDef, ast.FunctionDef),
+    )
+
+    statements = list(function.body)
+
+    if (
+        statements
+        and isinstance(statements[0], ast.Expr)
+        and isinstance(statements[0].value, ast.Constant)
+        and isinstance(statements[0].value.value, str)
+    ):
+        statements.pop(0)
+
+    require_calls = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "require"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "api_security"
+    ]
+
+    assert len(require_calls) == 1, (
+        f"{endpoint.__name__} must contain exactly one "
+        "api_security.require call"
+    )
+
+    first_statement_calls = {
+        id(node)
+        for node in ast.walk(statements[0])
+        if isinstance(node, ast.Call)
+    }
+    require_call = require_calls[0]
+
+    assert id(require_call) in first_statement_calls, (
+        f"{endpoint.__name__} must authorize before domain work"
+    )
+    assert len(require_call.args) >= 2
+
+    operation_node = require_call.args[1]
+
+    assert isinstance(operation_node, ast.Attribute)
+    assert isinstance(operation_node.value, ast.Name)
+    assert operation_node.value.id == "ProtectedOperation"
+
+    return ProtectedOperation[operation_node.attr]
+
+
+def block_all_domain_work(
+    monkeypatch,
+    runtime: AgentRuntime,
+    api_module,
+) -> list[str]:
+    """Fail if a rejected request reaches validation, storage or execution."""
+
+    calls: list[str] = []
+
+    class ForbiddenStandardEvent:
+        @classmethod
+        def model_validate(cls, value):
+            calls.append("event.validate")
+            raise AssertionError(
+                "Rejected request reached StandardEvent validation"
+            )
+
+    def forbidden(label: str):
+        async def call(*args, **kwargs):
+            calls.append(label)
+            raise AssertionError(
+                "Rejected request reached protected domain work: "
+                f"{label}"
+            )
+
+        return call
+
+    monkeypatch.setattr(
+        api_module,
+        "StandardEvent",
+        ForbiddenStandardEvent,
+    )
+
+    targets = [
+        (runtime.pipeline, "execute", "pipeline.execute"),
+        (runtime.incident_store, "get", "incident.get"),
+        (runtime.incident_store, "update", "incident.update"),
+        (runtime.approval, "get", "approval.get"),
+        (
+            runtime.approval,
+            "list_by_incident",
+            "approval.list_by_incident",
+        ),
+        (runtime.approval, "approve", "approval.approve"),
+        (runtime.approval, "reject", "approval.reject"),
+        (
+            runtime.action_execution_service,
+            "get",
+            "action_execution.get",
+        ),
+        (
+            runtime.action_execution_service,
+            "get_by_approval",
+            "action_execution.get_by_approval",
+        ),
+        (
+            runtime.action_execution_service,
+            "list_by_incident",
+            "action_execution.list_by_incident",
+        ),
+        (
+            runtime.action_execution_service,
+            "reconcile",
+            "action_execution.reconcile",
+        ),
+        (runtime.action_runtime, "resume", "action_runtime.resume"),
+        (runtime.verification, "get", "verification.get"),
+        (
+            runtime.verification,
+            "get_by_action_execution",
+            "verification.get_by_action_execution",
+        ),
+        (
+            runtime.verification,
+            "list_by_incident",
+            "verification.list_by_incident",
+        ),
+        (
+            runtime.verification_coordinator,
+            "run",
+            "verification_coordinator.run",
+        ),
+    ]
+
+    preparation_service = getattr(
+        runtime,
+        "production_action_preparation",
+        None,
+    )
+    if preparation_service is not None:
+        targets.append(
+            (
+                preparation_service,
+                "prepare",
+                "production_action_preparation.prepare",
+            )
+        )
+
+    query_service = getattr(
+        runtime,
+        "production_action_query",
+        None,
+    )
+    if query_service is not None:
+        targets.append(
+            (
+                query_service,
+                "get",
+                "production_action_query.get",
+            )
+        )
+
+    rehearsal_service = getattr(
+        runtime,
+        "production_pilot_rehearsal",
+        None,
+    )
+    if rehearsal_service is not None:
+        targets.append(
+            (
+                rehearsal_service,
+                "run",
+                "production_pilot_rehearsal.run",
+            )
+        )
+
+    crash_rehearsal_service = getattr(
+        runtime,
+        "production_pilot_crash_recovery_rehearsal",
+        None,
+    )
+    if crash_rehearsal_service is not None:
+        targets.append(
+            (
+                crash_rehearsal_service,
+                "run",
+                "production_pilot_crash_recovery_rehearsal.run",
+            )
+        )
+
+    pre_enable_service = getattr(
+        runtime,
+        "production_pilot_pre_enable_evidence",
+        None,
+    )
+    if pre_enable_service is not None:
+        targets.extend(
+            (
+                (
+                    pre_enable_service,
+                    "get",
+                    "production_pilot_pre_enable_evidence.get",
+                ),
+                (
+                    pre_enable_service,
+                    "sign_off",
+                    "production_pilot_pre_enable_evidence.sign_off",
+                ),
+            )
+        )
+
+    ceremony_service = getattr(
+        runtime,
+        "production_pilot_ceremony",
+        None,
+    )
+    if ceremony_service is not None:
+        targets.append(
+            (
+                ceremony_service,
+                "record_checklist",
+                "production_pilot_ceremony.record_checklist",
+            )
+        )
+
+    for owner, method_name, label in targets:
+        monkeypatch.setattr(
+            owner,
+            method_name,
+            forbidden(label),
+        )
+
+    return calls
+
+
+class ExplodingAuthenticationProvider(BaseAuthenticationProvider):
+    @property
+    def name(self) -> str:
+        return "security_matrix_exploding"
+
+    def authenticate(self, credential: str | None) -> OperatorIdentity:
+        raise RuntimeError(
+            "Provider failed while processing credential "
+            f"{credential}"
+        )
+
+
+def test_security_contract_covers_every_role_operation_and_route():
+    assert set(EXPECTED_OPERATION_ROLES) == set(ProtectedOperation)
+    assert set(READ_ROLES) == (
+        set(OperatorRole) - {OperatorRole.SERVICE}
+    )
+    assert len(ROUTE_CONTRACTS) == 18
+    assert len(
+        {
+            (contract.method, contract.path_template)
+            for contract in ROUTE_CONTRACTS
+        }
+    ) == 18
+
+
+def test_router_has_exactly_the_audited_security_contract(
+    api_environment,
+):
+    _, _, _, api_module = api_environment
+
+    actual_routes = {
+        (
+            method,
+            route.path,
+            route.endpoint.__name__,
+        ): route
+        for route in api_module.router.routes
+        if isinstance(route, APIRoute)
+        for method in route.methods
+    }
+    expected_routes = {
+        (
+            contract.method,
+            contract.path_template,
+            contract.endpoint_name,
+        )
+        for contract in ROUTE_CONTRACTS
+    }
+
+    assert set(actual_routes) == expected_routes
+
+    for contract in ROUTE_CONTRACTS:
+        key = (
+            contract.method,
+            contract.path_template,
+            contract.endpoint_name,
+        )
+        route = actual_routes[key]
+
+        assert _api_require_operation(route.endpoint) == contract.operation
+
+
+@pytest.mark.parametrize(
+    ("operation", "role"),
+    tuple(
+        (operation, role)
+        for operation in ProtectedOperation
+        for role in OperatorRole
+    ),
+    ids=lambda value: value.value,
+)
+def test_authenticated_adapter_enforces_complete_role_operation_matrix(
+    operation,
+    role,
+):
+    credential = api_test_credential(role)
+    adapter = ApiSecurityAdapter(
+        authentication=create_api_test_authentication_service(),
+        policy=SecurityPolicyEngine(),
+    )
+    allowed = role in EXPECTED_OPERATION_ROLES[operation]
+
+    if allowed:
+        context = adapter.require(
+            credential.authorization_value,
+            operation,
+        )
+        assert context.principal_id == credential.principal_id
+        assert context.operation == operation
+        assert context.authorization.allowed is True
+        assert "credential" not in context.audit_context()
+        assert "api_key" not in context.audit_context()
+        return
+
+    with pytest.raises(HTTPException) as error:
+        adapter.require(
+            credential.authorization_value,
+            operation,
+        )
+
+    assert error.value.status_code == 403
+    assert error.value.detail == "Authorization denied"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "contract",
+    ROUTE_CONTRACTS,
+    ids=_contract_id,
+)
+async def test_real_http_routes_enforce_complete_role_matrix(
+    api_environment,
+    contract,
+):
+    app, _, security, _ = api_environment
+
+    async with api_client(app) as client:
+        for role in OperatorRole:
+            headers = request_headers(
+                contract,
+                security=security,
+                role=role,
+            )
+            response = await send_contract_request(
+                client,
+                contract,
+                headers,
+            )
+
+            if role in contract.allowed_roles:
+                assert response.status_code == contract.allowed_status, (
+                    f"{contract.endpoint_name} unexpectedly rejected "
+                    f"allowed role {role.value}: {response.text}"
+                )
+                assert response.status_code not in {401, 403, 503}
+            else:
+                assert response.status_code == 403, (
+                    f"{contract.endpoint_name} did not reject role "
+                    f"{role.value}: {response.text}"
+                )
+                assert response.json() == {
+                    "detail": "Authorization denied"
+                }
+
+            assert security.credential(role).api_key not in response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "authorization",
+    (
+        None,
+        "Bearer unsupported-security-matrix-token",
+        f"ApiKey {INVALID_CREDENTIAL}",
+    ),
+    ids=(
+        "missing",
+        "unsupported-scheme",
+        "invalid-api-key",
+    ),
+)
+async def test_every_route_returns_safe_401_before_all_domain_work(
+    api_environment,
+    monkeypatch,
+    caplog,
+    authorization,
+):
+    app, runtime, _, api_module = api_environment
+    calls = block_all_domain_work(
+        monkeypatch,
+        runtime,
+        api_module,
+    )
+    async with api_client(app) as client:
+        for contract in ROUTE_CONTRACTS:
+            headers = request_headers(
+                contract,
+                authorization=authorization,
+            )
+            response = await send_contract_request(
+                client,
+                contract,
+                headers,
+            )
+
+            assert response.status_code == 401, (
+                f"{contract.endpoint_name} did not fail with 401"
+            )
+            assert response.json() == {
+                "detail": "Authentication failed"
+            }
+            assert response.headers["www-authenticate"] == "ApiKey"
+            assert INVALID_CREDENTIAL not in response.text
+
+    assert INVALID_CREDENTIAL not in caplog.text
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_every_route_returns_safe_503_before_all_domain_work(
+    api_environment,
+    monkeypatch,
+    caplog,
+):
+    app, runtime, _, api_module = api_environment
+    calls = block_all_domain_work(
+        monkeypatch,
+        runtime,
+        api_module,
+    )
+    authentication = AuthenticationService(
+        AuthenticationProviderRegistry(
+            [ExplodingAuthenticationProvider()]
+        )
+    )
+    unavailable_adapter = ApiSecurityAdapter(
+        authentication=authentication,
+        policy=runtime.security_policy,
+    )
+    monkeypatch.setattr(
+        api_module,
+        "api_security",
+        unavailable_adapter,
+    )
+    async with api_client(app) as client:
+        for contract in ROUTE_CONTRACTS:
+            headers = request_headers(
+                contract,
+                authorization=(
+                    "ApiKey " + PROVIDER_FAILURE_CREDENTIAL
+                ),
+            )
+            response = await send_contract_request(
+                client,
+                contract,
+                headers,
+            )
+
+            assert response.status_code == 503, (
+                f"{contract.endpoint_name} did not fail with 503"
+            )
+            assert response.json() == {
+                "detail": "Authentication service unavailable"
+            }
+            assert PROVIDER_FAILURE_CREDENTIAL not in response.text
+            assert "provider failed" not in response.text.lower()
+
+    assert PROVIDER_FAILURE_CREDENTIAL not in caplog.text
+    assert calls == []
+
+
+WRITE_ROUTE_CASES = tuple(
+    contract
+    for contract in ROUTE_CONTRACTS
+    if contract.audited_operator
+)
+
+
+@pytest.mark.asyncio
+async def test_write_routes_reject_operator_spoofing_before_domain_work(
+    api_environment,
+    monkeypatch,
+):
+    app, runtime, security, api_module = api_environment
+    calls = block_all_domain_work(
+        monkeypatch,
+        runtime,
+        api_module,
+    )
+    async with api_client(app) as client:
+        for contract in WRITE_ROUTE_CASES:
+            role = {
+                ProtectedOperation.DECIDE_APPROVAL: OperatorRole.APPROVER,
+                ProtectedOperation.RESUME_ACTION: OperatorRole.EXECUTOR,
+                ProtectedOperation.RECONCILE_ACTION: OperatorRole.RECONCILER,
+            }[contract.operation]
+            headers = request_headers(
+                contract,
+                security=security,
+                role=role,
+                spoof_operator=True,
+            )
+            response = await send_contract_request(
+                client,
+                contract,
+                headers,
+            )
+
+            assert response.status_code == 403, (
+                f"{contract.endpoint_name} accepted a spoofed operator"
+            )
+            assert response.json() == {
+                "detail": (
+                    "Authenticated operator identity does not match "
+                    "X-Operator-ID"
+                )
+            }
+            assert security.credential(role).api_key not in response.text
+
+    assert calls == []
+
+
+def test_separation_of_duties_has_no_non_admin_write_bypass():
+    assert (
+        EXPECTED_OPERATION_ROLES[
+            ProtectedOperation.PREPARE_REMEDIATION
+        ]
+        & EXPECTED_OPERATION_ROLES[
+            ProtectedOperation.DECIDE_APPROVAL
+        ]
+        & EXPECTED_OPERATION_ROLES[
+            ProtectedOperation.RESUME_ACTION
+        ]
+        & EXPECTED_OPERATION_ROLES[
+            ProtectedOperation.RECONCILE_ACTION
+        ]
+    ) == {OperatorRole.ADMIN}
+
+    for role in (
+        OperatorRole.ANALYST,
+        OperatorRole.SERVICE,
+        OperatorRole.APPROVER,
+        OperatorRole.EXECUTOR,
+        OperatorRole.RECONCILER,
+    ):
+        allowed_write_operations = {
+            operation
+            for operation in (
+                ProtectedOperation.PREPARE_REMEDIATION,
+                ProtectedOperation.DECIDE_APPROVAL,
+                ProtectedOperation.RESUME_ACTION,
+                ProtectedOperation.RECONCILE_ACTION,
+            )
+            if role in EXPECTED_OPERATION_ROLES[operation]
+        }
+        assert len(allowed_write_operations) == 1

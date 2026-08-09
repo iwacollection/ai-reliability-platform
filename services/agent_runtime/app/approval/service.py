@@ -1,110 +1,115 @@
+from collections.abc import Mapping
+from typing import Any
+from uuid import UUID
+
 from services.agent_runtime.app.action.models import (
     ActionPlan,
 )
-
-
 from services.agent_runtime.app.approval.manager import (
     ApprovalManager,
 )
-
-
 from services.agent_runtime.app.approval.models import (
     ApprovalRequest,
 )
 
 
-
 class ApprovalService:
     """
-    Approval workflow service.
+    Application service for the human approval workflow.
 
-    Connect:
-
-    Policy Decision
-
-          |
-
-          v
-
-    Approval Manager
-
-          |
-
-          v
-
-    Approval Request
-
+    Audited decision arguments are passed unchanged to ApprovalManager so the
+    manager can persist the decision and lifecycle transition atomically.
+    Calls without audit arguments remain compatible with internal legacy
+    callers while the API migration is staged.
     """
-
 
     def __init__(
         self,
         manager: ApprovalManager | None = None,
-    ):
-
-
+    ) -> None:
         self.manager = (
             manager
             or ApprovalManager()
         )
 
-
-
     async def create_approval(
         self,
         action: ActionPlan,
         reason: str = "",
+        incident_id: UUID | str | None = None,
+        *,
+        request_id: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> ApprovalRequest:
-        """
-        Create human approval request.
-        """
+        arguments: dict[str, Any] = {
+            "action": action,
+            "reason": reason,
+            "incident_id": incident_id,
+        }
+        if request_id is not None:
+            arguments["request_id"] = request_id
+        if metadata is not None:
+            arguments["metadata"] = metadata
 
-
-        return await (
-            self.manager.create_request(
-                action,
-                reason,
-            )
+        return await self.manager.create_request(
+            **arguments,
         )
-
-
 
     async def approve(
         self,
         request_id: str,
+        *,
+        operator_id: str | None = None,
+        idempotency_key: str | None = None,
+        reason: str = "",
+        metadata: Mapping[str, Any] | None = None,
     ) -> ApprovalRequest:
-
-
-        return await (
-            self.manager.approve(
-                request_id
-            )
+        return await self.manager.approve(
+            request_id,
+            operator_id=operator_id,
+            idempotency_key=idempotency_key,
+            reason=reason,
+            metadata=metadata,
         )
-
-
 
     async def reject(
         self,
         request_id: str,
+        *,
+        operator_id: str | None = None,
+        idempotency_key: str | None = None,
+        reason: str = "",
+        metadata: Mapping[str, Any] | None = None,
     ) -> ApprovalRequest:
-
-
-        return await (
-            self.manager.reject(
-                request_id
-            )
+        return await self.manager.reject(
+            request_id,
+            operator_id=operator_id,
+            idempotency_key=idempotency_key,
+            reason=reason,
+            metadata=metadata,
         )
-
-
 
     async def get(
         self,
         request_id: str,
     ) -> ApprovalRequest | None:
+        return await self.manager.get_request(
+            request_id
+        )
 
+    async def list_by_incident(
+        self,
+        incident_id: UUID | str,
+    ) -> list[ApprovalRequest]:
+        """
+        Return every approval attempt linked to one Incident.
+
+        Ordering and filtering are delegated through ApprovalManager to the
+        indexed ApprovalStore query. No approval lifecycle state is changed.
+        """
 
         return await (
-            self.manager.get_request(
-                request_id
+            self.manager.list_requests_by_incident(
+                incident_id
             )
         )

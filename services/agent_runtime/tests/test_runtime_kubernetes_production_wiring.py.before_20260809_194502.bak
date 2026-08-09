@@ -1,0 +1,247 @@
+from pathlib import Path
+
+import pytest
+
+import services.agent_runtime.app.runtime.runtime as runtime_module
+
+from common.config.settings import AuthenticationConfig
+from services.agent_runtime.app.action.kubernetes_preflight import (
+    KubernetesPreflightPolicy,
+    KubernetesPreflightResolver,
+)
+from services.agent_runtime.app.action.kubernetes_production_executor import (
+    KubernetesProductionExecutor,
+    KubernetesProductionExecutorPolicy,
+)
+from services.agent_runtime.app.action.production_pilot_budget_service import (
+    ProductionPilotBudgetService,
+)
+from services.agent_runtime.app.action.production_pilot_budget_store import (
+    ProductionPilotBudgetStore,
+)
+from services.agent_runtime.app.action.safety_models import (
+    KubernetesWorkloadScope,
+)
+from services.agent_runtime.app.security.factory import (
+    create_authentication_service,
+)
+from services.agent_runtime.tests.test_production_pilot import (
+    NOW,
+    control,
+)
+
+
+def disabled_authentication_service():
+    return create_authentication_service(AuthenticationConfig())
+
+
+def scope() -> KubernetesWorkloadScope:
+    return KubernetesWorkloadScope(
+        cluster="production-a",
+        namespace="payment",
+        name="payment-api",
+        container="payment-api",
+    )
+
+
+def resolver() -> KubernetesPreflightResolver:
+    return KubernetesPreflightResolver(
+        api_url="https://kubernetes.test",
+        cluster_name="production-a",
+        policy=KubernetesPreflightPolicy(
+            enabled=True,
+            allowed_targets=(scope(),),
+        ),
+        bearer_token="preflight-service-token-0001",
+    )
+
+
+def budget_service(
+    tmp_path: Path,
+) -> ProductionPilotBudgetService:
+    return ProductionPilotBudgetService(
+        store=ProductionPilotBudgetStore(
+            tmp_path / "production_pilot_budget.db"
+        ),
+        clock=lambda: NOW,
+    )
+
+
+def production_executor(
+    *,
+    pilot_control=None,
+    pilot_budget_service=None,
+) -> KubernetesProductionExecutor:
+    return KubernetesProductionExecutor(
+        api_url="https://kubernetes.test",
+        cluster_name="production-a",
+        policy=KubernetesProductionExecutorPolicy(
+            enabled=True,
+            allowed_targets=(scope(),),
+        ),
+        bearer_token="production-writer-token-0001",
+        pilot_control=pilot_control,
+        pilot_budget_service=pilot_budget_service,
+    )
+
+
+def test_default_disabled_runtime_keeps_mock_execution_and_no_artifact_db(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        runtime_module,
+        "create_kubernetes_preflight_resolver",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "create_kubernetes_production_executor",
+        lambda **_: None,
+    )
+
+    runtime = runtime_module.AgentRuntime(
+        authentication_service=disabled_authentication_service()
+    )
+
+    assert runtime.kubernetes_preflight is None
+    assert runtime.kubernetes_production_executor is None
+    assert runtime.production_pilot_budget_store is None
+    assert runtime.production_pilot_budget_service is None
+    assert runtime.production_pilot_ceremony_store is None
+    assert runtime.production_pilot_ceremony is None
+    assert runtime.production_pilot_rehearsal is not None
+    assert (
+        runtime.production_pilot_readiness
+        .get()
+        .ready_for_execution
+        is False
+    )
+    assert runtime.action_runtime.executor.__class__.__name__ == "MockExecutor"
+    assert not (tmp_path / "data" / "preflight_artifacts.db").exists()
+    assert not (tmp_path / "data" / "production_pilot_budget.db").exists()
+    assert not (
+        tmp_path / "data" / "production_pilot_ceremonies.db"
+    ).exists()
+
+
+def test_runtime_shares_production_executor_only_with_durable_action_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    monkeypatch.chdir(tmp_path)
+    expected_preflight = resolver()
+    expected_control = control()
+    expected_budget = budget_service(tmp_path)
+    expected_executor = production_executor(
+        pilot_control=expected_control,
+        pilot_budget_service=expected_budget,
+    )
+
+    runtime = runtime_module.AgentRuntime(
+        authentication_service=disabled_authentication_service(),
+        kubernetes_preflight=expected_preflight,
+        kubernetes_production_executor=expected_executor,
+        production_pilot_control=expected_control,
+        production_pilot_budget_service=expected_budget,
+    )
+
+    assert runtime.kubernetes_preflight is expected_preflight
+    assert runtime.kubernetes_production_executor is expected_executor
+    assert runtime.action_runtime.executor.__class__.__name__ == "MockExecutor"
+    assert (
+        runtime.action_runtime.kubernetes_production_executor
+        is expected_executor
+    )
+    assert (
+        runtime.action_runtime.preflight_artifact_service
+        is runtime.preflight_artifact_service
+    )
+    assert (
+        runtime.production_pilot_control
+        is runtime.action_runtime.production_pilot_control
+    )
+    assert (
+        runtime.production_pilot_control
+        is expected_executor.pilot_control
+    )
+    assert runtime.production_pilot_budget_service is expected_budget
+    assert (
+        runtime.action_runtime.production_pilot_budget_service
+        is expected_budget
+    )
+    assert expected_executor.pilot_budget_service is expected_budget
+    assert (
+        runtime.production_pilot_rehearsal.budget_service
+        is expected_budget
+    )
+    assert runtime.production_pilot_ceremony is not None
+    assert runtime.production_pilot_ceremony_store is not None
+    assert (
+        runtime.production_pilot_ceremony.control
+        is expected_control
+    )
+    assert (
+        runtime.production_pilot_ceremony.rehearsal
+        is runtime.production_pilot_rehearsal
+    )
+    assert (
+        runtime.production_pilot_ceremony.budget_service
+        is expected_budget
+    )
+    assert (
+        runtime.production_pilot_ceremony.approval_service
+        is runtime.approval
+    )
+    assert (
+        runtime.production_pilot_ceremony.artifact_service
+        is runtime.preflight_artifact_service
+    )
+    assert (
+        runtime.action_runtime.production_pilot_ceremony_service
+        is runtime.production_pilot_ceremony
+    )
+
+
+def test_production_executor_requires_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        runtime_module,
+        "create_kubernetes_preflight_resolver",
+        lambda: None,
+    )
+    expected_control = control()
+    expected_budget = budget_service(tmp_path)
+
+    with pytest.raises(TypeError, match="requires trusted preflight"):
+        runtime_module.AgentRuntime(
+            authentication_service=disabled_authentication_service(),
+            kubernetes_production_executor=production_executor(
+                pilot_control=expected_control,
+                pilot_budget_service=expected_budget,
+            ),
+            production_pilot_control=expected_control,
+            production_pilot_budget_service=expected_budget,
+        )
+
+
+def test_invalid_production_executor_fails_before_factories(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def fail_factory():
+        raise AssertionError("factory must not run")
+
+    monkeypatch.setattr(
+        runtime_module,
+        "create_authentication_service",
+        fail_factory,
+    )
+
+    with pytest.raises(TypeError, match="production executor is invalid"):
+        runtime_module.AgentRuntime(
+            kubernetes_production_executor=object(),
+        )

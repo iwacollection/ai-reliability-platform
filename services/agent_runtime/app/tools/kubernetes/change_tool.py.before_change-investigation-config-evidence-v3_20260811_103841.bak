@@ -1,0 +1,2041 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from datetime import UTC, datetime
+from typing import Any
+from urllib.parse import quote, urlencode
+
+import httpx
+
+from services.agent_runtime.app.tools.base import (
+    BaseTool,
+)
+from services.agent_runtime.app.tools.kubernetes.tool import (
+    KubernetesAuthorizationError,
+    KubernetesConfigurationError,
+    KubernetesQueryError,
+    KubernetesResourceNotFoundError,
+    KubernetesTool,
+)
+
+
+class KubernetesChangeToolError(
+    RuntimeError
+):
+    """
+    Base error for the bounded read-only workload-change evidence tool.
+    """
+
+
+class KubernetesChangeTopologyError(
+    KubernetesChangeToolError
+):
+    """
+    The Pod owner chain cannot be proven as Pod -> ReplicaSet -> Deployment.
+    """
+
+
+class KubernetesChangeResponseError(
+    KubernetesChangeToolError
+):
+    """
+    Kubernetes workload/change payload is structurally invalid.
+    """
+
+
+class KubernetesChangeTool(
+    BaseTool
+):
+    """
+    Bounded read-only Deployment change evidence for one Pod.
+
+    The public contract accepts only a Pod scope and optional incident time.
+    It performs only GET requests to fixed Kubernetes Core/apps API paths.
+    The caller cannot supply a Kubernetes verb, resource kind, API path,
+    label selector or URL.
+    """
+
+    _MAX_HISTORY_ITEMS = 50
+    _DEPLOYMENT_REVISION_ANNOTATION = (
+        "deployment.kubernetes.io/revision"
+    )
+
+    def __init__(
+        self,
+        kubernetes: KubernetesTool | None = None,
+    ) -> None:
+        self.kubernetes = (
+            kubernetes
+            if kubernetes is not None
+            else KubernetesTool()
+        )
+
+        if not isinstance(
+            self.kubernetes,
+            KubernetesTool,
+        ):
+            raise TypeError(
+                "KubernetesChangeTool requires KubernetesTool"
+            )
+
+    @property
+    def name(
+        self,
+    ) -> str:
+        return "kubernetes_change"
+
+    @property
+    def is_available(
+        self,
+    ) -> bool:
+        return (
+            self.kubernetes.api_url
+            is not None
+        )
+
+    async def execute(
+        self,
+        target: str,
+        namespace: str = "default",
+        cluster: str | None = None,
+        incident_time: str | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        pod_name = self._required_text(
+            target,
+            "target",
+        )
+
+        namespace_value = self._required_text(
+            namespace,
+            "namespace",
+        )
+
+        if cluster is not None:
+            cluster_value = self._required_text(
+                cluster,
+                "cluster",
+            )
+
+            configured_cluster = (
+                self.kubernetes.cluster_name
+            )
+
+            if (
+                configured_cluster is not None
+                and cluster_value
+                != configured_cluster
+            ):
+                raise KubernetesChangeTopologyError(
+                    "Requested cluster does not match configured Kubernetes cluster"
+                )
+
+        if self.kubernetes.api_url is None:
+            raise KubernetesConfigurationError(
+                "KUBERNETES_API_URL is not configured"
+            )
+
+        incident_at = self._optional_time(
+            incident_time
+        )
+
+        if self.kubernetes.client is not None:
+            return await self._collect(
+                client=self.kubernetes.client,
+                pod_name=pod_name,
+                namespace=namespace_value,
+                incident_at=incident_at,
+            )
+
+        async with httpx.AsyncClient(
+            timeout=self.kubernetes.timeout_seconds,
+            verify=self.kubernetes._httpx_verify,
+        ) as client:
+            return await self._collect(
+                client=client,
+                pod_name=pod_name,
+                namespace=namespace_value,
+                incident_at=incident_at,
+            )
+
+    async def _collect(
+        self,
+        *,
+        client: httpx.AsyncClient,
+        pod_name: str,
+        namespace: str,
+        incident_at: datetime | None,
+    ) -> dict[str, Any]:
+        pod = await self._get_json(
+            client=client,
+            url=self._pod_url(
+                namespace=namespace,
+                name=pod_name,
+            ),
+        )
+
+        replica_set_owner = self._controller_owner(
+            pod,
+            expected_kind="ReplicaSet",
+        )
+
+        replica_set = await self._get_json(
+            client=client,
+            url=self._replica_set_url(
+                namespace=namespace,
+                name=replica_set_owner[
+                    "name"
+                ],
+            ),
+        )
+
+        self._require_metadata_identity(
+            replica_set,
+            expected_name=(
+                replica_set_owner[
+                    "name"
+                ]
+            ),
+            expected_uid=(
+                replica_set_owner[
+                    "uid"
+                ]
+            ),
+            label="ReplicaSet",
+        )
+
+        deployment_owner = self._controller_owner(
+            replica_set,
+            expected_kind="Deployment",
+        )
+
+        deployment = await self._get_json(
+            client=client,
+            url=self._deployment_url(
+                namespace=namespace,
+                name=deployment_owner[
+                    "name"
+                ],
+            ),
+        )
+
+        self._require_metadata_identity(
+            deployment,
+            expected_name=(
+                deployment_owner[
+                    "name"
+                ]
+            ),
+            expected_uid=(
+                deployment_owner[
+                    "uid"
+                ]
+            ),
+            label="Deployment",
+        )
+
+        selector = self._deployment_selector(
+            deployment
+        )
+
+        history_payload = await self._get_json(
+            client=client,
+            url=self._replica_set_list_url(
+                namespace=namespace,
+                selector=selector,
+            ),
+        )
+
+        history_items = history_payload.get(
+            "items"
+        )
+
+        if not isinstance(
+            history_items,
+            list,
+        ):
+            raise KubernetesChangeResponseError(
+                "ReplicaSet history items are invalid"
+            )
+
+        history_metadata = (
+            history_payload.get(
+                "metadata"
+            )
+        )
+
+        history_complete = True
+
+        if isinstance(
+            history_metadata,
+            Mapping,
+        ):
+            history_complete = not bool(
+                history_metadata.get(
+                    "continue"
+                )
+            )
+
+        current_revision = self._revision(
+            replica_set
+        )
+
+        deployment_revision = self._revision(
+            deployment
+        )
+
+        if (
+            deployment_revision is not None
+            and current_revision is not None
+            and deployment_revision
+            != current_revision
+        ):
+            raise KubernetesChangeTopologyError(
+                "Deployment and current ReplicaSet revisions disagree"
+            )
+
+        revision_after = (
+            current_revision
+            if current_revision is not None
+            else deployment_revision
+        )
+
+        deployment_metadata = self._metadata(
+            deployment,
+            "Deployment",
+        )
+
+        deployment_uid = deployment_metadata.get(
+            "uid"
+        )
+
+        history: list[
+            tuple[
+                int,
+                Mapping[str, Any],
+            ]
+        ] = []
+
+        for item in history_items[
+            :self._MAX_HISTORY_ITEMS
+        ]:
+            if not isinstance(
+                item,
+                Mapping,
+            ):
+                continue
+
+            if not self._owned_by(
+                item,
+                kind="Deployment",
+                name=deployment_owner[
+                    "name"
+                ],
+                uid=deployment_uid,
+            ):
+                continue
+
+            revision = self._revision(
+                item
+            )
+
+            if revision is None:
+                continue
+
+            history.append(
+                (
+                    revision,
+                    item,
+                )
+            )
+
+        previous_item = None
+        previous_revision = None
+
+        if revision_after is not None:
+            candidates = [
+                (
+                    revision,
+                    item,
+                )
+                for revision, item
+                in history
+                if revision < revision_after
+            ]
+
+            if candidates:
+                (
+                    previous_revision,
+                    previous_item,
+                ) = max(
+                    candidates,
+                    key=lambda pair: pair[
+                        0
+                    ],
+                )
+
+        image_after = self._template_images(
+            replica_set
+        )
+
+        if image_after is None:
+            image_after = self._template_images(
+                deployment
+            )
+
+        image_before = (
+            self._template_images(
+                previous_item
+            )
+            if previous_item is not None
+            else None
+        )
+
+        image_changed = (
+            (
+                image_before
+                != image_after
+            )
+            if (
+                image_before is not None
+                and image_after is not None
+            )
+            else None
+        )
+
+        rollout_started_at = self._creation_timestamp(
+            replica_set
+        )
+
+        rollout_offset_seconds = None
+
+        if (
+            incident_at is not None
+            and rollout_started_at
+            is not None
+        ):
+            rollout_offset_seconds = (
+                incident_at
+                - rollout_started_at
+            ).total_seconds()
+
+        spec = deployment.get(
+            "spec"
+        )
+
+        status = deployment.get(
+            "status"
+        )
+
+        if not isinstance(
+            spec,
+            Mapping,
+        ):
+            spec = {}
+
+        if not isinstance(
+            status,
+            Mapping,
+        ):
+            status = {}
+
+        rollout_facts = self._rollout_facts(
+            deployment=deployment,
+        )
+
+        event_facts = await self._collect_event_facts(
+            client=client,
+            namespace=namespace,
+            incident_at=incident_at,
+            objects=[
+                (
+                    "Pod",
+                    self._metadata(
+                        pod,
+                        "Pod",
+                    ),
+                ),
+                (
+                    "ReplicaSet",
+                    self._metadata(
+                        replica_set,
+                        "ReplicaSet",
+                    ),
+                ),
+                (
+                    "Deployment",
+                    deployment_metadata,
+                ),
+            ],
+        )
+
+        observed_at = self._now()
+
+        return {
+            "success": True,
+            "source": "kubernetes_change",
+            "mode": "read_only",
+            "production_signal": True,
+            "observed_at": (
+                observed_at.isoformat()
+            ),
+            "cluster": (
+                self.kubernetes.cluster_name
+            ),
+            "data": {
+                "owner_chain_verified": True,
+                "workload_kind": "Deployment",
+                "deployment_name": (
+                    deployment_owner[
+                        "name"
+                    ]
+                ),
+                "revision_before": (
+                    previous_revision
+                ),
+                "revision_after": (
+                    revision_after
+                ),
+                "revision_changed": (
+                    (
+                        previous_revision
+                        != revision_after
+                    )
+                    if (
+                        previous_revision is not None
+                        and revision_after is not None
+                    )
+                    else None
+                ),
+                "image_before": (
+                    image_before
+                ),
+                "image_after": (
+                    image_after
+                ),
+                "image_changed": (
+                    image_changed
+                ),
+                "rollout_started_at": (
+                    rollout_started_at.isoformat()
+                    if rollout_started_at
+                    is not None
+                    else None
+                ),
+                "rollout_offset_seconds": (
+                    rollout_offset_seconds
+                ),
+                "generation": (
+                    self._non_negative_int(
+                        deployment_metadata.get(
+                            "generation"
+                        )
+                    )
+                ),
+                "observed_generation": (
+                    self._non_negative_int(
+                        status.get(
+                            "observedGeneration"
+                        )
+                    )
+                ),
+                "replicas_desired": (
+                    self._non_negative_int(
+                        spec.get(
+                            "replicas"
+                        )
+                    )
+                ),
+                "replicas_updated": (
+                    self._non_negative_int(
+                        status.get(
+                            "updatedReplicas"
+                        )
+                    )
+                ),
+                "replicas_ready": (
+                    self._non_negative_int(
+                        status.get(
+                            "readyReplicas"
+                        )
+                    )
+                ),
+                "replicas_available": (
+                    self._non_negative_int(
+                        status.get(
+                            "availableReplicas"
+                        )
+                    )
+                ),
+                "replicas_unavailable": (
+                    self._non_negative_int(
+                        status.get(
+                            "unavailableReplicas"
+                        )
+                    )
+                ),
+                "history_complete": (
+                    history_complete
+                ),
+                **rollout_facts,
+                **event_facts,
+            },
+        }
+
+    @classmethod
+    def _rollout_facts(
+        cls,
+        *,
+        deployment: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        metadata = cls._metadata(
+            deployment,
+            "Deployment",
+        )
+
+        spec = deployment.get(
+            "spec"
+        )
+
+        status = deployment.get(
+            "status"
+        )
+
+        if not isinstance(
+            spec,
+            Mapping,
+        ):
+            spec = {}
+
+        if not isinstance(
+            status,
+            Mapping,
+        ):
+            status = {}
+
+        conditions = status.get(
+            "conditions"
+        )
+
+        if not isinstance(
+            conditions,
+            list,
+        ):
+            conditions = []
+
+        condition_map: dict[
+            str,
+            Mapping[str, Any],
+        ] = {}
+
+        for condition in conditions[
+            :32
+        ]:
+            if not isinstance(
+                condition,
+                Mapping,
+            ):
+                continue
+
+            condition_type = condition.get(
+                "type"
+            )
+
+            if not isinstance(
+                condition_type,
+                str,
+            ):
+                continue
+
+            if condition_type in {
+                "Progressing",
+                "Available",
+                "ReplicaFailure",
+            }:
+                condition_map[
+                    condition_type
+                ] = condition
+
+        progressing = condition_map.get(
+            "Progressing",
+            {},
+        )
+
+        available = condition_map.get(
+            "Available",
+            {},
+        )
+
+        replica_failure = condition_map.get(
+            "ReplicaFailure",
+            {},
+        )
+
+        progressing_status = cls._condition_status(
+            progressing.get(
+                "status"
+            )
+        )
+
+        available_status = cls._condition_status(
+            available.get(
+                "status"
+            )
+        )
+
+        replica_failure_status = cls._condition_status(
+            replica_failure.get(
+                "status"
+            )
+        )
+
+        progressing_reason = cls._optional_bounded_text(
+            progressing.get(
+                "reason"
+            ),
+            limit=128,
+        )
+
+        available_reason = cls._optional_bounded_text(
+            available.get(
+                "reason"
+            ),
+            limit=128,
+        )
+
+        replica_failure_reason = cls._optional_bounded_text(
+            replica_failure.get(
+                "reason"
+            ),
+            limit=128,
+        )
+
+        failure_reasons = []
+
+        if (
+            progressing_status
+            == "False"
+            and progressing_reason
+            == "ProgressDeadlineExceeded"
+        ):
+            failure_reasons.append(
+                progressing_reason
+            )
+
+        if (
+            replica_failure_status
+            == "True"
+        ):
+            failure_reasons.append(
+                replica_failure_reason
+                or "ReplicaFailure"
+            )
+
+        desired = cls._non_negative_int(
+            spec.get(
+                "replicas"
+            )
+        )
+
+        updated = cls._non_negative_int(
+            status.get(
+                "updatedReplicas"
+            )
+        )
+
+        ready = cls._non_negative_int(
+            status.get(
+                "readyReplicas"
+            )
+        )
+
+        available_replicas = (
+            cls._non_negative_int(
+                status.get(
+                    "availableReplicas"
+                )
+            )
+        )
+
+        generation = cls._non_negative_int(
+            metadata.get(
+                "generation"
+            )
+        )
+
+        observed_generation = (
+            cls._non_negative_int(
+                status.get(
+                    "observedGeneration"
+                )
+            )
+        )
+
+        generation_observed = None
+
+        if (
+            generation is not None
+            and observed_generation
+            is not None
+        ):
+            generation_observed = (
+                observed_generation
+                >= generation
+            )
+
+        rollout_complete = None
+
+        if desired is not None:
+            rollout_complete = (
+                generation_observed
+                is True
+                and updated
+                == desired
+                and ready
+                == desired
+                and available_replicas
+                == desired
+                and not failure_reasons
+            )
+
+        condition_parts = [
+            (
+                "Progressing="
+                + (
+                    progressing_status
+                    or "Unknown"
+                )
+                + ":"
+                + (
+                    progressing_reason
+                    or "-"
+                )
+            ),
+            (
+                "Available="
+                + (
+                    available_status
+                    or "Unknown"
+                )
+                + ":"
+                + (
+                    available_reason
+                    or "-"
+                )
+            ),
+            (
+                "ReplicaFailure="
+                + (
+                    replica_failure_status
+                    or "Unknown"
+                )
+                + ":"
+                + (
+                    replica_failure_reason
+                    or "-"
+                )
+            ),
+        ]
+
+        return {
+            "rollout_condition_summary": (
+                ";".join(
+                    condition_parts
+                )[
+                    :512
+                ]
+            ),
+            "generation_observed": (
+                generation_observed
+            ),
+            "rollout_complete": (
+                rollout_complete
+            ),
+            "rollout_failure_signal": (
+                bool(
+                    failure_reasons
+                )
+            ),
+            "rollout_failure_reason": (
+                ";".join(
+                    failure_reasons
+                )[
+                    :256
+                ]
+                if failure_reasons
+                else None
+            ),
+        }
+
+    async def _collect_event_facts(
+        self,
+        *,
+        client: httpx.AsyncClient,
+        namespace: str,
+        incident_at: datetime | None,
+        objects: list[
+            tuple[
+                str,
+                Mapping[str, Any],
+            ]
+        ],
+    ) -> dict[str, Any]:
+        records: list[
+            dict[str, Any]
+        ] = []
+
+        query_successes = 0
+        query_failures: list[
+            str
+        ] = []
+
+        for kind, metadata in objects:
+            uid = metadata.get(
+                "uid"
+            )
+
+            name = metadata.get(
+                "name"
+            )
+
+            if (
+                not isinstance(
+                    uid,
+                    str,
+                )
+                or not uid.strip()
+                or not isinstance(
+                    name,
+                    str,
+                )
+                or not name.strip()
+            ):
+                continue
+
+            try:
+                payload = await self._get_json(
+                    client=client,
+                    url=self._event_list_url(
+                        namespace=namespace,
+                        uid=uid.strip(),
+                    ),
+                )
+
+            except KubernetesAuthorizationError:
+                query_failures.append(
+                    "authorization_denied"
+                )
+                continue
+
+            except KubernetesResourceNotFoundError:
+                query_failures.append(
+                    "not_found"
+                )
+                continue
+
+            except KubernetesQueryError:
+                query_failures.append(
+                    "query_failed"
+                )
+                continue
+
+            query_successes += 1
+
+            items = payload.get(
+                "items"
+            )
+
+            if not isinstance(
+                items,
+                list,
+            ):
+                query_failures.append(
+                    "invalid_payload"
+                )
+                continue
+
+            for item in items[
+                :self._MAX_HISTORY_ITEMS
+            ]:
+                record = self._event_record(
+                    item=item,
+                    default_kind=kind,
+                    default_name=name.strip(),
+                )
+
+                if record is None:
+                    continue
+
+                if (
+                    incident_at is not None
+                    and record[
+                        "observed_at"
+                    ]
+                    is not None
+                ):
+                    delta_seconds = (
+                        incident_at
+                        - record[
+                            "observed_at"
+                        ]
+                    ).total_seconds()
+
+                    if not (
+                        -900.0
+                        <= delta_seconds
+                        <= 3600.0
+                    ):
+                        continue
+
+                    record[
+                        "incident_offset_seconds"
+                    ] = (
+                        delta_seconds
+                    )
+
+                records.append(
+                    record
+                )
+
+        records.sort(
+            key=lambda item: (
+                item[
+                    "observed_at"
+                ]
+                or datetime.min.replace(
+                    tzinfo=UTC
+                )
+            ),
+            reverse=True,
+        )
+
+        records = records[
+            :12
+        ]
+
+        warning_count = sum(
+            1
+            for item in records
+            if item[
+                "type"
+            ] == "Warning"
+        )
+
+        reasons = []
+
+        for item in records:
+            reason = item.get(
+                "reason"
+            )
+
+            if (
+                reason
+                and reason not in reasons
+            ):
+                reasons.append(
+                    reason
+                )
+
+        summaries = []
+
+        for item in records:
+            timestamp = (
+                item[
+                    "observed_at"
+                ].isoformat()
+                if item[
+                    "observed_at"
+                ]
+                is not None
+                else "unknown-time"
+            )
+
+            summary = (
+                f"{timestamp} "
+                f"{item['kind']}/{item['name']} "
+                f"{item['type']} "
+                f"{item['reason'] or 'UnknownReason'}"
+            )
+
+            message = item.get(
+                "message"
+            )
+
+            if message:
+                summary += (
+                    ": "
+                    + message
+                )
+
+            summaries.append(
+                summary
+            )
+
+        if query_successes == 0:
+            events_status = (
+                "unavailable"
+            )
+
+        elif query_failures:
+            events_status = "partial"
+
+        else:
+            events_status = "complete"
+
+        return {
+            "events_status": (
+                events_status
+            ),
+            "events_error_code": (
+                query_failures[
+                    0
+                ]
+                if query_failures
+                else None
+            ),
+            "recent_event_count": (
+                len(
+                    records
+                )
+            ),
+            "recent_warning_count": (
+                warning_count
+            ),
+            "recent_event_reasons": (
+                ";".join(
+                    reasons
+                )[
+                    :512
+                ]
+                if reasons
+                else None
+            ),
+            "recent_event_summary": (
+                " | ".join(
+                    summaries
+                )[
+                    :1536
+                ]
+                if summaries
+                else None
+            ),
+        }
+
+    @classmethod
+    def _event_record(
+        cls,
+        *,
+        item: Any,
+        default_kind: str,
+        default_name: str,
+    ) -> dict[str, Any] | None:
+        if not isinstance(
+            item,
+            Mapping,
+        ):
+            return None
+
+        involved = item.get(
+            "involvedObject"
+        )
+
+        if not isinstance(
+            involved,
+            Mapping,
+        ):
+            involved = {}
+
+        kind = cls._optional_bounded_text(
+            involved.get(
+                "kind"
+            ),
+            limit=64,
+        ) or default_kind
+
+        name = cls._optional_bounded_text(
+            involved.get(
+                "name"
+            ),
+            limit=253,
+        ) or default_name
+
+        event_type = cls._optional_bounded_text(
+            item.get(
+                "type"
+            ),
+            limit=32,
+        ) or "Normal"
+
+        reason = cls._optional_bounded_text(
+            item.get(
+                "reason"
+            ),
+            limit=128,
+        )
+
+        message = cls._optional_bounded_text(
+            item.get(
+                "message"
+            ),
+            limit=512,
+        )
+
+        observed_at = cls._event_time(
+            item
+        )
+
+        return {
+            "kind": kind,
+            "name": name,
+            "type": event_type,
+            "reason": reason,
+            "message": message,
+            "observed_at": (
+                observed_at
+            ),
+        }
+
+    @classmethod
+    def _event_time(
+        cls,
+        item: Mapping[str, Any],
+    ) -> datetime | None:
+        candidates = [
+            item.get(
+                "eventTime"
+            ),
+            (
+                item.get(
+                    "series"
+                )
+                or {}
+            ).get(
+                "lastObservedTime"
+            )
+            if isinstance(
+                item.get(
+                    "series"
+                ),
+                Mapping,
+            )
+            else None,
+            item.get(
+                "lastTimestamp"
+            ),
+            item.get(
+                "firstTimestamp"
+            ),
+        ]
+
+        metadata = item.get(
+            "metadata"
+        )
+
+        if isinstance(
+            metadata,
+            Mapping,
+        ):
+            candidates.append(
+                metadata.get(
+                    "creationTimestamp"
+                )
+            )
+
+        for candidate in candidates:
+            if candidate is None:
+                continue
+
+            try:
+                parsed = cls._optional_time(
+                    candidate
+                )
+            except KubernetesChangeResponseError:
+                continue
+
+            if parsed is not None:
+                return parsed
+
+        return None
+
+    @staticmethod
+    def _condition_status(
+        value: Any,
+    ) -> str | None:
+        if value is None:
+            return None
+
+        if value not in {
+            "True",
+            "False",
+            "Unknown",
+        }:
+            raise KubernetesChangeResponseError(
+                "Deployment condition status is invalid"
+            )
+
+        return value
+
+    @staticmethod
+    def _optional_bounded_text(
+        value: Any,
+        *,
+        limit: int,
+    ) -> str | None:
+        if value is None:
+            return None
+
+        if not isinstance(
+            value,
+            str,
+        ):
+            raise KubernetesChangeResponseError(
+                "Kubernetes change text value is invalid"
+            )
+
+        normalized = (
+            " ".join(
+                value.split()
+            )
+        )
+
+        if not normalized:
+            return None
+
+        return normalized[
+            :limit
+        ]
+
+    async def _get_json(
+        self,
+        *,
+        client: httpx.AsyncClient,
+        url: str,
+    ) -> dict[str, Any]:
+        try:
+            response = await client.get(
+                url,
+                headers=self.kubernetes._headers,
+            )
+        except httpx.HTTPError as exc:
+            raise KubernetesQueryError(
+                "Kubernetes change evidence query failed"
+            ) from exc
+
+        status = response.status_code
+
+        if status in {
+            401,
+            403,
+        }:
+            raise KubernetesAuthorizationError(
+                "Kubernetes authorization failed"
+            )
+
+        if status == 404:
+            raise KubernetesResourceNotFoundError(
+                "Kubernetes change resource not found"
+            )
+
+        if (
+            status < 200
+            or status >= 300
+        ):
+            raise KubernetesQueryError(
+                f"Kubernetes change query failed with HTTP {status}"
+            )
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise KubernetesChangeResponseError(
+                "Kubernetes change response is invalid JSON"
+            ) from exc
+
+        if not isinstance(
+            payload,
+            dict,
+        ):
+            raise KubernetesChangeResponseError(
+                "Kubernetes change response payload is invalid"
+            )
+
+        return payload
+
+    @staticmethod
+    def _metadata(
+        payload: Mapping[str, Any],
+        label: str,
+    ) -> Mapping[str, Any]:
+        metadata = payload.get(
+            "metadata"
+        )
+
+        if not isinstance(
+            metadata,
+            Mapping,
+        ):
+            raise KubernetesChangeResponseError(
+                f"{label} metadata is invalid"
+            )
+
+        return metadata
+
+    @classmethod
+    def _controller_owner(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        expected_kind: str,
+    ) -> dict[str, str]:
+        metadata = cls._metadata(
+            payload,
+            expected_kind,
+        )
+
+        owners = metadata.get(
+            "ownerReferences"
+        )
+
+        if not isinstance(
+            owners,
+            list,
+        ):
+            raise KubernetesChangeTopologyError(
+                f"{expected_kind} controller owner is unavailable"
+            )
+
+        matches = []
+
+        for owner in owners:
+            if not isinstance(
+                owner,
+                Mapping,
+            ):
+                continue
+
+            if (
+                owner.get(
+                    "controller"
+                )
+                is not True
+            ):
+                continue
+
+            if owner.get(
+                "kind"
+            ) != expected_kind:
+                continue
+
+            name = owner.get(
+                "name"
+            )
+
+            uid = owner.get(
+                "uid"
+            )
+
+            if (
+                isinstance(
+                    name,
+                    str,
+                )
+                and name.strip()
+                and isinstance(
+                    uid,
+                    str,
+                )
+                and uid.strip()
+            ):
+                matches.append(
+                    {
+                        "name": (
+                            name.strip()
+                        ),
+                        "uid": (
+                            uid.strip()
+                        ),
+                    }
+                )
+
+        if len(
+            matches
+        ) != 1:
+            raise KubernetesChangeTopologyError(
+                f"Expected one controller {expected_kind} owner"
+            )
+
+        return matches[
+            0
+        ]
+
+    @classmethod
+    def _require_metadata_identity(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        expected_name: str,
+        expected_uid: str,
+        label: str,
+    ) -> None:
+        metadata = cls._metadata(
+            payload,
+            label,
+        )
+
+        if (
+            metadata.get(
+                "name"
+            )
+            != expected_name
+            or metadata.get(
+                "uid"
+            )
+            != expected_uid
+        ):
+            raise KubernetesChangeTopologyError(
+                f"{label} identity does not match owner reference"
+            )
+
+    @classmethod
+    def _owned_by(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        kind: str,
+        name: str,
+        uid: Any,
+    ) -> bool:
+        metadata = payload.get(
+            "metadata"
+        )
+
+        if not isinstance(
+            metadata,
+            Mapping,
+        ):
+            return False
+
+        owners = metadata.get(
+            "ownerReferences"
+        )
+
+        if not isinstance(
+            owners,
+            list,
+        ):
+            return False
+
+        for owner in owners:
+            if not isinstance(
+                owner,
+                Mapping,
+            ):
+                continue
+
+            if (
+                owner.get(
+                    "controller"
+                )
+                is True
+                and owner.get(
+                    "kind"
+                )
+                == kind
+                and owner.get(
+                    "name"
+                )
+                == name
+                and (
+                    uid is None
+                    or owner.get(
+                        "uid"
+                    )
+                    == uid
+                )
+            ):
+                return True
+
+        return False
+
+    @classmethod
+    def _deployment_selector(
+        cls,
+        deployment: Mapping[str, Any],
+    ) -> str:
+        spec = deployment.get(
+            "spec"
+        )
+
+        if not isinstance(
+            spec,
+            Mapping,
+        ):
+            raise KubernetesChangeResponseError(
+                "Deployment spec is invalid"
+            )
+
+        selector = spec.get(
+            "selector"
+        )
+
+        if not isinstance(
+            selector,
+            Mapping,
+        ):
+            raise KubernetesChangeResponseError(
+                "Deployment selector is invalid"
+            )
+
+        match_labels = selector.get(
+            "matchLabels"
+        )
+
+        if (
+            not isinstance(
+                match_labels,
+                Mapping,
+            )
+            or not match_labels
+            or len(
+                match_labels
+            )
+            > 16
+        ):
+            raise KubernetesChangeResponseError(
+                "Deployment matchLabels selector is unsupported"
+            )
+
+        pairs = []
+
+        for key in sorted(
+            match_labels
+        ):
+            value = match_labels[
+                key
+            ]
+
+            if (
+                not isinstance(
+                    key,
+                    str,
+                )
+                or not key
+                or len(
+                    key
+                )
+                > 253
+                or not isinstance(
+                    value,
+                    str,
+                )
+                or len(
+                    value
+                )
+                > 63
+                or "," in key
+                or "=" in key
+                or "," in value
+                or "=" in value
+            ):
+                raise KubernetesChangeResponseError(
+                    "Deployment label selector is invalid"
+                )
+
+            pairs.append(
+                f"{key}={value}"
+            )
+
+        return ",".join(
+            pairs
+        )
+
+    @classmethod
+    def _revision(
+        cls,
+        payload: Mapping[str, Any] | None,
+    ) -> int | None:
+        if payload is None:
+            return None
+
+        metadata = payload.get(
+            "metadata"
+        )
+
+        if not isinstance(
+            metadata,
+            Mapping,
+        ):
+            return None
+
+        annotations = metadata.get(
+            "annotations"
+        )
+
+        if not isinstance(
+            annotations,
+            Mapping,
+        ):
+            return None
+
+        raw = annotations.get(
+            cls._DEPLOYMENT_REVISION_ANNOTATION
+        )
+
+        if raw is None:
+            return None
+
+        try:
+            value = int(
+                raw
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            raise KubernetesChangeResponseError(
+                "Deployment revision is invalid"
+            )
+
+        if (
+            value < 0
+            or value > 1_000_000_000
+        ):
+            raise KubernetesChangeResponseError(
+                "Deployment revision is invalid"
+            )
+
+        return value
+
+    @staticmethod
+    def _template_images(
+        payload: Mapping[str, Any] | None,
+    ) -> str | None:
+        if payload is None:
+            return None
+
+        spec = payload.get(
+            "spec"
+        )
+
+        if not isinstance(
+            spec,
+            Mapping,
+        ):
+            return None
+
+        template = spec.get(
+            "template"
+        )
+
+        if not isinstance(
+            template,
+            Mapping,
+        ):
+            return None
+
+        template_spec = template.get(
+            "spec"
+        )
+
+        if not isinstance(
+            template_spec,
+            Mapping,
+        ):
+            return None
+
+        containers = template_spec.get(
+            "containers"
+        )
+
+        if not isinstance(
+            containers,
+            list,
+        ):
+            return None
+
+        pairs = []
+
+        for container in containers[
+            :8
+        ]:
+            if not isinstance(
+                container,
+                Mapping,
+            ):
+                continue
+
+            name = container.get(
+                "name"
+            )
+
+            image = container.get(
+                "image"
+            )
+
+            if (
+                not isinstance(
+                    name,
+                    str,
+                )
+                or not name.strip()
+                or not isinstance(
+                    image,
+                    str,
+                )
+                or not image.strip()
+            ):
+                continue
+
+            pairs.append(
+                (
+                    name.strip()[
+                        :128
+                    ],
+                    image.strip()[
+                        :256
+                    ],
+                )
+            )
+
+        if not pairs:
+            return None
+
+        return ";".join(
+            f"{name}={image}"
+            for name, image
+            in sorted(
+                pairs
+            )
+        )[:512]
+
+    @classmethod
+    def _creation_timestamp(
+        cls,
+        payload: Mapping[str, Any],
+    ) -> datetime | None:
+        metadata = cls._metadata(
+            payload,
+            "Kubernetes resource",
+        )
+
+        return cls._optional_time(
+            metadata.get(
+                "creationTimestamp"
+            )
+        )
+
+    @staticmethod
+    def _optional_time(
+        value: Any,
+    ) -> datetime | None:
+        if value is None:
+            return None
+
+        if not isinstance(
+            value,
+            str,
+        ):
+            raise KubernetesChangeResponseError(
+                "Kubernetes change timestamp is invalid"
+            )
+
+        text = value.strip()
+
+        if not text:
+            return None
+
+        if text.endswith(
+            "Z"
+        ):
+            text = (
+                text[
+                    :-1
+                ]
+                + "+00:00"
+            )
+
+        try:
+            parsed = datetime.fromisoformat(
+                text
+            )
+        except ValueError as exc:
+            raise KubernetesChangeResponseError(
+                "Kubernetes change timestamp is invalid"
+            ) from exc
+
+        if parsed.tzinfo is None:
+            raise KubernetesChangeResponseError(
+                "Kubernetes change timestamp must be timezone-aware"
+            )
+
+        return parsed.astimezone(
+            UTC
+        )
+
+    @staticmethod
+    def _non_negative_int(
+        value: Any,
+    ) -> int | None:
+        if value is None:
+            return None
+
+        if (
+            isinstance(
+                value,
+                bool,
+            )
+            or not isinstance(
+                value,
+                int,
+            )
+            or value < 0
+            or value > 1_000_000_000
+        ):
+            raise KubernetesChangeResponseError(
+                "Kubernetes change integer is invalid"
+            )
+
+        return value
+
+    @staticmethod
+    def _required_text(
+        value: Any,
+        label: str,
+    ) -> str:
+        if not isinstance(
+            value,
+            str,
+        ):
+            raise KubernetesChangeToolError(
+                f"Kubernetes change {label} is invalid"
+            )
+
+        normalized = value.strip()
+
+        if (
+            not normalized
+            or len(
+                normalized
+            )
+            > 253
+        ):
+            raise KubernetesChangeToolError(
+                f"Kubernetes change {label} is invalid"
+            )
+
+        return normalized
+
+    def _event_list_url(
+        self,
+        *,
+        namespace: str,
+        uid: str,
+    ) -> str:
+        query = urlencode(
+            {
+                "fieldSelector": (
+                    "involvedObject.uid="
+                    + uid
+                ),
+                "limit": str(
+                    self._MAX_HISTORY_ITEMS
+                ),
+            }
+        )
+
+        return (
+            f"{self.kubernetes.api_url}"
+            "/api/v1/namespaces/"
+            f"{quote(namespace, safe='')}"
+            "/events"
+            f"?{query}"
+        )
+
+    def _pod_url(
+        self,
+        *,
+        namespace: str,
+        name: str,
+    ) -> str:
+        return (
+            f"{self.kubernetes.api_url}"
+            "/api/v1/namespaces/"
+            f"{quote(namespace, safe='')}"
+            "/pods/"
+            f"{quote(name, safe='')}"
+        )
+
+    def _replica_set_url(
+        self,
+        *,
+        namespace: str,
+        name: str,
+    ) -> str:
+        return (
+            f"{self.kubernetes.api_url}"
+            "/apis/apps/v1/namespaces/"
+            f"{quote(namespace, safe='')}"
+            "/replicasets/"
+            f"{quote(name, safe='')}"
+        )
+
+    def _deployment_url(
+        self,
+        *,
+        namespace: str,
+        name: str,
+    ) -> str:
+        return (
+            f"{self.kubernetes.api_url}"
+            "/apis/apps/v1/namespaces/"
+            f"{quote(namespace, safe='')}"
+            "/deployments/"
+            f"{quote(name, safe='')}"
+        )
+
+    def _replica_set_list_url(
+        self,
+        *,
+        namespace: str,
+        selector: str,
+    ) -> str:
+        query = urlencode(
+            {
+                "labelSelector": (
+                    selector
+                ),
+                "limit": str(
+                    self._MAX_HISTORY_ITEMS
+                ),
+            }
+        )
+
+        return (
+            f"{self.kubernetes.api_url}"
+            "/apis/apps/v1/namespaces/"
+            f"{quote(namespace, safe='')}"
+            "/replicasets"
+            f"?{query}"
+        )
+
+    def _now(
+        self,
+    ) -> datetime:
+        value = self.kubernetes._clock()
+
+        if value.tzinfo is None:
+            return value.replace(
+                tzinfo=UTC
+            )
+
+        return value.astimezone(
+            UTC
+        )
+
+
+__all__ = [
+    "KubernetesChangeResponseError",
+    "KubernetesChangeTool",
+    "KubernetesChangeToolError",
+    "KubernetesChangeTopologyError",
+]

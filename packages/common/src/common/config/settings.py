@@ -1,8 +1,55 @@
+from collections.abc import Mapping
+from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
+from re import fullmatch
+from typing import Any
+from urllib.parse import urlparse
 
 import yaml
-from pydantic import BaseModel
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
+
+
+_PROVIDER_NAME_PATTERN = (
+    r"[a-z][a-z0-9_.-]{0,127}"
+)
+
+
+_ENVIRONMENT_NAME_PATTERN = (
+    r"[A-Z][A-Z0-9_]{2,127}"
+)
+
+
+_ALLOWED_OPERATOR_ROLES = frozenset(
+    {
+        "viewer",
+        "analyst",
+        "approver",
+        "executor",
+        "reconciler",
+        "admin",
+        "service",
+    }
+)
+
+
+_SENSITIVE_ATTRIBUTE_FRAGMENTS = (
+    "authorization",
+    "credential",
+    "password",
+    "secret",
+    "token",
+    "api_key",
+    "apikey",
+    "private_key",
+)
 
 
 class AppConfig(BaseModel):
@@ -13,6 +60,39 @@ class AppConfig(BaseModel):
     name: str
 
     version: str
+
+
+class RateLimitConfig(BaseModel):
+    """
+    LLM gateway rate limit configuration.
+    """
+
+    enabled: bool = True
+
+    requests_per_minute: int = 60
+
+
+class LLMGatewayConfig(BaseModel):
+    """
+    LLM Gateway reliability configuration.
+
+    Controls:
+
+    - fallback
+    - retry
+    - timeout
+    - rate limit
+    """
+
+    fallback_enabled: bool = True
+
+    retry_attempts: int = 3
+
+    request_timeout: int = 30
+
+    rate_limit: RateLimitConfig = Field(
+        default_factory=RateLimitConfig
+    )
 
 
 class LLMConfig(BaseModel):
@@ -26,6 +106,10 @@ class LLMConfig(BaseModel):
 
     timeout: int
 
+    gateway: LLMGatewayConfig = Field(
+        default_factory=LLMGatewayConfig
+    )
+
 
 class RuntimeConfig(BaseModel):
     """
@@ -35,6 +119,1515 @@ class RuntimeConfig(BaseModel):
     pipeline: str
 
     max_workers: int
+
+
+class KubernetesPreflightTargetConfig(BaseModel):
+    """One exact Deployment container allowed by OOMKilled Pilot v1."""
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+    )
+
+    cluster: str = Field(min_length=1, max_length=128)
+    namespace: str = Field(min_length=1, max_length=63)
+    deployment: str = Field(min_length=1, max_length=253)
+    container: str = Field(min_length=1, max_length=63)
+
+    @field_validator(
+        "cluster",
+        "namespace",
+        "deployment",
+        "container",
+        mode="before",
+    )
+    @classmethod
+    def validate_exact_target_text(
+        cls,
+        value: Any,
+        info,
+    ) -> str:
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+        ):
+            raise ValueError(
+                "Kubernetes preflight target fields must be exact text"
+            )
+
+        if info.field_name == "cluster":
+            pattern = r"[A-Za-z0-9](?:[A-Za-z0-9_.:-]{0,126}[A-Za-z0-9])?"
+        elif info.field_name == "deployment":
+            label = r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?"
+            pattern = rf"{label}(?:\.{label})*"
+        else:
+            pattern = r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?"
+
+        if fullmatch(pattern, value) is None:
+            raise ValueError(
+                "Kubernetes preflight target identifier is invalid"
+            )
+
+        return value
+
+
+class KubernetesPreflightConfig(BaseModel):
+    """
+    Fail-closed production configuration for trusted Kubernetes preflight.
+
+    The configuration stores only a credential environment-variable name or
+    token-file path. The bearer token itself must never be serialized here.
+    """
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+    )
+
+    enabled: bool = False
+    api_url: str | None = None
+    cluster_name: str | None = None
+    bearer_token_env: str | None = None
+    bearer_token_file: str | None = None
+    ca_file: str | None = None
+    allowed_targets: tuple[
+        KubernetesPreflightTargetConfig,
+        ...,
+    ] = Field(default_factory=tuple)
+    increase_percent: int = Field(default=25, ge=1, le=25)
+    contract_ttl_seconds: int = Field(default=600, ge=60, le=900)
+    request_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
+    field_manager: str = "ai-reliability-platform"
+    policy_version: str = "oom-memory-increase-v1"
+
+    @field_validator("api_url", mode="before")
+    @classmethod
+    def validate_api_url(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+        ):
+            raise ValueError("Kubernetes API URL is invalid")
+
+        normalized = value.rstrip("/")
+        parsed = urlparse(normalized)
+        if (
+            parsed.scheme != "https"
+            or not parsed.netloc
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+        ):
+            raise ValueError("Kubernetes API URL must be a clean HTTPS origin")
+
+        return normalized
+
+    @field_validator("cluster_name", mode="before")
+    @classmethod
+    def validate_cluster_name(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        if (
+            not isinstance(value, str)
+            or value != value.strip()
+            or fullmatch(
+                r"[A-Za-z0-9](?:[A-Za-z0-9_.:-]{0,126}[A-Za-z0-9])?",
+                value,
+            )
+            is None
+        ):
+            raise ValueError("Kubernetes cluster name is invalid")
+        return value
+
+    @field_validator("bearer_token_env", mode="before")
+    @classmethod
+    def validate_bearer_token_env(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        if (
+            not isinstance(value, str)
+            or value != value.strip()
+            or fullmatch(_ENVIRONMENT_NAME_PATTERN, value) is None
+        ):
+            raise ValueError(
+                "Kubernetes bearer-token environment name is invalid"
+            )
+        return value
+
+    @field_validator("bearer_token_file", "ca_file", mode="before")
+    @classmethod
+    def validate_file_reference(
+        cls,
+        value: Any,
+        info,
+    ) -> str | None:
+        if value is None:
+            return None
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or "\x00" in value
+            or len(value) > 4096
+        ):
+            raise ValueError(
+                f"Kubernetes {info.field_name} reference is invalid"
+            )
+        return value
+
+    @field_validator("field_manager", mode="before")
+    @classmethod
+    def validate_field_manager(cls, value: Any) -> str:
+        if (
+            not isinstance(value, str)
+            or value != value.strip()
+            or fullmatch(
+                r"[A-Za-z0-9](?:[A-Za-z0-9_.:/-]{0,126}[A-Za-z0-9])?",
+                value,
+            )
+            is None
+        ):
+            raise ValueError("Kubernetes field manager is invalid")
+        return value
+
+    @field_validator("policy_version", mode="before")
+    @classmethod
+    def validate_policy_version(cls, value: Any) -> str:
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or len(value) > 64
+        ):
+            raise ValueError("Kubernetes preflight policy version is invalid")
+        return value
+
+    @model_validator(mode="after")
+    def validate_enabled_boundary(self) -> "KubernetesPreflightConfig":
+        credential_references = sum(
+            item is not None
+            for item in (
+                self.bearer_token_env,
+                self.bearer_token_file,
+            )
+        )
+
+        if self.enabled:
+            if self.api_url is None or self.cluster_name is None:
+                raise ValueError(
+                    "Enabled Kubernetes preflight requires API URL and cluster"
+                )
+            if credential_references != 1:
+                raise ValueError(
+                    "Enabled Kubernetes preflight requires exactly one token source"
+                )
+            if not self.allowed_targets:
+                raise ValueError(
+                    "Enabled Kubernetes preflight requires an exact allowlist"
+                )
+
+        target_keys = [
+            (
+                item.cluster,
+                item.namespace,
+                item.deployment,
+                item.container,
+            )
+            for item in self.allowed_targets
+        ]
+        if len(target_keys) != len(set(target_keys)):
+            raise ValueError(
+                "Kubernetes preflight allowlist targets must be unique"
+            )
+
+        if self.cluster_name is not None and any(
+            item.cluster != self.cluster_name
+            for item in self.allowed_targets
+        ):
+            raise ValueError(
+                "Kubernetes preflight target cluster does not match connection"
+            )
+
+        return self
+
+
+KUBERNETES_PRODUCTION_WRITE_ACKNOWLEDGEMENT = (
+    "I_UNDERSTAND_THIS_ENABLES_REAL_KUBERNETES_WRITES"
+)
+
+
+class KubernetesProductionExecutionConfig(BaseModel):
+    """
+    Fail-closed feature gate for the OOMKilled Pilot production write path.
+
+    The execution identity is deliberately separate from the read/dry-run
+    preflight identity. Configuration contains only an environment-variable
+    name or token-file path and never serializes the credential itself.
+    """
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+    )
+
+    enabled: bool = False
+    write_acknowledgement: str | None = None
+    bearer_token_env: str | None = None
+    bearer_token_file: str | None = None
+    request_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        le=30,
+    )
+    minimum_remaining_seconds: int = Field(
+        default=5,
+        ge=1,
+        le=60,
+    )
+
+    @field_validator("write_acknowledgement", mode="before")
+    @classmethod
+    def validate_write_acknowledgement(
+        cls,
+        value: Any,
+    ) -> str | None:
+        if value is None:
+            return None
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or len(value) > 128
+        ):
+            raise ValueError(
+                "Kubernetes production write acknowledgement is invalid"
+            )
+        return value
+
+    @field_validator("bearer_token_env", mode="before")
+    @classmethod
+    def validate_bearer_token_env(
+        cls,
+        value: Any,
+    ) -> str | None:
+        if value is None:
+            return None
+        if (
+            not isinstance(value, str)
+            or value != value.strip()
+            or fullmatch(_ENVIRONMENT_NAME_PATTERN, value) is None
+        ):
+            raise ValueError(
+                "Kubernetes production bearer-token environment name "
+                "is invalid"
+            )
+        return value
+
+    @field_validator("bearer_token_file", mode="before")
+    @classmethod
+    def validate_bearer_token_file(
+        cls,
+        value: Any,
+    ) -> str | None:
+        if value is None:
+            return None
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or "\x00" in value
+            or len(value) > 4096
+        ):
+            raise ValueError(
+                "Kubernetes production bearer-token file reference "
+                "is invalid"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def validate_enabled_boundary(
+        self,
+    ) -> "KubernetesProductionExecutionConfig":
+        credential_references = sum(
+            item is not None
+            for item in (
+                self.bearer_token_env,
+                self.bearer_token_file,
+            )
+        )
+
+        if self.enabled:
+            if (
+                self.write_acknowledgement
+                != KUBERNETES_PRODUCTION_WRITE_ACKNOWLEDGEMENT
+            ):
+                raise ValueError(
+                    "Enabled Kubernetes production execution requires the "
+                    "exact write acknowledgement"
+                )
+            if credential_references != 1:
+                raise ValueError(
+                    "Enabled Kubernetes production execution requires "
+                    "exactly one token source"
+                )
+
+        return self
+
+
+class RemediationConfig(BaseModel):
+    """Production remediation configuration root."""
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+    )
+
+    kubernetes_preflight: KubernetesPreflightConfig = Field(
+        default_factory=KubernetesPreflightConfig
+    )
+
+    kubernetes_production_execution: (
+        KubernetesProductionExecutionConfig
+    ) = Field(
+        default_factory=(
+            KubernetesProductionExecutionConfig
+        )
+    )
+
+    @model_validator(mode="after")
+    def validate_production_execution_boundary(
+        self,
+    ) -> "RemediationConfig":
+        execution = self.kubernetes_production_execution
+        preflight = self.kubernetes_preflight
+
+        if not execution.enabled:
+            return self
+
+        if not preflight.enabled:
+            raise ValueError(
+                "Kubernetes production execution requires enabled preflight"
+            )
+
+        execution_reference = (
+            ("env", execution.bearer_token_env)
+            if execution.bearer_token_env is not None
+            else ("file", execution.bearer_token_file)
+        )
+        preflight_reference = (
+            ("env", preflight.bearer_token_env)
+            if preflight.bearer_token_env is not None
+            else ("file", preflight.bearer_token_file)
+        )
+
+        if execution_reference == preflight_reference:
+            raise ValueError(
+                "Kubernetes production execution must use a credential "
+                "reference separate from preflight"
+            )
+
+        return self
+
+
+class KubernetesReadClusterConfig(BaseModel):
+    """
+    One exact read-only Kubernetes connection descriptor.
+
+    This model stores credential references only. The bearer token value is
+    resolved by the Agent Runtime factory and must never be serialized into
+    Settings or app.yaml.
+    """
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+    )
+
+    cluster_name: str
+    api_url: str
+    bearer_token_env: str | None = None
+    bearer_token_file: str | None = None
+    ca_file: str | None = None
+    request_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        le=30,
+    )
+
+    @field_validator(
+        "cluster_name",
+        mode="before",
+    )
+    @classmethod
+    def validate_cluster_name(
+        cls,
+        value: Any,
+    ) -> str:
+        if (
+            not isinstance(
+                value,
+                str,
+            )
+            or value != value.strip()
+            or fullmatch(
+                r"[A-Za-z0-9](?:[A-Za-z0-9_.:-]{0,126}[A-Za-z0-9])?",
+                value,
+            )
+            is None
+        ):
+            raise ValueError(
+                "Kubernetes read cluster name is invalid"
+            )
+
+        return value
+
+    @field_validator(
+        "api_url",
+        mode="before",
+    )
+    @classmethod
+    def validate_api_url(
+        cls,
+        value: Any,
+    ) -> str:
+        if (
+            not isinstance(
+                value,
+                str,
+            )
+            or not value
+            or value != value.strip()
+        ):
+            raise ValueError(
+                "Kubernetes read API URL is invalid"
+            )
+
+        normalized = value.rstrip(
+            "/"
+        )
+
+        parsed = urlparse(
+            normalized
+        )
+
+        if (
+            parsed.scheme != "https"
+            or not parsed.netloc
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {
+                "",
+                "/",
+            }
+        ):
+            raise ValueError(
+                "Kubernetes read API URL must be a clean HTTPS origin"
+            )
+
+        return normalized
+
+    @field_validator(
+        "bearer_token_env",
+        mode="before",
+    )
+    @classmethod
+    def validate_bearer_token_env(
+        cls,
+        value: Any,
+    ) -> str | None:
+        if value is None:
+            return None
+
+        if (
+            not isinstance(
+                value,
+                str,
+            )
+            or value != value.strip()
+            or fullmatch(
+                _ENVIRONMENT_NAME_PATTERN,
+                value,
+            )
+            is None
+        ):
+            raise ValueError(
+                "Kubernetes read bearer-token environment name is invalid"
+            )
+
+        return value
+
+    @field_validator(
+        "bearer_token_file",
+        "ca_file",
+        mode="before",
+    )
+    @classmethod
+    def validate_file_reference(
+        cls,
+        value: Any,
+        info,
+    ) -> str | None:
+        if value is None:
+            return None
+
+        if (
+            not isinstance(
+                value,
+                str,
+            )
+            or not value
+            or value != value.strip()
+            or "\x00" in value
+            or len(
+                value
+            )
+            > 4096
+        ):
+            raise ValueError(
+                f"Kubernetes read {info.field_name} reference is invalid"
+            )
+
+        return value
+
+    @model_validator(
+        mode="after"
+    )
+    def validate_credential_reference(
+        self,
+    ) -> "KubernetesReadClusterConfig":
+        references = sum(
+            item is not None
+            for item in (
+                self.bearer_token_env,
+                self.bearer_token_file,
+            )
+        )
+
+        if references != 1:
+            raise ValueError(
+                "Kubernetes read cluster requires exactly one token source"
+            )
+
+        return self
+
+
+class KubernetesReadMultiClusterConfig(BaseModel):
+    """
+    Disabled-by-default read-only multi-cluster connection configuration.
+
+    The configuration is immutable and bounded. Enabling it does not itself
+    contact Kubernetes; the connection factory only resolves local credential
+    references and constructs cluster-bound read-only Tool objects.
+    """
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+    )
+
+    enabled: bool = False
+
+    clusters: tuple[
+        KubernetesReadClusterConfig,
+        ...,
+    ] = Field(
+        default_factory=tuple,
+        max_length=64,
+    )
+
+    @model_validator(
+        mode="after"
+    )
+    def validate_cluster_set(
+        self,
+    ) -> "KubernetesReadMultiClusterConfig":
+        if (
+            self.enabled
+            and not self.clusters
+        ):
+            raise ValueError(
+                "Enabled Kubernetes read multi-cluster configuration requires at least one cluster"
+            )
+
+        cluster_names = [
+            item.cluster_name
+            for item in self.clusters
+        ]
+
+        api_urls = [
+            item.api_url
+            for item in self.clusters
+        ]
+
+        credential_references = [
+            (
+                (
+                    "env",
+                    item.bearer_token_env,
+                )
+                if item.bearer_token_env
+                is not None
+                else (
+                    "file",
+                    item.bearer_token_file,
+                )
+            )
+            for item in self.clusters
+        ]
+
+        if len(
+            cluster_names
+        ) != len(
+            set(
+                cluster_names
+            )
+        ):
+            raise ValueError(
+                "Kubernetes read cluster names must be unique"
+            )
+
+        if len(
+            api_urls
+        ) != len(
+            set(
+                api_urls
+            )
+        ):
+            raise ValueError(
+                "Kubernetes read API URLs must be unique"
+            )
+
+        if len(
+            credential_references
+        ) != len(
+            set(
+                credential_references
+            )
+        ):
+            raise ValueError(
+                "Kubernetes read clusters must use distinct credential references"
+            )
+
+        return self
+
+
+class PrometheusReadEndpointConfig(BaseModel):
+    """
+    One exact read-only Prometheus/Thanos/Mimir endpoint descriptor.
+
+    The model stores credential references only. Raw bearer-token values must
+    never be serialized into Settings or app.yaml.
+    """
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+    )
+
+    endpoint_name: str
+    base_url: str
+    authentication: str = "none"
+    bearer_token_env: str | None = None
+    bearer_token_file: str | None = None
+    ca_file: str | None = None
+    request_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        le=30,
+    )
+
+    @field_validator(
+        "endpoint_name",
+        mode="before",
+    )
+    @classmethod
+    def validate_endpoint_name(
+        cls,
+        value: Any,
+    ) -> str:
+        if (
+            not isinstance(
+                value,
+                str,
+            )
+            or value != value.strip()
+            or fullmatch(
+                r"[A-Za-z0-9](?:[A-Za-z0-9_.:-]{0,126}[A-Za-z0-9])?",
+                value,
+            )
+            is None
+        ):
+            raise ValueError(
+                "Prometheus read endpoint name is invalid"
+            )
+
+        return value
+
+    @field_validator(
+        "base_url",
+        mode="before",
+    )
+    @classmethod
+    def validate_base_url(
+        cls,
+        value: Any,
+    ) -> str:
+        if (
+            not isinstance(
+                value,
+                str,
+            )
+            or not value
+            or value != value.strip()
+        ):
+            raise ValueError(
+                "Prometheus read base URL is invalid"
+            )
+
+        normalized = value.rstrip(
+            "/"
+        )
+
+        parsed = urlparse(
+            normalized
+        )
+
+        if (
+            parsed.scheme != "https"
+            or not parsed.netloc
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {
+                "",
+                "/",
+            }
+        ):
+            raise ValueError(
+                "Prometheus read base URL must be a clean HTTPS origin"
+            )
+
+        return normalized
+
+    @field_validator(
+        "authentication",
+        mode="before",
+    )
+    @classmethod
+    def validate_authentication(
+        cls,
+        value: Any,
+    ) -> str:
+        if not isinstance(
+            value,
+            str,
+        ):
+            raise ValueError(
+                "Prometheus read authentication mode is invalid"
+            )
+
+        normalized = value.strip().lower()
+
+        if normalized not in {
+            "none",
+            "bearer",
+        }:
+            raise ValueError(
+                "Prometheus read authentication must be none or bearer"
+            )
+
+        return normalized
+
+    @field_validator(
+        "bearer_token_env",
+        mode="before",
+    )
+    @classmethod
+    def validate_bearer_token_env(
+        cls,
+        value: Any,
+    ) -> str | None:
+        if value is None:
+            return None
+
+        if (
+            not isinstance(
+                value,
+                str,
+            )
+            or value != value.strip()
+            or fullmatch(
+                _ENVIRONMENT_NAME_PATTERN,
+                value,
+            )
+            is None
+        ):
+            raise ValueError(
+                "Prometheus read bearer-token environment name is invalid"
+            )
+
+        return value
+
+    @field_validator(
+        "bearer_token_file",
+        "ca_file",
+        mode="before",
+    )
+    @classmethod
+    def validate_file_reference(
+        cls,
+        value: Any,
+        info,
+    ) -> str | None:
+        if value is None:
+            return None
+
+        if (
+            not isinstance(
+                value,
+                str,
+            )
+            or not value
+            or value != value.strip()
+            or "\x00" in value
+            or len(
+                value
+            )
+            > 4096
+        ):
+            raise ValueError(
+                f"Prometheus read {info.field_name} reference is invalid"
+            )
+
+        return value
+
+    @model_validator(
+        mode="after"
+    )
+    def validate_authentication_reference(
+        self,
+    ) -> "PrometheusReadEndpointConfig":
+        references = sum(
+            item is not None
+            for item in (
+                self.bearer_token_env,
+                self.bearer_token_file,
+            )
+        )
+
+        if self.authentication == "none":
+            if references != 0:
+                raise ValueError(
+                    "Prometheus read authentication none cannot configure bearer-token references"
+                )
+
+        elif references != 1:
+            raise ValueError(
+                "Prometheus read bearer authentication requires exactly one token source"
+            )
+
+        return self
+
+
+class PrometheusReadClusterBindingConfig(BaseModel):
+    """
+    Bind one Incident cluster identity to one configured metrics endpoint.
+    """
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+    )
+
+    cluster_name: str
+    endpoint_name: str
+
+    @field_validator(
+        "cluster_name",
+        "endpoint_name",
+        mode="before",
+    )
+    @classmethod
+    def validate_binding_identifier(
+        cls,
+        value: Any,
+        info,
+    ) -> str:
+        if (
+            not isinstance(
+                value,
+                str,
+            )
+            or value != value.strip()
+            or fullmatch(
+                r"[A-Za-z0-9](?:[A-Za-z0-9_.:-]{0,126}[A-Za-z0-9])?",
+                value,
+            )
+            is None
+        ):
+            raise ValueError(
+                f"Prometheus read {info.field_name} is invalid"
+            )
+
+        return value
+
+
+class PrometheusReadMultiClusterConfig(BaseModel):
+    """
+    Disabled-by-default read-only Prometheus multi-cluster connections.
+
+    Endpoints and cluster bindings are separated so several Incident clusters
+    can intentionally share one central Thanos/Mimir/Prometheus endpoint
+    without duplicating credentials or clients.
+    """
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+    )
+
+    enabled: bool = False
+
+    endpoints: tuple[
+        PrometheusReadEndpointConfig,
+        ...,
+    ] = Field(
+        default_factory=tuple,
+        max_length=64,
+    )
+
+    cluster_bindings: tuple[
+        PrometheusReadClusterBindingConfig,
+        ...,
+    ] = Field(
+        default_factory=tuple,
+        max_length=64,
+    )
+
+    @model_validator(
+        mode="after"
+    )
+    def validate_endpoint_and_binding_set(
+        self,
+    ) -> "PrometheusReadMultiClusterConfig":
+        if self.enabled:
+            if not self.endpoints:
+                raise ValueError(
+                    "Enabled Prometheus read configuration requires at least one endpoint"
+                )
+
+            if not self.cluster_bindings:
+                raise ValueError(
+                    "Enabled Prometheus read configuration requires at least one cluster binding"
+                )
+
+        endpoint_names = [
+            item.endpoint_name
+            for item in self.endpoints
+        ]
+
+        base_urls = [
+            item.base_url
+            for item in self.endpoints
+        ]
+
+        if len(
+            endpoint_names
+        ) != len(
+            set(
+                endpoint_names
+            )
+        ):
+            raise ValueError(
+                "Prometheus read endpoint names must be unique"
+            )
+
+        if len(
+            base_urls
+        ) != len(
+            set(
+                base_urls
+            )
+        ):
+            raise ValueError(
+                "Prometheus read endpoint URLs must be unique"
+            )
+
+        bearer_references = [
+            (
+                (
+                    "env",
+                    item.bearer_token_env,
+                )
+                if item.bearer_token_env
+                is not None
+                else (
+                    "file",
+                    item.bearer_token_file,
+                )
+            )
+            for item in self.endpoints
+            if item.authentication
+            == "bearer"
+        ]
+
+        if len(
+            bearer_references
+        ) != len(
+            set(
+                bearer_references
+            )
+        ):
+            raise ValueError(
+                "Prometheus read endpoints must use distinct bearer credential references"
+            )
+
+        cluster_names = [
+            item.cluster_name
+            for item in self.cluster_bindings
+        ]
+
+        if len(
+            cluster_names
+        ) != len(
+            set(
+                cluster_names
+            )
+        ):
+            raise ValueError(
+                "Prometheus read cluster bindings must use unique cluster names"
+            )
+
+        known_endpoints = set(
+            endpoint_names
+        )
+
+        referenced_endpoints = {
+            item.endpoint_name
+            for item in self.cluster_bindings
+        }
+
+        unknown_endpoints = (
+            referenced_endpoints
+            - known_endpoints
+        )
+
+        if unknown_endpoints:
+            raise ValueError(
+                "Prometheus read cluster binding references an unknown endpoint"
+            )
+
+        if self.enabled:
+            unused_endpoints = (
+                known_endpoints
+                - referenced_endpoints
+            )
+
+            if unused_endpoints:
+                raise ValueError(
+                    "Enabled Prometheus read configuration contains an unused endpoint"
+                )
+
+        return self
+
+
+class ConnectionsConfig(BaseModel):
+    """
+    Non-remediation infrastructure connection configuration.
+    """
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+    )
+
+    kubernetes_read: (
+        KubernetesReadMultiClusterConfig
+    ) = Field(
+        default_factory=(
+            KubernetesReadMultiClusterConfig
+        )
+    )
+
+
+    prometheus_read: (
+        PrometheusReadMultiClusterConfig
+    ) = Field(
+        default_factory=(
+            PrometheusReadMultiClusterConfig
+        )
+    )
+
+
+class AuthenticationApiKeyConfig(BaseModel):
+    """
+    Non-secret API key identity configuration.
+
+    secret_env stores only the name of an environment variable. The API key
+    value must never be written to app.yaml or serialized as Settings data.
+    """
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+    )
+
+    key_id: str = Field(
+        min_length=1,
+        max_length=128,
+    )
+
+    secret_env: str = Field(
+        min_length=3,
+        max_length=128,
+    )
+
+    principal_id: str = Field(
+        min_length=1,
+        max_length=128,
+    )
+
+    roles: frozenset[str] = Field(
+        min_length=1,
+    )
+
+    display_name: str | None = Field(
+        default=None,
+        max_length=256,
+    )
+
+    active: bool = True
+
+    expires_at: datetime | None = None
+
+    attributes: dict[str, Any] = Field(
+        default_factory=dict,
+    )
+
+    @field_validator(
+        "key_id",
+        "principal_id",
+        mode="before",
+    )
+    @classmethod
+    def normalize_required_text(
+        cls,
+        value: Any,
+    ) -> str:
+        if not isinstance(
+            value,
+            str,
+        ):
+            raise ValueError(
+                "Authentication identity fields must be text"
+            )
+
+        normalized = value.strip()
+
+        if not normalized:
+            raise ValueError(
+                "Authentication identity fields cannot be empty"
+            )
+
+        return normalized
+
+    @field_validator(
+        "secret_env",
+        mode="before",
+    )
+    @classmethod
+    def validate_secret_environment_name(
+        cls,
+        value: Any,
+    ) -> str:
+        if (
+            not isinstance(
+                value,
+                str,
+            )
+            or value != value.strip()
+            or fullmatch(
+                _ENVIRONMENT_NAME_PATTERN,
+                value,
+            )
+            is None
+        ):
+            raise ValueError(
+                "API key secret environment name is invalid"
+            )
+
+        return value
+
+    @field_validator(
+        "roles",
+        mode="before",
+    )
+    @classmethod
+    def normalize_roles(
+        cls,
+        value: Any,
+    ) -> frozenset[str]:
+        if (
+            isinstance(
+                value,
+                str,
+            )
+            or value is None
+        ):
+            raise ValueError(
+                "Authentication roles must be a collection"
+            )
+
+        try:
+            normalized_roles = frozenset(
+                str(
+                    getattr(
+                        role,
+                        "value",
+                        role,
+                    )
+                )
+                .strip()
+                .lower()
+                for role in value
+            )
+        except TypeError:
+            raise ValueError(
+                "Authentication roles must be a collection"
+            ) from None
+
+        if not normalized_roles:
+            raise ValueError(
+                "At least one authentication role is required"
+            )
+
+        unknown_roles = (
+            normalized_roles
+            - _ALLOWED_OPERATOR_ROLES
+        )
+
+        if unknown_roles:
+            raise ValueError(
+                "Authentication configuration contains an unknown role"
+            )
+
+        return normalized_roles
+
+    @field_validator(
+        "display_name",
+        mode="before",
+    )
+    @classmethod
+    def normalize_optional_text(
+        cls,
+        value: Any,
+    ) -> str | None:
+        if value is None:
+            return None
+
+        if not isinstance(
+            value,
+            str,
+        ):
+            raise ValueError(
+                "Authentication display name must be text"
+            )
+
+        normalized = value.strip()
+
+        return normalized or None
+
+    @field_validator(
+        "expires_at",
+        mode="after",
+    )
+    @classmethod
+    def require_timezone_aware_expiry(
+        cls,
+        value: datetime | None,
+    ) -> datetime | None:
+        if value is None:
+            return None
+
+        if (
+            value.tzinfo is None
+            or value.utcoffset() is None
+        ):
+            raise ValueError(
+                "API key expiry must be timezone-aware"
+            )
+
+        return value.astimezone(
+            UTC
+        )
+
+    @field_validator(
+        "attributes",
+        mode="before",
+    )
+    @classmethod
+    def reject_secret_attributes(
+        cls,
+        value: Any,
+    ) -> dict[str, Any]:
+        if value is None:
+            return {}
+
+        if not isinstance(
+            value,
+            Mapping,
+        ):
+            raise ValueError(
+                "Authentication attributes must be a mapping"
+            )
+
+        attributes = dict(
+            value
+        )
+
+        for key in attributes:
+            normalized_key = str(
+                key
+            ).strip().lower().replace(
+                "-",
+                "_",
+            )
+
+            if any(
+                fragment in normalized_key
+                for fragment in (
+                    _SENSITIVE_ATTRIBUTE_FRAGMENTS
+                )
+            ):
+                raise ValueError(
+                    "Authentication attributes must not contain "
+                    "credentials or secrets"
+                )
+
+        return attributes
+
+
+class AuthenticationConfig(BaseModel):
+    """
+    Authentication provider startup configuration.
+
+    Disabled authentication does not mean anonymous access. The factory will
+    create a reject-all provider until authentication is explicitly enabled.
+    """
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+    )
+
+    enabled: bool = False
+
+    default_provider: str = "api_key"
+
+    api_keys: tuple[
+        AuthenticationApiKeyConfig,
+        ...,
+    ] = Field(
+        default_factory=tuple,
+    )
+
+    @field_validator(
+        "default_provider",
+        mode="before",
+    )
+    @classmethod
+    def validate_default_provider(
+        cls,
+        value: Any,
+    ) -> str:
+        if (
+            not isinstance(
+                value,
+                str,
+            )
+            or value != value.strip()
+            or fullmatch(
+                _PROVIDER_NAME_PATTERN,
+                value,
+            )
+            is None
+        ):
+            raise ValueError(
+                "Default authentication provider name is invalid"
+            )
+
+        return value
+
+    @model_validator(
+        mode="after"
+    )
+    def validate_provider_configuration(
+        self,
+    ) -> "AuthenticationConfig":
+        if self.default_provider != "api_key":
+            raise ValueError(
+                "Default authentication provider is not configured"
+            )
+
+        key_ids = [
+            item.key_id
+            for item in self.api_keys
+        ]
+        secret_environment_names = [
+            item.secret_env
+            for item in self.api_keys
+        ]
+
+        if len(
+            key_ids
+        ) != len(
+            set(
+                key_ids
+            )
+        ):
+            raise ValueError(
+                "Authentication API key IDs must be unique"
+            )
+
+        if len(
+            secret_environment_names
+        ) != len(
+            set(
+                secret_environment_names
+            )
+        ):
+            raise ValueError(
+                "Authentication secret environment names must be unique"
+            )
+
+        if self.enabled and not self.api_keys:
+            raise ValueError(
+                "Enabled API key authentication requires at least one key"
+            )
+
+        return self
+
+
+class SecurityConfig(BaseModel):
+    """Security configuration root."""
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+    )
+
+    authentication: AuthenticationConfig = Field(
+        default_factory=AuthenticationConfig
+    )
 
 
 class Settings(BaseModel):
@@ -47,6 +1640,18 @@ class Settings(BaseModel):
     llm: LLMConfig
 
     runtime: RuntimeConfig
+
+    security: SecurityConfig = Field(
+        default_factory=SecurityConfig
+    )
+
+    connections: ConnectionsConfig = Field(
+        default_factory=ConnectionsConfig
+    )
+
+    remediation: RemediationConfig = Field(
+        default_factory=RemediationConfig
+    )
 
 
 @lru_cache

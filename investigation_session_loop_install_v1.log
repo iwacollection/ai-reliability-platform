@@ -1,0 +1,18 @@
+Pausable Durable Investigation Session Loop v1 install
+关键源码 SHA-256 基线检查通过
+new_paths=['services/agent_runtime/app/investigation/session_loop.py', 'services/agent_runtime/tests/test_investigation_session_loop.py']
+identical_paths=[]
+
+========== Investigation Session Loop 语法检查 ==========
+[exit_code=0]
+Runtime、Coordinator、自动触发与默认数据库隔离检查通过
+
+========== Investigation Session 持久化调用链专项测试 ==========
+...................................................                      [100%]
+51 passed in 7.03s
+[exit_code=0]
+
+========== Investigation、Conversation 与 Shared LLM 关键回归 ==========
+........................................................................ [100%]
+72 passed in 5.44s
+[exit_code=0]

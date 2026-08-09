@@ -1,0 +1,406 @@
+import asyncio
+import time
+from datetime import UTC, datetime
+
+from services.agent_runtime.app.investigation.models import (
+    EvidenceItem,
+    InvestigationLimits,
+    InvestigationScope,
+    InvestigationState,
+    InvestigationStatus,
+    InvestigationStopReason,
+)
+from services.agent_runtime.app.investigation.reasoner import (
+    BaseInvestigationReasoner,
+)
+
+
+class EvidenceDrivenInvestigationCoordinator:
+    """
+    Run one bounded, read-only, Shadow evidence investigation.
+
+    This coordinator is deliberately independent from PlannerPipeline and
+    ActionRuntime in v1. Calling it writes only a bounded JSON snapshot to
+    context.metadata["investigation_shadow"]. It never writes variables,
+    Incident state, Approval, Action, Verification, budget or Kubernetes.
+    """
+
+    def __init__(
+        self,
+        reasoner: BaseInvestigationReasoner,
+        probe_executor,
+        limits: InvestigationLimits | None = None,
+        monotonic_clock=None,
+        utc_clock=None,
+    ) -> None:
+        if not isinstance(
+            reasoner,
+            BaseInvestigationReasoner,
+        ):
+            raise TypeError(
+                "Investigation reasoner is invalid"
+            )
+
+        if probe_executor is None or not callable(
+            getattr(probe_executor, "collect", None)
+        ):
+            raise TypeError(
+                "Investigation probe executor is invalid"
+            )
+
+        self.reasoner = reasoner
+        self.probe_executor = probe_executor
+        self.limits = limits or InvestigationLimits()
+        self._monotonic = monotonic_clock or time.monotonic
+        self._utc_clock = utc_clock or (
+            lambda: datetime.now(UTC)
+        )
+
+    async def investigate(
+        self,
+        context,
+    ) -> InvestigationState:
+        scope = self._scope_from_context(
+            context
+        )
+        started_at = self._now()
+        started_monotonic = self._monotonic()
+
+        state = InvestigationState(
+            status=InvestigationStatus.RUNNING,
+            scope=scope,
+            limits=self.limits,
+            started_at=started_at,
+            updated_at=started_at,
+        )
+
+        while state.status == InvestigationStatus.RUNNING:
+            if state.iteration_count >= self.limits.max_iterations:
+                self._stop(
+                    state,
+                    status=InvestigationStatus.EXHAUSTED,
+                    reason=InvestigationStopReason.MAX_ITERATIONS,
+                )
+                break
+
+            remaining = self._remaining_seconds(
+                started_monotonic
+            )
+            if remaining <= 0:
+                self._stop(
+                    state,
+                    status=InvestigationStatus.EXHAUSTED,
+                    reason=InvestigationStopReason.TIMEOUT,
+                )
+                break
+
+            try:
+                decision = await asyncio.wait_for(
+                    self.reasoner.decide(
+                        scope,
+                        state.model_copy(deep=True),
+                    ),
+                    timeout=remaining,
+                )
+            except TimeoutError:
+                self._stop(
+                    state,
+                    status=InvestigationStatus.EXHAUSTED,
+                    reason=InvestigationStopReason.TIMEOUT,
+                )
+                break
+            except Exception as exc:
+                self._stop(
+                    state,
+                    status=InvestigationStatus.FAILED,
+                    reason=InvestigationStopReason.REASONER_ERROR,
+                    failure_code=type(exc).__name__,
+                )
+                break
+
+            if not self._evidence_references_are_valid(
+                decision=decision,
+                state=state,
+            ):
+                self._stop(
+                    state,
+                    status=InvestigationStatus.FAILED,
+                    reason=InvestigationStopReason.REASONER_ERROR,
+                    failure_code="InvalidEvidenceReference",
+                )
+                break
+
+            state.iteration_count += 1
+            state.hypotheses = [
+                item.model_copy(deep=True)
+                for item in decision.hypotheses
+            ]
+            state.decision_summaries.append(
+                decision.rationale_summary
+            )
+            state.updated_at = self._now()
+
+            if decision.stop:
+                self._stop(
+                    state,
+                    status=InvestigationStatus.CONCLUDED,
+                    reason=decision.stop_reason,
+                )
+                state.conclusion = decision.conclusion
+                break
+
+            probe = decision.next_probe
+            if probe is None:
+                self._stop(
+                    state,
+                    status=InvestigationStatus.EXHAUSTED,
+                    reason=InvestigationStopReason.NO_SAFE_PROBE,
+                )
+                break
+
+            if probe in state.attempted_probes:
+                self._stop(
+                    state,
+                    status=InvestigationStatus.EXHAUSTED,
+                    reason=InvestigationStopReason.DUPLICATE_PROBE,
+                )
+                break
+
+            if state.tool_call_count >= self.limits.max_tool_calls:
+                self._stop(
+                    state,
+                    status=InvestigationStatus.EXHAUSTED,
+                    reason=InvestigationStopReason.MAX_TOOL_CALLS,
+                )
+                break
+
+            remaining = self._remaining_seconds(
+                started_monotonic
+            )
+            if remaining <= 0:
+                self._stop(
+                    state,
+                    status=InvestigationStatus.EXHAUSTED,
+                    reason=InvestigationStopReason.TIMEOUT,
+                )
+                break
+
+            state.attempted_probes.append(probe)
+            state.tool_call_count += 1
+
+            try:
+                evidence = await asyncio.wait_for(
+                    self.probe_executor.collect(
+                        context,
+                        scope,
+                        probe,
+                    ),
+                    timeout=remaining,
+                )
+            except TimeoutError:
+                self._stop(
+                    state,
+                    status=InvestigationStatus.EXHAUSTED,
+                    reason=InvestigationStopReason.TIMEOUT,
+                )
+                break
+            except Exception as exc:
+                evidence = EvidenceItem(
+                    probe=probe,
+                    source="investigation_probe",
+                    success=False,
+                    trusted=False,
+                    production_signal=False,
+                    reliability=0.0,
+                    observed_at=self._now(),
+                    facts={},
+                    error_code=type(exc).__name__[:256],
+                )
+
+            state.evidence.append(evidence)
+            state.updated_at = self._now()
+
+        self._publish_shadow_snapshot(
+            context=context,
+            state=state,
+        )
+        return state
+
+    @staticmethod
+    def _scope_from_context(
+        context,
+    ) -> InvestigationScope:
+        event = getattr(
+            context,
+            "event",
+            None,
+        )
+        signal = getattr(
+            event,
+            "signal",
+            None,
+        )
+        resources = getattr(
+            event,
+            "resources",
+            None,
+        )
+
+        if signal is None or not resources:
+            raise ValueError(
+                "Investigation requires one event resource"
+            )
+
+        resource = resources[0]
+
+        header = getattr(
+            event,
+            "header",
+            None,
+        )
+
+        event_occurred_at = getattr(
+            header,
+            "occurred_at",
+            None,
+        )
+
+        if event_occurred_at is not None:
+            if (
+                not isinstance(
+                    event_occurred_at,
+                    datetime,
+                )
+                or event_occurred_at.tzinfo is None
+            ):
+                raise ValueError(
+                    "Investigation event occurred_at "
+                    "must be timezone-aware"
+                )
+
+            event_occurred_at = (
+                event_occurred_at.astimezone(
+                    UTC
+                )
+            )
+
+        return InvestigationScope(
+            alert_name=str(
+                getattr(signal, "name", "")
+            ),
+            alert_message=str(
+                getattr(signal, "message", "")
+                or ""
+            ),
+            event_occurred_at=event_occurred_at,
+            resource=str(
+                getattr(resource, "name", "")
+            ),
+            namespace=str(
+                getattr(resource, "namespace", None)
+                or "default"
+            ),
+            cluster=(
+                str(getattr(resource, "cluster"))
+                if getattr(resource, "cluster", None)
+                else None
+            ),
+        )
+
+    def _remaining_seconds(
+        self,
+        started_monotonic: float,
+    ) -> float:
+        return (
+            self.limits.timeout_seconds
+            - (
+                self._monotonic()
+                - started_monotonic
+            )
+        )
+
+    def _stop(
+        self,
+        state: InvestigationState,
+        status: InvestigationStatus,
+        reason: InvestigationStopReason | None,
+        failure_code: str | None = None,
+    ) -> None:
+        state.status = status
+        state.stop_reason = reason
+        state.failure_code = failure_code
+        state.updated_at = self._now()
+
+    def _now(self) -> datetime:
+        value = self._utc_clock()
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+
+    @staticmethod
+    def _publish_shadow_snapshot(
+        context,
+        state: InvestigationState,
+    ) -> None:
+        metadata = getattr(
+            context,
+            "metadata",
+            None,
+        )
+
+        if not isinstance(metadata, dict):
+            raise TypeError(
+                "Investigation context metadata is unavailable"
+            )
+
+        metadata["investigation_shadow"] = (
+            state.model_dump(mode="json")
+        )
+
+    @staticmethod
+    def _evidence_references_are_valid(
+        decision,
+        state: InvestigationState,
+    ) -> bool:
+        known_ids = {
+            item.evidence_id
+            for item in state.evidence
+        }
+
+        for hypothesis in decision.hypotheses:
+            referenced_ids = set(
+                hypothesis.supporting_evidence_ids
+            ) | set(
+                hypothesis.conflicting_evidence_ids
+            )
+
+            if not referenced_ids.issubset(
+                known_ids
+            ):
+                return False
+
+        conclusion = decision.conclusion
+
+        if conclusion is None:
+            return True
+
+        conclusion_ids = set(
+            conclusion.evidence_ids
+        )
+        if not conclusion_ids.issubset(
+            known_ids
+        ):
+            return False
+
+        trusted_ids = {
+            item.evidence_id
+            for item in state.evidence
+            if item.trusted
+        }
+
+        return (
+            bool(conclusion_ids)
+            and conclusion_ids.issubset(
+                trusted_ids
+            )
+        )

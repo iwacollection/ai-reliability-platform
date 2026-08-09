@@ -1,0 +1,850 @@
+import os
+import ssl
+from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote, urlparse
+
+import httpx
+
+from services.agent_runtime.app.tools.base import (
+    BaseTool,
+)
+
+
+class KubernetesToolError(RuntimeError):
+    """
+    Base error raised by KubernetesTool.
+    """
+
+
+class KubernetesConfigurationError(
+    KubernetesToolError
+):
+    """
+    Kubernetes API configuration is invalid or unavailable.
+    """
+
+
+class KubernetesQueryError(
+    KubernetesToolError
+):
+    """
+    Kubernetes API query failed.
+    """
+
+
+class KubernetesAuthorizationError(
+    KubernetesQueryError
+):
+    """
+    Kubernetes rejected the configured identity.
+    """
+
+
+class KubernetesResourceNotFoundError(
+    KubernetesQueryError
+):
+    """
+    Requested Kubernetes resource does not exist.
+    """
+
+
+class KubernetesOperationNotAllowedError(
+    KubernetesToolError
+):
+    """
+    Operation is outside the read-only verification boundary.
+    """
+
+
+class KubernetesTool(BaseTool):
+    """
+    Read-only Kubernetes Pod evidence tool.
+
+    Live mode uses the Kubernetes Core API directly through httpx.
+    It supports an explicit API URL and in-cluster discovery.
+
+    A temporary dry-run fallback is retained for compatibility.
+    It is marked production_signal=False and is rejected by the
+    VerificationEvidenceCollector.
+    """
+
+    _READ_ONLY_ACTIONS = {
+        "describe",
+        "get",
+    }
+
+    _POD_RESOURCES = {
+        "pod",
+        "pods",
+    }
+
+    _DEFAULT_TOKEN_FILE = Path(
+        "/var/run/secrets/kubernetes.io/"
+        "serviceaccount/token"
+    )
+
+    _DEFAULT_CA_FILE = Path(
+        "/var/run/secrets/kubernetes.io/"
+        "serviceaccount/ca.crt"
+    )
+
+    def __init__(
+        self,
+        api_url: str | None = None,
+        timeout_seconds: float | None = None,
+        verify_tls: bool | None = None,
+        bearer_token: str | None = None,
+        token_file: str | Path | None = None,
+        ca_file: str | Path | None = None,
+        cluster_name: str | None = None,
+        allow_dry_run_fallback: bool | None = None,
+        client: httpx.AsyncClient | None = None,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        configured_url = (
+            api_url
+            if api_url is not None
+            else os.getenv("KUBERNETES_API_URL")
+        )
+
+        self.in_cluster = False
+
+        if not configured_url:
+            configured_url = (
+                self._discover_in_cluster_url()
+            )
+            self.in_cluster = bool(
+                configured_url
+            )
+
+        self.api_url = (
+            configured_url.rstrip("/")
+            if configured_url
+            else None
+        )
+
+        if self.api_url:
+            parsed_url = urlparse(
+                self.api_url
+            )
+            if parsed_url.scheme not in {
+                "http",
+                "https",
+            } or not parsed_url.netloc:
+                raise KubernetesConfigurationError(
+                    "Kubernetes API URL is invalid"
+                )
+
+        self.timeout_seconds = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else self._read_positive_float(
+                "KUBERNETES_TIMEOUT_SECONDS",
+                default=5.0,
+            )
+        )
+
+        self.verify_tls = (
+            verify_tls
+            if verify_tls is not None
+            else self._read_bool(
+                "KUBERNETES_VERIFY_TLS",
+                default=True,
+            )
+        )
+
+        configured_token_file = (
+            token_file
+            if token_file is not None
+            else os.getenv("KUBERNETES_TOKEN_FILE")
+        )
+
+        if (
+            configured_token_file is None
+            and self.in_cluster
+            and self._DEFAULT_TOKEN_FILE.exists()
+        ):
+            configured_token_file = (
+                self._DEFAULT_TOKEN_FILE
+            )
+
+        self.token_file = (
+            Path(configured_token_file)
+            if configured_token_file
+            else None
+        )
+
+        self.bearer_token = (
+            bearer_token
+            if bearer_token is not None
+            else os.getenv(
+                "KUBERNETES_BEARER_TOKEN"
+            )
+        )
+
+        if (
+            not self.bearer_token
+            and self.token_file is not None
+        ):
+            self.bearer_token = self._read_token(
+                self.token_file
+            )
+
+        configured_ca_file = (
+            ca_file
+            if ca_file is not None
+            else os.getenv("KUBERNETES_CA_FILE")
+        )
+
+        if (
+            configured_ca_file is None
+            and self.in_cluster
+            and self._DEFAULT_CA_FILE.exists()
+        ):
+            configured_ca_file = (
+                self._DEFAULT_CA_FILE
+            )
+
+        self.ca_file = (
+            Path(configured_ca_file)
+            if configured_ca_file
+            else None
+        )
+
+        self.cluster_name = (
+            cluster_name
+            if cluster_name is not None
+            else os.getenv(
+                "KUBERNETES_CLUSTER_NAME"
+            )
+        )
+
+        self.allow_dry_run_fallback = (
+            allow_dry_run_fallback
+            if allow_dry_run_fallback is not None
+            else self._read_bool(
+                "KUBERNETES_ALLOW_DRY_RUN_FALLBACK",
+                default=True,
+            )
+        )
+
+        self.client = client
+        self._clock = clock or (
+            lambda: datetime.now(UTC)
+        )
+
+        if self.timeout_seconds <= 0:
+            raise KubernetesConfigurationError(
+                "Kubernetes timeout must be positive"
+            )
+
+    @property
+    def name(self) -> str:
+        return "kubernetes"
+
+    async def execute(
+        self,
+        action: str,
+        resource: str,
+        target: str,
+        namespace: str = "default",
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        normalized_action = self._required_text(
+            action,
+            "action",
+        ).lower()
+        normalized_resource = self._required_text(
+            resource,
+            "resource",
+        ).lower()
+        normalized_target = self._required_text(
+            target,
+            "target",
+        )
+        normalized_namespace = self._required_text(
+            namespace,
+            "namespace",
+        )
+
+        if normalized_action not in (
+            self._READ_ONLY_ACTIONS
+        ):
+            if self.allow_dry_run_fallback:
+                return self._dry_run_response(
+                    action=normalized_action,
+                    resource=normalized_resource,
+                    target=normalized_target,
+                    namespace=normalized_namespace,
+                )
+
+            raise KubernetesOperationNotAllowedError(
+                "KubernetesTool only allows read-only "
+                "get and describe actions"
+            )
+
+        if normalized_resource not in (
+            self._POD_RESOURCES
+        ):
+            raise KubernetesOperationNotAllowedError(
+                "KubernetesTool currently supports Pod "
+                "evidence only"
+            )
+
+        if self.api_url is None:
+            if not self.allow_dry_run_fallback:
+                raise KubernetesConfigurationError(
+                    "KUBERNETES_API_URL is not configured"
+                )
+
+            return self._dry_run_response(
+                action=normalized_action,
+                resource="pod",
+                target=normalized_target,
+                namespace=normalized_namespace,
+            )
+
+        payload = await self._get_pod(
+            namespace=normalized_namespace,
+            target=normalized_target,
+        )
+
+        data = self._normalize_pod(
+            payload
+        )
+        observed_at = self._now()
+
+        return {
+            "success": True,
+            "source": "kubernetes",
+            "mode": "read_only",
+            "production_signal": True,
+            "observed_at": observed_at.isoformat(),
+            "action": normalized_action,
+            "resource": "pod",
+            "target": normalized_target,
+            "namespace": normalized_namespace,
+            "cluster": self.cluster_name,
+            "data": data,
+        }
+
+    async def _get_pod(
+        self,
+        namespace: str,
+        target: str,
+    ) -> dict[str, Any]:
+        url = self._pod_url(
+            namespace=namespace,
+            target=target,
+        )
+
+        try:
+            if self.client is not None:
+                response = await self.client.get(
+                    url,
+                    headers=self._headers,
+                )
+            else:
+                async with httpx.AsyncClient(
+                    timeout=self.timeout_seconds,
+                    verify=self._httpx_verify,
+                    headers=self._headers,
+                ) as client:
+                    response = await client.get(
+                        url
+                    )
+
+            response.raise_for_status()
+        except httpx.TimeoutException as exc:
+            raise KubernetesQueryError(
+                "Kubernetes API query timed out"
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code
+
+            if status_code in {
+                401,
+                403,
+            }:
+                raise KubernetesAuthorizationError(
+                    "Kubernetes API authorization failed"
+                ) from exc
+
+            if status_code == 404:
+                raise KubernetesResourceNotFoundError(
+                    "Kubernetes Pod was not found"
+                ) from exc
+
+            raise KubernetesQueryError(
+                "Kubernetes API returned HTTP "
+                f"{status_code}"
+            ) from exc
+        except httpx.RequestError as exc:
+            raise KubernetesQueryError(
+                "Kubernetes API request failed"
+            ) from exc
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise KubernetesQueryError(
+                "Kubernetes API returned invalid JSON"
+            ) from exc
+
+        if not isinstance(payload, dict):
+            raise KubernetesQueryError(
+                "Kubernetes API response is not an object"
+            )
+
+        if (
+            payload.get("kind") == "Status"
+            and payload.get("status") == "Failure"
+        ):
+            reason = payload.get(
+                "reason",
+                "Unknown",
+            )
+            raise KubernetesQueryError(
+                "Kubernetes API returned failure "
+                f"[{reason}]"
+            )
+
+        return payload
+
+    def _normalize_pod(
+        self,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        metadata = payload.get("metadata")
+        status = payload.get("status")
+        spec = payload.get("spec")
+
+        if not isinstance(metadata, Mapping):
+            raise KubernetesQueryError(
+                "Kubernetes Pod metadata is invalid"
+            )
+
+        if not isinstance(status, Mapping):
+            raise KubernetesQueryError(
+                "Kubernetes Pod status is invalid"
+            )
+
+        if not isinstance(spec, Mapping):
+            spec = {}
+
+        conditions = self._normalize_conditions(
+            status.get("conditions")
+        )
+        containers = self._normalize_containers(
+            status.get("containerStatuses")
+        )
+
+        ready_condition = any(
+            condition["type"] == "Ready"
+            and condition["status"] == "True"
+            for condition in conditions
+        )
+        scheduled = any(
+            condition["type"] == "PodScheduled"
+            and condition["status"] == "True"
+            for condition in conditions
+        )
+        all_containers_ready = (
+            bool(containers)
+            and all(
+                container["ready"] is True
+                for container in containers
+            )
+        )
+        phase = status.get("phase")
+        ready = (
+            phase == "Running"
+            and ready_condition
+            and all_containers_ready
+        )
+        oom_killed = any(
+            container.get("state_reason")
+            == "OOMKilled"
+            or container.get(
+                "last_termination_reason"
+            )
+            == "OOMKilled"
+            for container in containers
+        )
+
+        return {
+            "api_version": payload.get(
+                "apiVersion"
+            ),
+            "kind": payload.get("kind"),
+            "uid": metadata.get("uid"),
+            "resource_version": metadata.get(
+                "resourceVersion"
+            ),
+            "creation_timestamp": metadata.get(
+                "creationTimestamp"
+            ),
+            "deletion_timestamp": metadata.get(
+                "deletionTimestamp"
+            ),
+            "labels": dict(
+                metadata.get("labels") or {}
+            ),
+            "phase": phase,
+            "ready": ready,
+            "scheduled": scheduled,
+            "oom_killed": oom_killed,
+            "pod_ip": status.get("podIP"),
+            "host_ip": status.get("hostIP"),
+            "node_name": spec.get("nodeName"),
+            "conditions": conditions,
+            "containers": containers,
+        }
+
+    @staticmethod
+    def _normalize_conditions(
+        value: Any,
+    ) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+
+        conditions = []
+
+        for condition in value:
+            if not isinstance(condition, Mapping):
+                continue
+
+            conditions.append(
+                {
+                    "type": condition.get("type"),
+                    "status": condition.get("status"),
+                    "reason": condition.get("reason"),
+                    "message": condition.get("message"),
+                    "last_transition_time": (
+                        condition.get(
+                            "lastTransitionTime"
+                        )
+                    ),
+                }
+            )
+
+        return conditions
+
+    @classmethod
+    def _normalize_containers(
+        cls,
+        value: Any,
+    ) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+
+        containers = []
+
+        for container in value:
+            if not isinstance(container, Mapping):
+                continue
+
+            state, state_reason = (
+                cls._container_state(
+                    container.get("state")
+                )
+            )
+            last_reason, last_finished_at = (
+                cls._last_termination(
+                    container.get("lastState")
+                )
+            )
+
+            containers.append(
+                {
+                    "name": container.get("name"),
+                    "ready": container.get("ready")
+                    is True,
+                    "restart_count": cls._safe_int(
+                        container.get("restartCount")
+                    ),
+                    "state": state,
+                    "state_reason": state_reason,
+                    "last_termination_reason": (
+                        last_reason
+                    ),
+                    "last_terminated_at": (
+                        last_finished_at
+                    ),
+                    "image": container.get("image"),
+                    "image_id": container.get(
+                        "imageID"
+                    ),
+                }
+            )
+
+        return containers
+
+    @staticmethod
+    def _container_state(
+        value: Any,
+    ) -> tuple[str | None, str | None]:
+        if not isinstance(value, Mapping):
+            return None, None
+
+        for name in (
+            "waiting",
+            "running",
+            "terminated",
+        ):
+            details = value.get(name)
+            if isinstance(details, Mapping):
+                return name, details.get("reason")
+
+        return None, None
+
+    @staticmethod
+    def _last_termination(
+        value: Any,
+    ) -> tuple[str | None, str | None]:
+        if not isinstance(value, Mapping):
+            return None, None
+
+        terminated = value.get("terminated")
+
+        if not isinstance(terminated, Mapping):
+            return None, None
+
+        return (
+            terminated.get("reason"),
+            terminated.get("finishedAt"),
+        )
+
+    @staticmethod
+    def _safe_int(
+        value: Any,
+    ) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    def _pod_url(
+        self,
+        namespace: str,
+        target: str,
+    ) -> str:
+        if self.api_url is None:
+            raise KubernetesConfigurationError(
+                "KUBERNETES_API_URL is not configured"
+            )
+
+        safe_namespace = quote(
+            namespace,
+            safe="",
+        )
+        safe_target = quote(
+            target,
+            safe="",
+        )
+
+        return (
+            f"{self.api_url}/api/v1/namespaces/"
+            f"{safe_namespace}/pods/{safe_target}"
+        )
+
+    @property
+    def _headers(self) -> dict[str, str]:
+        headers = {
+            "Accept": "application/json"
+        }
+
+        if self.bearer_token:
+            headers["Authorization"] = (
+                f"Bearer {self.bearer_token}"
+            )
+
+        return headers
+
+    @property
+    def _httpx_verify(
+        self,
+    ) -> bool | ssl.SSLContext:
+        if not self.verify_tls:
+            return False
+
+        if self.ca_file is None:
+            return True
+
+        if not self.ca_file.is_file():
+            raise KubernetesConfigurationError(
+                "Kubernetes CA file was not found"
+            )
+
+        try:
+            return ssl.create_default_context(
+                cafile=str(self.ca_file)
+            )
+        except OSError as exc:
+            raise KubernetesConfigurationError(
+                "Kubernetes CA file is invalid"
+            ) from exc
+
+    def _dry_run_response(
+        self,
+        action: str,
+        resource: str,
+        target: str,
+        namespace: str,
+    ) -> dict[str, Any]:
+        return {
+            "success": True,
+            "source": "mock_kubernetes",
+            "mode": "dry_run",
+            "production_signal": False,
+            "observed_at": self._now().isoformat(),
+            "action": action,
+            "resource": resource,
+            "target": target,
+            "namespace": namespace,
+            "message": (
+                "Kubernetes action simulated"
+            ),
+        }
+
+    def _now(self) -> datetime:
+        value = self._clock()
+
+        if value.tzinfo is None:
+            raise KubernetesConfigurationError(
+                "Kubernetes clock must return a "
+                "timezone-aware datetime"
+            )
+
+        return value.astimezone(UTC)
+
+    @classmethod
+    def _discover_in_cluster_url(
+        cls,
+    ) -> str | None:
+        host = os.getenv(
+            "KUBERNETES_SERVICE_HOST"
+        )
+
+        if not host:
+            return None
+
+        port = os.getenv(
+            "KUBERNETES_SERVICE_PORT_HTTPS",
+            os.getenv(
+                "KUBERNETES_SERVICE_PORT",
+                "443",
+            ),
+        )
+
+        normalized_host = host.strip()
+
+        if ":" in normalized_host and not (
+            normalized_host.startswith("[")
+            and normalized_host.endswith("]")
+        ):
+            normalized_host = (
+                f"[{normalized_host}]"
+            )
+
+        return (
+            f"https://{normalized_host}:{port}"
+        )
+
+    @staticmethod
+    def _read_token(
+        path: Path,
+    ) -> str:
+        try:
+            token = path.read_text(
+                encoding="utf-8"
+            ).strip()
+        except OSError as exc:
+            raise KubernetesConfigurationError(
+                "Kubernetes token file could not be read"
+            ) from exc
+
+        if not token:
+            raise KubernetesConfigurationError(
+                "Kubernetes token file is empty"
+            )
+
+        return token
+
+    @staticmethod
+    def _required_text(
+        value: Any,
+        name: str,
+    ) -> str:
+        if not isinstance(value, str):
+            raise KubernetesToolError(
+                f"Kubernetes {name} must be text"
+            )
+
+        normalized = value.strip()
+
+        if not normalized:
+            raise KubernetesToolError(
+                f"Kubernetes {name} cannot be empty"
+            )
+
+        return normalized
+
+    @staticmethod
+    def _read_bool(
+        name: str,
+        default: bool,
+    ) -> bool:
+        raw = os.getenv(name)
+
+        if raw is None:
+            return default
+
+        normalized = raw.strip().lower()
+
+        if normalized in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return True
+
+        if normalized in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }:
+            return False
+
+        raise KubernetesConfigurationError(
+            f"{name} must be a boolean"
+        )
+
+    @staticmethod
+    def _read_positive_float(
+        name: str,
+        default: float,
+    ) -> float:
+        raw = os.getenv(name)
+
+        if raw is None:
+            return default
+
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            raise KubernetesConfigurationError(
+                f"{name} must be a number"
+            ) from exc
+
+        if value <= 0:
+            raise KubernetesConfigurationError(
+                f"{name} must be positive"
+            )
+
+        return value

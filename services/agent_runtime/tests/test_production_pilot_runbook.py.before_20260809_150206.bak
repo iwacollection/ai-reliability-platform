@@ -1,0 +1,56 @@
+from pathlib import Path
+
+from services.agent_runtime.app.action.production_pilot import (
+    KUBERNETES_PRODUCTION_KILL_SWITCH_DISENGAGED,
+    KUBERNETES_PRODUCTION_KILL_SWITCH_ENGAGED,
+    KUBERNETES_PRODUCTION_RUNBOOK_ACKNOWLEDGEMENT,
+)
+from services.agent_runtime.app.action.production_pilot_ceremony_models import (
+    PRODUCTION_PILOT_ACTIVATION_ACKNOWLEDGEMENT,
+)
+
+
+def runbook_path() -> Path:
+    return (
+        Path(__file__)
+        .resolve()
+        .parents[3]
+        / "docs"
+        / "runbooks"
+        / "oomkilled-production-pilot-v1.md"
+    )
+
+
+def test_runbook_locks_live_pilot_safety_contract():
+    content = runbook_path().read_text(
+        encoding="utf-8"
+    )
+
+    for required in (
+        KUBERNETES_PRODUCTION_KILL_SWITCH_ENGAGED,
+        KUBERNETES_PRODUCTION_KILL_SWITCH_DISENGAGED,
+        KUBERNETES_PRODUCTION_RUNBOOK_ACKNOWLEDGEMENT,
+        "GET /production-actions/pilot-readiness",
+        "POST /production-actions/pilot-rehearsal",
+        "POST /production-actions/{approval_id}/pilot-activation-checklist",
+        PRODUCTION_PILOT_ACTIVATION_ACKNOWLEDGEMENT,
+        "ready_for_execution=true",
+        "budget_state=available",
+        "durable_claim_created=false",
+        "external_call_count=0",
+        "action_execution_created=false",
+        "real_write_attempted=false",
+        "ceremony.status=ready",
+        "ceremony.status=activated",
+        "RUNNING + ACTIVATED",
+        "激活重放永远不能获得 Executor 调用权限",
+        "INDETERMINATE",
+        "Idempotency-Key",
+        "Exactly-once Verification",
+    ):
+        assert required in content
+
+    lowered = content.lower()
+    assert "bearer " not in lowered
+    assert "api_key " not in lowered
+    assert "password=" not in lowered

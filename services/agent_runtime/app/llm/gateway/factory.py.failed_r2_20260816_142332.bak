@@ -1,0 +1,38 @@
+from services.agent_runtime.app.llm.client import (
+    LLMClient,
+)
+from services.agent_runtime.app.llm.gateway.gateway import (
+    LLMGateway,
+)
+from services.agent_runtime.app.llm.gateway.router import (
+    LLMRouter,
+)
+from services.agent_runtime.app.llm.observed_client import (
+    ObservedLLMClient,
+)
+from services.agent_runtime.app.llm.provider_factory import (
+    create_llm_provider,
+)
+
+
+def create_shared_llm_gateway() -> LLMGateway:
+    """
+    Build the single Runtime-owned LLM Gateway.
+
+    Provider construction, observability, routing, rate limiting, circuit
+    breaking and fallback remain centralized in LLMGateway. Callers receive
+    the same instance instead of assembling parallel gateways.
+    """
+
+    provider = create_llm_provider()
+    base_client = LLMClient(provider)
+    observed_client = ObservedLLMClient(
+        base_client
+    )
+
+    return LLMGateway(
+        clients={
+            "openai": observed_client,
+        },
+        router=LLMRouter(),
+    )

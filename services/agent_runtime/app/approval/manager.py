@@ -1,163 +1,450 @@
-from uuid import uuid4
-
+from collections.abc import Mapping
+from datetime import UTC, datetime
+from typing import Any
+from uuid import UUID, uuid4
 
 from services.agent_runtime.app.action.models import (
     ActionPlan,
 )
-
-
 from services.agent_runtime.app.approval.models import (
+    ApprovalDecision,
     ApprovalRequest,
     ApprovalStatus,
 )
-
-
 from services.agent_runtime.app.approval.store import (
+    ApprovalConflictError,
     ApprovalStore,
 )
+from services.agent_runtime.app.approval.transition_guard import (
+    ApprovalTransitionGuard,
+)
 
+
+class ApprovalDecisionConflictError(
+    ApprovalConflictError
+):
+    """
+    A terminal decision exists but does not match the requested idempotent
+    replay.
+    """
 
 
 class ApprovalManager:
     """
-    Manage human approval workflow.
+    Manage the human approval workflow.
 
-    Flow:
-
-    Policy Decision
-
-          |
-
-          v
-
-    ApprovalRequest
-
-          |
-
-          v
-
-    Human Decision
-
+    Audited decisions persist ApprovalStatus, ActionPlan.approved and
+    ApprovalDecision in one compare-and-set update. Calls without audit
+    arguments retain the legacy behavior for internal compatibility.
     """
-
 
     def __init__(
         self,
         store: ApprovalStore | None = None,
-    ):
-
+        *,
+        transition_guard: ApprovalTransitionGuard | None = None,
+    ) -> None:
+        if (
+            transition_guard is not None
+            and not isinstance(
+                transition_guard,
+                ApprovalTransitionGuard,
+            )
+        ):
+            raise TypeError(
+                "Approval transition guard is invalid"
+            )
 
         self.store = (
             store
             or ApprovalStore()
         )
+        self.transition_guard = transition_guard
 
+    def set_transition_guard(
+        self,
+        transition_guard: ApprovalTransitionGuard,
+    ) -> None:
+        """Install the shared guard once during Runtime composition."""
 
+        if not isinstance(
+            transition_guard,
+            ApprovalTransitionGuard,
+        ):
+            raise TypeError(
+                "Approval transition guard is invalid"
+            )
+
+        if (
+            self.transition_guard is not None
+            and self.transition_guard
+            is not transition_guard
+        ):
+            raise ValueError(
+                "Approval transition guard is already configured"
+            )
+
+        self.transition_guard = transition_guard
 
     async def create_request(
         self,
         action: ActionPlan,
         reason: str = "",
+        incident_id: UUID | str | None = None,
+        *,
+        request_id: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> ApprovalRequest:
-        """
-        Create pending approval request.
-        """
-
+        if request_id is not None and (
+            not isinstance(request_id, str)
+            or not request_id
+            or request_id != request_id.strip()
+            or len(request_id) > 128
+        ):
+            raise ValueError(
+                "Approval request ID is invalid"
+            )
 
         request = ApprovalRequest(
-
-            id=str(
-                uuid4()
+            id=(
+                request_id
+                if request_id is not None
+                else str(uuid4())
             ),
-
-
+            incident_id=incident_id,
             action=action,
-
-
             reason=reason,
-
+            metadata=dict(metadata or {}),
         )
-
 
         return await self.store.save(
             request
         )
 
-
-
     async def get_request(
         self,
         request_id: str,
     ) -> ApprovalRequest | None:
-
-
         return await self.store.get(
             request_id
         )
 
+    async def list_requests_by_incident(
+        self,
+        incident_id: UUID | str,
+    ) -> list[ApprovalRequest]:
+        """
+        Return every approval attempt linked to one Incident.
 
+        ApprovalStore owns filtering and stable chronological ordering. The
+        manager deliberately does not collapse multiple remediation attempts
+        into one record.
+        """
+
+        return await self.store.list_by_incident(
+            incident_id
+        )
 
     async def approve(
         self,
         request_id: str,
+        *,
+        operator_id: str | None = None,
+        idempotency_key: str | None = None,
+        reason: str = "",
+        metadata: Mapping[str, Any] | None = None,
     ) -> ApprovalRequest:
-
-
-        request = await self.store.get(
-            request_id
+        return await self._transition(
+            request_id=request_id,
+            target_status=ApprovalStatus.APPROVED,
+            action_approved=True,
+            operator_id=operator_id,
+            idempotency_key=idempotency_key,
+            decision_reason=reason,
+            decision_metadata=metadata,
         )
-
-
-        if request is None:
-
-            raise ValueError(
-                "Approval request not found"
-            )
-
-
-        request.status = (
-            ApprovalStatus.APPROVED
-        )
-
-
-        return await self.store.update(
-            request
-        )
-
-
 
     async def reject(
         self,
         request_id: str,
+        *,
+        operator_id: str | None = None,
+        idempotency_key: str | None = None,
+        reason: str = "",
+        metadata: Mapping[str, Any] | None = None,
     ) -> ApprovalRequest:
-
-
-        request = await self.store.get(
-            request_id
+        return await self._transition(
+            request_id=request_id,
+            target_status=ApprovalStatus.REJECTED,
+            action_approved=False,
+            operator_id=operator_id,
+            idempotency_key=idempotency_key,
+            decision_reason=reason,
+            decision_metadata=metadata,
         )
-
-
-        if request is None:
-
-            raise ValueError(
-                "Approval request not found"
-            )
-
-
-        request.status = (
-            ApprovalStatus.REJECTED
-        )
-
-
-        return await self.store.update(
-            request
-        )
-
-
 
     async def list_requests(
         self,
     ) -> list[ApprovalRequest]:
-
-
         return await self.store.list_all()
+
+    async def _transition(
+        self,
+        *,
+        request_id: str,
+        target_status: ApprovalStatus,
+        action_approved: bool,
+        operator_id: str | None,
+        idempotency_key: str | None,
+        decision_reason: str,
+        decision_metadata: Mapping[str, Any] | None,
+    ) -> ApprovalRequest:
+        """
+        Move PENDING to one terminal state using compare-and-set.
+
+        An audited replay succeeds only when operator, idempotency key, target
+        status, reason and metadata all match the stored decision.
+        """
+
+        decision = self._build_decision(
+            target_status=target_status,
+            operator_id=operator_id,
+            idempotency_key=idempotency_key,
+            reason=decision_reason,
+            metadata=decision_metadata,
+        )
+
+        request = await self._get_required(
+            request_id
+        )
+
+        if request.status == target_status:
+            return self._resolve_replay(
+                request=request,
+                requested_decision=decision,
+            )
+
+        if request.status != ApprovalStatus.PENDING:
+            self._raise_terminal_conflict(
+                request=request,
+                target_status=target_status,
+                audited=decision is not None,
+            )
+
+        await self._require_transition_allowed(
+            request=request,
+            target_status=target_status,
+            requested_decision=decision,
+        )
+
+        request.status = target_status
+        request.action.approved = (
+            action_approved
+        )
+        request.decision = decision
+        request.updated_at = (
+            decision.decided_at
+            if decision is not None
+            else datetime.now(UTC)
+        )
+
+        try:
+            return await self.store.update(
+                request,
+                expected_status=(
+                    ApprovalStatus.PENDING
+                ),
+            )
+
+        except ApprovalConflictError as exc:
+            current = await self._get_required(
+                request_id
+            )
+
+            if current.status == target_status:
+                return self._resolve_replay(
+                    request=current,
+                    requested_decision=decision,
+                )
+
+            if decision is not None:
+                raise ApprovalDecisionConflictError(
+                    "Concurrent approval decision conflict "
+                    f"for {request_id}: stored status is "
+                    f"{current.status.value}, requested status "
+                    f"is {target_status.value}"
+                ) from exc
+
+            raise ApprovalConflictError(
+                "Concurrent approval decision conflict "
+                f"for {request_id}: stored status is "
+                f"{current.status.value}, requested status "
+                f"is {target_status.value}"
+            ) from exc
+
+    async def _require_transition_allowed(
+        self,
+        *,
+        request: ApprovalRequest,
+        target_status: ApprovalStatus,
+        requested_decision: ApprovalDecision | None,
+    ) -> None:
+        """
+        Evaluate an optional guard only for a still-pending transition.
+
+        If a concurrent caller completed the same transition while the guard
+        was evaluating, an exact audited replay remains successful. The guard
+        exception is otherwise propagated without changing Approval state.
+        """
+
+        if self.transition_guard is None:
+            return
+
+        try:
+            await self.transition_guard.require_transition(
+                request,
+                target_status,
+            )
+        except Exception:
+            current = await self._get_required(
+                request.id
+            )
+            if current.status == target_status:
+                self._resolve_replay(
+                    request=current,
+                    requested_decision=(
+                        requested_decision
+                    ),
+                )
+                return
+
+            raise
+
+    @staticmethod
+    def _build_decision(
+        *,
+        target_status: ApprovalStatus,
+        operator_id: str | None,
+        idempotency_key: str | None,
+        reason: str,
+        metadata: Mapping[str, Any] | None,
+    ) -> ApprovalDecision | None:
+        audit_requested = any(
+            (
+                operator_id is not None,
+                idempotency_key is not None,
+                bool(reason),
+                metadata is not None,
+            )
+        )
+
+        if not audit_requested:
+            return None
+
+        if (
+            operator_id is None
+            or idempotency_key is None
+        ):
+            raise ValueError(
+                "Audited approval decisions require both "
+                "operator_id and idempotency_key"
+            )
+
+        return ApprovalDecision(
+            status=target_status,
+            operator_id=operator_id,
+            idempotency_key=idempotency_key,
+            reason=reason,
+            metadata=dict(
+                metadata or {}
+            ),
+        )
+
+    @classmethod
+    def _resolve_replay(
+        cls,
+        *,
+        request: ApprovalRequest,
+        requested_decision: ApprovalDecision | None,
+    ) -> ApprovalRequest:
+        """Return an exact replay and reject every ambiguous terminal retry."""
+
+        if requested_decision is None:
+            return request
+
+        stored_decision = request.decision
+
+        if stored_decision is None:
+            raise ApprovalDecisionConflictError(
+                "Approval request is already terminal but has "
+                "no persisted idempotency decision: "
+                f"{request.id}"
+            )
+
+        if cls._same_decision(
+            stored=stored_decision,
+            requested=requested_decision,
+        ):
+            return request
+
+        raise ApprovalDecisionConflictError(
+            "Approval request already has a different "
+            f"decision: {request.id}"
+        )
+
+    @staticmethod
+    def _same_decision(
+        *,
+        stored: ApprovalDecision,
+        requested: ApprovalDecision,
+    ) -> bool:
+        return (
+            stored.status == requested.status
+            and stored.operator_id
+            == requested.operator_id
+            and stored.idempotency_key
+            == requested.idempotency_key
+            and stored.reason
+            == requested.reason
+            and stored.metadata
+            == requested.metadata
+        )
+
+    @staticmethod
+    def _raise_terminal_conflict(
+        *,
+        request: ApprovalRequest,
+        target_status: ApprovalStatus,
+        audited: bool,
+    ) -> None:
+        message = (
+            "Cannot transition approval request "
+            f"{request.id} from "
+            f"{request.status.value} to "
+            f"{target_status.value}"
+        )
+
+        if audited:
+            raise ApprovalDecisionConflictError(
+                message
+            )
+
+        raise ValueError(
+            message
+        )
+
+    async def _get_required(
+        self,
+        request_id: str,
+    ) -> ApprovalRequest:
+        request = await self.store.get(
+            request_id
+        )
+
+        if request is None:
+            raise ValueError(
+                "Approval request not found: "
+                f"{request_id}"
+            )
+
+        return request

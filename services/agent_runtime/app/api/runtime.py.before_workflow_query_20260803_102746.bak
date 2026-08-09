@@ -1,0 +1,986 @@
+from typing import Any, Literal
+from uuid import UUID, uuid4
+
+from fastapi import (
+    APIRouter,
+    Body,
+    Header,
+    HTTPException,
+)
+from fastapi.encoders import (
+    jsonable_encoder,
+)
+from fastapi.responses import (
+    JSONResponse,
+)
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+)
+
+from common.domain.event import StandardEvent
+
+from services.agent_runtime.app.action.execution_store import (
+    ActionExecutionConflictError,
+)
+from services.agent_runtime.app.runtime.verification_runtime import (
+    VerificationIncidentSyncError,
+)
+from services.agent_runtime.app.verification.profiles import (
+    VerificationProfileError,
+)
+from services.agent_runtime.app.verification.store import (
+    VerificationConflictError,
+)
+from services.agent_runtime.app.model.context import (
+    AgentContext,
+)
+from services.agent_runtime.app.approval.store import (
+    ApprovalConflictError,
+)
+from services.agent_runtime.app.runtime.runtime import (
+    AgentRuntime,
+)
+
+
+router = APIRouter()
+
+
+# One shared Runtime is required so API requests reuse the same configured
+# stores, tools and workflow services. SQLite remains the source of truth for
+# recovery after a process restart.
+runtime = AgentRuntime()
+
+
+class ApprovalDecisionBody(BaseModel):
+    """Optional human explanation and bounded audit metadata."""
+
+    model_config = ConfigDict(
+        extra="forbid"
+    )
+
+    reason: str = Field(
+        default="",
+        max_length=2000,
+    )
+
+    metadata: dict[str, Any] = Field(
+        default_factory=dict
+    )
+
+
+def _normalize_request_id(
+    value: str | None,
+) -> str:
+    normalized = (
+        value.strip()
+        if value is not None
+        else ""
+    )
+    return normalized or str(
+        uuid4()
+    )
+
+
+def _normalize_required_header(
+    value: str,
+    header_name: str,
+) -> str:
+    """Reject whitespace-only identity and idempotency headers."""
+
+    normalized = value.strip()
+
+    if not normalized:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{header_name} must not "
+                "be blank"
+            ),
+        )
+
+    return normalized
+
+
+def _trace_matches_incident(
+    trace,
+    incident_id: str,
+) -> bool:
+    """Prevent traces from another API request leaking into the response."""
+
+    for field_name in (
+        "input_data",
+        "output_data",
+    ):
+        data = getattr(
+            trace,
+            field_name,
+            None,
+        )
+
+        if not isinstance(
+            data,
+            dict,
+        ):
+            continue
+
+        if str(
+            data.get(
+                "incident_id",
+                "",
+            )
+        ) == incident_id:
+            return True
+
+    return False
+
+
+def _trace_summary(
+    trace,
+) -> dict[str, Any]:
+    """
+    Return bounded trace metadata.
+
+    Raw spans and prompt input are intentionally excluded from the public API
+    response. Full traces remain available through the observability store.
+    """
+
+    return {
+        "trace_id": str(
+            trace.trace_id
+        ),
+        "agent": trace.agent,
+        "duration_ms": trace.duration_ms,
+        "success": trace.success,
+        "score": trace.score,
+        "message": trace.message,
+    }
+
+
+def _current_trace_summaries(
+    incident_id: UUID,
+) -> list[dict[str, Any]]:
+    normalized_id = str(
+        incident_id
+    )
+
+    return [
+        _trace_summary(
+            trace
+        )
+        for trace in runtime.tracer.list()
+        if _trace_matches_incident(
+            trace,
+            normalized_id,
+        )
+    ]
+
+
+def _action_execution_status(
+    execution: dict[str, Any],
+) -> str:
+    """Read the persisted execution status from either response shape."""
+
+    value = (
+        execution.get(
+            "execution_status"
+        )
+        or execution.get(
+            "status"
+        )
+        or ""
+    )
+
+    return str(
+        value
+    ).strip().lower()
+
+
+def _action_execution_http_status(
+    execution: dict[str, Any],
+) -> int:
+    """Map Action Execution state without treating uncertainty as success."""
+
+    status = _action_execution_status(
+        execution
+    )
+
+    if status == "succeeded":
+        return 200
+
+    if status == "running":
+        return 202
+
+    if status == "failed":
+        return 502
+
+    if status == "indeterminate":
+        return 503
+
+    if (
+        execution.get("success")
+        is True
+        and execution.get(
+            "execution_id"
+        )
+    ):
+        return 200
+
+    return 409
+
+
+def _verification_status(
+    verification,
+) -> str | None:
+    """Normalize a persisted Verification status for the API response."""
+
+    if verification is None:
+        return None
+
+    value = getattr(
+        verification,
+        "status",
+        None,
+    )
+
+    if value is None:
+        return None
+
+    return str(
+        getattr(
+            value,
+            "value",
+            value,
+        )
+    ).strip().lower()
+
+
+def _workflow_status(
+    *,
+    execution_status: str,
+    verification_status: str | None,
+    verification_error: dict[str, Any] | None,
+) -> str:
+    """Expose the whole remediation outcome without hiding partial states."""
+
+    if execution_status != "succeeded":
+        return (
+            f"action_{execution_status}"
+            if execution_status
+            else "action_unknown"
+        )
+
+    if verification_error is not None:
+        return "verification_reconciliation_required"
+
+    if verification_status is None:
+        return "verification_not_started"
+
+    return {
+        "pending": "verification_pending",
+        "running": "verification_running",
+        "passed": "resolved",
+        "failed": "verification_failed",
+        "inconclusive": (
+            "verification_inconclusive"
+        ),
+        "timed_out": "verification_timed_out",
+    }.get(
+        verification_status,
+        "verification_unknown",
+    )
+
+
+@router.post(
+    "/execute",
+    summary="Execute Agent Runtime",
+)
+async def execute_runtime(
+    payload: dict = Body(...),
+    x_request_id: str | None = Header(
+        default=None,
+        max_length=128,
+    ),
+):
+    """
+    Validate one StandardEvent and execute the shared Agent Runtime pipeline.
+
+    This endpoint performs analysis only. It does not approve or execute a
+    remediation action automatically.
+    """
+
+    try:
+        event = StandardEvent.model_validate(
+            payload
+        )
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=jsonable_encoder(
+                exc.errors()
+            ),
+        ) from exc
+
+    request_id = _normalize_request_id(
+        x_request_id
+    )
+
+    context = AgentContext(
+        request_id=request_id,
+        event=event,
+        memory=runtime.memory,
+        tools=runtime.tools,
+        skills=runtime.skills,
+        mcp=runtime.mcp,
+        approval=runtime.approval,
+    )
+
+    results = await runtime.pipeline.execute(
+        context
+    )
+
+    incident = context.incident
+    trace_summaries = (
+        _current_trace_summaries(
+            incident.id
+        )
+    )
+
+    response = {
+        "success": True,
+        "request_id": request_id,
+        "incident": incident.model_dump(
+            mode="json"
+        ),
+        "results": [
+            result.model_dump(
+                mode="json"
+            )
+            for result in results
+        ],
+        "executions": [
+            execution.model_dump(
+                mode="json"
+            )
+            for execution in context.executions
+        ],
+        "evaluations": [
+            evaluation.model_dump(
+                mode="json"
+            )
+            for evaluation in context.evaluations
+        ],
+        "traces": trace_summaries,
+        "trace_count": len(
+            trace_summaries
+        ),
+    }
+
+    return jsonable_encoder(
+        response
+    )
+
+
+@router.get(
+    "/incidents/{incident_id}",
+    summary="Get Incident State",
+)
+async def get_incident(
+    incident_id: UUID,
+):
+    """Read one persisted Incident without changing workflow state."""
+
+    incident = await runtime.incident_store.get(
+        str(
+            incident_id
+        )
+    )
+
+    if incident is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Incident not found",
+        )
+
+    return jsonable_encoder(
+        {
+            "success": True,
+            "incident": incident.model_dump(
+                mode="json"
+            ),
+        }
+    )
+
+
+@router.get(
+    "/approvals/{approval_id}",
+    summary="Get Approval Request",
+)
+async def get_approval(
+    approval_id: UUID,
+):
+    """Read one persisted ApprovalRequest without making a decision."""
+
+    approval = await runtime.approval.get(
+        str(
+            approval_id
+        )
+    )
+
+    if approval is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Approval request not found",
+        )
+
+    return jsonable_encoder(
+        {
+            "success": True,
+            "approval": approval.model_dump(
+                mode="json"
+            ),
+        }
+    )
+
+
+async def _apply_approval_decision(
+    *,
+    approval_id: UUID,
+    operation: Literal[
+        "approve",
+        "reject",
+    ],
+    decision: ApprovalDecisionBody,
+    operator_id: str,
+    idempotency_key: str,
+):
+    """Apply one audited decision and map lifecycle failures to HTTP status."""
+
+    request_id = str(
+        approval_id
+    )
+
+    existing = await runtime.approval.get(
+        request_id
+    )
+
+    if existing is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Approval request not found",
+        )
+
+    decision_metadata = dict(
+        decision.metadata
+    )
+    decision_metadata[
+        "source"
+    ] = "api"
+
+    try:
+        if operation == "approve":
+            approval = await runtime.approval.approve(
+                request_id,
+                operator_id=operator_id,
+                idempotency_key=idempotency_key,
+                reason=decision.reason,
+                metadata=decision_metadata,
+            )
+        else:
+            approval = await runtime.approval.reject(
+                request_id,
+                operator_id=operator_id,
+                idempotency_key=idempotency_key,
+                reason=decision.reason,
+                metadata=decision_metadata,
+            )
+
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=jsonable_encoder(
+                exc.errors()
+            ),
+        ) from exc
+
+    except ApprovalConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(
+                exc
+            ),
+        ) from exc
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(
+                exc
+            ),
+        ) from exc
+
+    return jsonable_encoder(
+        {
+            "success": True,
+            "approval": approval.model_dump(
+                mode="json"
+            ),
+        }
+    )
+
+
+@router.post(
+    "/approvals/{approval_id}/approve",
+    summary="Approve Remediation Action",
+)
+async def approve_approval(
+    approval_id: UUID,
+    decision: ApprovalDecisionBody = Body(...),
+    x_operator_id: str = Header(
+        ...,
+        alias="X-Operator-ID",
+        min_length=1,
+        max_length=128,
+    ),
+    idempotency_key: str = Header(
+        ...,
+        alias="Idempotency-Key",
+        min_length=1,
+        max_length=128,
+    ),
+):
+    """
+    Persist an audited approval decision.
+
+    X-Operator-ID must be injected by a trusted authentication layer in a
+    production deployment. This endpoint records identity; it does not
+    authenticate the caller by itself.
+    """
+
+    return await _apply_approval_decision(
+        approval_id=approval_id,
+        operation="approve",
+        decision=decision,
+        operator_id=x_operator_id,
+        idempotency_key=idempotency_key,
+    )
+
+
+@router.post(
+    "/approvals/{approval_id}/reject",
+    summary="Reject Remediation Action",
+)
+async def reject_approval(
+    approval_id: UUID,
+    decision: ApprovalDecisionBody = Body(...),
+    x_operator_id: str = Header(
+        ...,
+        alias="X-Operator-ID",
+        min_length=1,
+        max_length=128,
+    ),
+    idempotency_key: str = Header(
+        ...,
+        alias="Idempotency-Key",
+        min_length=1,
+        max_length=128,
+    ),
+):
+    """Persist an audited rejection without executing the Action."""
+
+    return await _apply_approval_decision(
+        approval_id=approval_id,
+        operation="reject",
+        decision=decision,
+        operator_id=x_operator_id,
+        idempotency_key=idempotency_key,
+    )
+
+
+@router.post(
+    "/approvals/{approval_id}/resume",
+    summary="Resume Approved Remediation Action",
+)
+async def resume_approved_action(
+    approval_id: UUID,
+    x_operator_id: str = Header(
+        ...,
+        alias="X-Operator-ID",
+        min_length=1,
+        max_length=128,
+    ),
+    idempotency_key: str = Header(
+        ...,
+        alias="Idempotency-Key",
+        min_length=1,
+        max_length=128,
+    ),
+):
+    """
+    Resume one approved Action through the persistent execution boundary.
+
+    The execution Idempotency-Key is independent from the key used to record
+    the approval decision. Replaying the same key returns the persisted result
+    without invoking the executor again.
+    """
+
+    request_id = str(
+        approval_id
+    )
+    operator_id = _normalize_required_header(
+        x_operator_id,
+        "X-Operator-ID",
+    )
+    execution_key = _normalize_required_header(
+        idempotency_key,
+        "Idempotency-Key",
+    )
+
+    approval = await runtime.approval.get(
+        request_id
+    )
+
+    if approval is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Approval request not found",
+        )
+
+    if (
+        approval.status.value
+        != "approved"
+        or approval.action.approved
+        is not True
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Approval request is not "
+                "approved for execution"
+            ),
+        )
+
+    if approval.incident_id is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Approval request is not "
+                "linked to an Incident"
+            ),
+        )
+
+    incident_id = str(
+        approval.incident_id
+    )
+    incident = await runtime.incident_store.get(
+        incident_id
+    )
+
+    if incident is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Linked Incident was not "
+                "found"
+            ),
+        )
+
+    try:
+        execution = await (
+            runtime.action_runtime.resume(
+                request_id,
+                incident=incident,
+                operator_id=operator_id,
+                idempotency_key=(
+                    execution_key
+                ),
+            )
+        )
+
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=jsonable_encoder(
+                exc.errors()
+            ),
+        ) from exc
+
+    except ActionExecutionConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(
+                exc
+            ),
+        ) from exc
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(
+                exc
+            ),
+        ) from exc
+
+    persisted_incident = (
+        await runtime.incident_store.get(
+            incident_id
+        )
+    )
+
+    if persisted_incident is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Action execution completed but "
+                "the Incident state could not "
+                "be reloaded"
+            ),
+        )
+
+    execution_status = (
+        _action_execution_status(
+            execution
+        )
+    )
+    response_status = (
+        _action_execution_http_status(
+            execution
+        )
+    )
+
+    verification = None
+    verification_error: (
+        dict[str, Any] | None
+    ) = None
+
+    if (
+        execution_status == "succeeded"
+        and response_status == 200
+    ):
+        execution_id = str(
+            execution.get(
+                "execution_id",
+                "",
+            )
+        ).strip()
+
+        if not execution_id:
+            verification_error = {
+                "type": (
+                    "MissingActionExecutionId"
+                ),
+                "message": (
+                    "Successful Action Execution "
+                    "did not return execution_id"
+                ),
+            }
+            response_status = 503
+
+        else:
+            try:
+                (
+                    verification,
+                    persisted_incident,
+                ) = await (
+                    runtime.verification_coordinator.run(
+                        incident_id=incident_id,
+                        plan=approval.action,
+                        namespace=(
+                            approval.action.namespace
+                        ),
+                        cluster=(
+                            approval.action.cluster
+                        ),
+                        action_execution_id=(
+                            execution_id
+                        ),
+                        metadata={
+                            "source": "api",
+                            "trigger": (
+                                "post_action_execution"
+                            ),
+                            "approval_id": request_id,
+                        },
+                    )
+                )
+
+            except VerificationIncidentSyncError as exc:
+                verification = await (
+                    runtime.verification
+                    .get_by_action_execution(
+                        execution_id
+                    )
+                )
+                reloaded_incident = await (
+                    runtime.incident_store.get(
+                        incident_id
+                    )
+                )
+
+                if reloaded_incident is not None:
+                    persisted_incident = (
+                        reloaded_incident
+                    )
+
+                verification_error = {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                    "verification_id": str(
+                        exc.verification_id
+                    ),
+                }
+                response_status = 503
+
+            except VerificationConflictError as exc:
+                verification = await (
+                    runtime.verification
+                    .get_by_action_execution(
+                        execution_id
+                    )
+                )
+                verification_error = {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                }
+                response_status = 409
+
+            except (
+                VerificationProfileError,
+                ValueError,
+            ) as exc:
+                verification = await (
+                    runtime.verification
+                    .get_by_action_execution(
+                        execution_id
+                    )
+                )
+                verification_error = {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                }
+                response_status = 503
+
+            except Exception as exc:
+                verification = await (
+                    runtime.verification
+                    .get_by_action_execution(
+                        execution_id
+                    )
+                )
+                verification_error = {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                }
+                response_status = 503
+
+    verification_status = (
+        _verification_status(
+            verification
+        )
+    )
+
+    if (
+        verification_status
+        in {
+            "pending",
+            "running",
+        }
+        and response_status == 200
+    ):
+        response_status = 202
+
+    workflow_status = _workflow_status(
+        execution_status=execution_status,
+        verification_status=(
+            verification_status
+        ),
+        verification_error=(
+            verification_error
+        ),
+    )
+
+    response = {
+        "success": (
+            response_status == 200
+        ),
+        "workflow_success": (
+            response_status == 200
+            and verification_error is None
+            and verification_status == "passed"
+            and persisted_incident.status.value
+            == "resolved"
+        ),
+        "workflow_status": workflow_status,
+        "approval_id": request_id,
+        "incident": (
+            persisted_incident.model_dump(
+                mode="json"
+            )
+        ),
+        "execution": execution,
+        "verification": (
+            verification.model_dump(
+                mode="json"
+            )
+            if verification is not None
+            else None
+        ),
+        "verification_required": (
+            execution_status == "succeeded"
+        ),
+        "verification_follow_up_required": (
+            execution_status == "succeeded"
+            and (
+                verification_status != "passed"
+                or verification_error is not None
+            )
+        ),
+        "verification_error": (
+            verification_error
+        ),
+        "manual_reconciliation_required": (
+            execution_status
+            == "indeterminate"
+            or verification_error is not None
+        ),
+    }
+
+    return JSONResponse(
+        status_code=response_status,
+        content=jsonable_encoder(
+            response
+        ),
+    )
+
+
+@router.get(
+    "/verifications/{verification_id}",
+    summary="Get Verification Result",
+)
+async def get_verification(
+    verification_id: UUID,
+):
+    """Read one persisted VerificationResult without running new probes."""
+
+    verification = await runtime.verification.get(
+        verification_id
+    )
+
+    if verification is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Verification result not found",
+        )
+
+    return jsonable_encoder(
+        {
+            "success": True,
+            "verification": (
+                verification.model_dump(
+                    mode="json"
+                )
+            ),
+        }
+    )

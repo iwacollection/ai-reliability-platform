@@ -1,0 +1,455 @@
+from datetime import UTC, datetime
+from types import SimpleNamespace
+
+import pytest
+
+from services.agent_runtime.app.investigation.coordinator import (
+    EvidenceDrivenInvestigationCoordinator,
+)
+from services.agent_runtime.app.investigation.models import (
+    EvidenceItem,
+    IncidentHypothesis,
+    InvestigationConclusion,
+    InvestigationDecision,
+    InvestigationLimits,
+    InvestigationProbe,
+    InvestigationStatus,
+    InvestigationStopReason,
+)
+from services.agent_runtime.app.investigation.reasoner import (
+    BaseInvestigationReasoner,
+)
+
+
+NOW = datetime(
+    2026,
+    8,
+    9,
+    15,
+    0,
+    tzinfo=UTC,
+)
+
+
+def hypothesis(
+    confidence=0.5,
+    supporting=None,
+    missing=None,
+):
+    return IncidentHypothesis(
+        hypothesis_id="memory_limit_too_low",
+        cause="Container memory limit is too low",
+        confidence=confidence,
+        supporting_evidence_ids=(
+            supporting or []
+        ),
+        missing_evidence=(
+            missing or []
+        ),
+    )
+
+
+class ScriptedReasoner(
+    BaseInvestigationReasoner
+):
+    def __init__(self, decisions):
+        self.decisions = list(decisions)
+        self.states = []
+
+    async def decide(self, scope, state):
+        self.states.append(state)
+        decision = self.decisions.pop(0)
+
+        if isinstance(decision, Exception):
+            raise decision
+
+        return decision
+
+
+class FakeProbeExecutor:
+    def __init__(
+        self,
+        failure=None,
+    ):
+        self.calls = []
+        self.failure = failure
+
+    async def collect(
+        self,
+        context,
+        scope,
+        probe,
+    ):
+        self.calls.append(
+            {
+                "context": context,
+                "scope": scope,
+                "probe": probe,
+            }
+        )
+
+        if self.failure is not None:
+            failure = self.failure
+            self.failure = None
+            raise failure
+
+        return EvidenceItem(
+            evidence_id=f"evidence-{len(self.calls)}",
+            probe=probe,
+            source=(
+                "kubernetes"
+                if probe
+                == InvestigationProbe.KUBERNETES_POD_STATE
+                else "prometheus"
+            ),
+            success=True,
+            trusted=True,
+            production_signal=True,
+            reliability=1.0,
+            observed_at=NOW,
+            facts={
+                "oom_killed": True,
+                "value_sum": 1024.0,
+            },
+        )
+
+
+def context():
+    incident = SimpleNamespace(
+        status="analyzing",
+        reason="unchanged",
+    )
+    return SimpleNamespace(
+        event=SimpleNamespace(
+            signal=SimpleNamespace(
+                name="PodOOMKilled",
+                message="Pod restarted",
+            ),
+            resources=[
+                SimpleNamespace(
+                    name="payment-api",
+                    namespace="payment",
+                    cluster="production-a",
+                )
+            ],
+        ),
+        metadata={
+            "existing": "preserved"
+        },
+        variables={
+            "existing": "preserved"
+        },
+        incident=incident,
+    )
+
+
+@pytest.mark.asyncio
+async def test_dynamic_loop_collects_two_probes_then_concludes():
+    reasoner = ScriptedReasoner(
+        [
+            InvestigationDecision(
+                hypotheses=[
+                    hypothesis(
+                        missing=[
+                            "pod termination state"
+                        ]
+                    )
+                ],
+                rationale_summary=(
+                    "Collect Kubernetes evidence"
+                ),
+                next_probe=(
+                    InvestigationProbe.KUBERNETES_POD_STATE
+                ),
+            ),
+            InvestigationDecision(
+                hypotheses=[
+                    hypothesis(
+                        confidence=0.75,
+                        supporting=["evidence-1"],
+                        missing=["memory usage"],
+                    )
+                ],
+                rationale_summary=(
+                    "Collect memory usage evidence"
+                ),
+                next_probe=(
+                    InvestigationProbe.PROMETHEUS_MEMORY_WORKING_SET
+                ),
+            ),
+            InvestigationDecision(
+                hypotheses=[
+                    hypothesis(
+                        confidence=0.94,
+                        supporting=[
+                            "evidence-1",
+                            "evidence-2",
+                        ],
+                    )
+                ],
+                rationale_summary=(
+                    "OOM and memory evidence agree"
+                ),
+                stop=True,
+                stop_reason=(
+                    InvestigationStopReason.SUFFICIENT_EVIDENCE
+                ),
+                conclusion=InvestigationConclusion(
+                    root_cause=(
+                        "Container exceeded its memory limit"
+                    ),
+                    confidence=0.94,
+                    evidence_ids=[
+                        "evidence-1",
+                        "evidence-2",
+                    ],
+                ),
+            ),
+        ]
+    )
+    probes = FakeProbeExecutor()
+    coordinator = EvidenceDrivenInvestigationCoordinator(
+        reasoner=reasoner,
+        probe_executor=probes,
+        utc_clock=lambda: NOW,
+    )
+    current_context = context()
+    original_incident = current_context.incident
+
+    result = await coordinator.investigate(
+        current_context
+    )
+
+    assert result.status == (
+        InvestigationStatus.CONCLUDED
+    )
+    assert result.stop_reason == (
+        InvestigationStopReason.SUFFICIENT_EVIDENCE
+    )
+    assert result.iteration_count == 3
+    assert result.tool_call_count == 2
+    assert [
+        call["probe"]
+        for call in probes.calls
+    ] == [
+        InvestigationProbe.KUBERNETES_POD_STATE,
+        InvestigationProbe.PROMETHEUS_MEMORY_WORKING_SET,
+    ]
+
+    assert current_context.variables == {
+        "existing": "preserved"
+    }
+    assert current_context.incident is original_incident
+    assert current_context.incident.status == "analyzing"
+    assert current_context.metadata["existing"] == (
+        "preserved"
+    )
+
+    snapshot = current_context.metadata[
+        "investigation_shadow"
+    ]
+    assert snapshot["shadow_mode"] is True
+    assert snapshot["read_only"] is True
+    assert snapshot["status"] == "concluded"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_probe_stops_before_second_tool_call():
+    repeated = InvestigationDecision(
+        hypotheses=[hypothesis()],
+        rationale_summary="Collect pod evidence",
+        next_probe=(
+            InvestigationProbe.KUBERNETES_POD_STATE
+        ),
+    )
+    reasoner = ScriptedReasoner(
+        [repeated, repeated]
+    )
+    probes = FakeProbeExecutor()
+    coordinator = EvidenceDrivenInvestigationCoordinator(
+        reasoner=reasoner,
+        probe_executor=probes,
+        utc_clock=lambda: NOW,
+    )
+
+    result = await coordinator.investigate(
+        context()
+    )
+
+    assert result.status == (
+        InvestigationStatus.EXHAUSTED
+    )
+    assert result.stop_reason == (
+        InvestigationStopReason.DUPLICATE_PROBE
+    )
+    assert result.tool_call_count == 1
+    assert len(probes.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_max_iterations_stops_without_extra_reasoner_call():
+    decision = InvestigationDecision(
+        hypotheses=[hypothesis()],
+        rationale_summary="Collect pod evidence",
+        next_probe=(
+            InvestigationProbe.KUBERNETES_POD_STATE
+        ),
+    )
+    reasoner = ScriptedReasoner([decision])
+    probes = FakeProbeExecutor()
+    coordinator = EvidenceDrivenInvestigationCoordinator(
+        reasoner=reasoner,
+        probe_executor=probes,
+        limits=InvestigationLimits(
+            max_iterations=1,
+            max_tool_calls=10,
+            timeout_seconds=30,
+        ),
+        utc_clock=lambda: NOW,
+    )
+
+    result = await coordinator.investigate(
+        context()
+    )
+
+    assert result.stop_reason == (
+        InvestigationStopReason.MAX_ITERATIONS
+    )
+    assert len(reasoner.states) == 1
+    assert len(probes.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_reasoner_failure_is_sanitized_and_shadow_safe():
+    secret = "credential-value-must-not-leak"
+    reasoner = ScriptedReasoner(
+        [RuntimeError(secret)]
+    )
+    coordinator = EvidenceDrivenInvestigationCoordinator(
+        reasoner=reasoner,
+        probe_executor=FakeProbeExecutor(),
+        utc_clock=lambda: NOW,
+    )
+    current_context = context()
+
+    result = await coordinator.investigate(
+        current_context
+    )
+
+    assert result.status == (
+        InvestigationStatus.FAILED
+    )
+    assert result.stop_reason == (
+        InvestigationStopReason.REASONER_ERROR
+    )
+    assert result.failure_code == "RuntimeError"
+    assert secret not in str(
+        current_context.metadata[
+            "investigation_shadow"
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_error_becomes_untrusted_evidence_without_message():
+    secret = "https://token@example.invalid"
+    reasoner = ScriptedReasoner(
+        [
+            InvestigationDecision(
+                hypotheses=[hypothesis()],
+                rationale_summary="Collect pod evidence",
+                next_probe=(
+                    InvestigationProbe.KUBERNETES_POD_STATE
+                ),
+            ),
+            InvestigationDecision(
+                hypotheses=[hypothesis()],
+                rationale_summary=(
+                    "Stop because trusted evidence is missing"
+                ),
+                stop=True,
+                stop_reason=(
+                    InvestigationStopReason.INSUFFICIENT_EVIDENCE
+                ),
+            ),
+        ]
+    )
+    probes = FakeProbeExecutor(
+        failure=RuntimeError(secret)
+    )
+    coordinator = EvidenceDrivenInvestigationCoordinator(
+        reasoner=reasoner,
+        probe_executor=probes,
+        utc_clock=lambda: NOW,
+    )
+
+    result = await coordinator.investigate(
+        context()
+    )
+
+    assert result.status == (
+        InvestigationStatus.CONCLUDED
+    )
+    assert result.stop_reason == (
+        InvestigationStopReason.INSUFFICIENT_EVIDENCE
+    )
+    assert len(result.evidence) == 1
+    assert result.evidence[0].success is False
+    assert result.evidence[0].trusted is False
+    assert result.evidence[0].error_code == (
+        "RuntimeError"
+    )
+    assert secret not in str(
+        result.model_dump(mode="json")
+    )
+
+
+@pytest.mark.asyncio
+async def test_unknown_evidence_reference_fails_closed():
+    reasoner = ScriptedReasoner(
+        [
+            InvestigationDecision(
+                hypotheses=[
+                    hypothesis(
+                        confidence=0.99,
+                        supporting=[
+                            "nonexistent-evidence"
+                        ],
+                    )
+                ],
+                rationale_summary=(
+                    "Reference evidence that was never collected"
+                ),
+                stop=True,
+                stop_reason=(
+                    InvestigationStopReason.SUFFICIENT_EVIDENCE
+                ),
+                conclusion=InvestigationConclusion(
+                    root_cause="Unsupported conclusion",
+                    confidence=0.99,
+                    evidence_ids=[
+                        "nonexistent-evidence"
+                    ],
+                ),
+            )
+        ]
+    )
+    probes = FakeProbeExecutor()
+    coordinator = EvidenceDrivenInvestigationCoordinator(
+        reasoner=reasoner,
+        probe_executor=probes,
+        utc_clock=lambda: NOW,
+    )
+
+    result = await coordinator.investigate(
+        context()
+    )
+
+    assert result.status == InvestigationStatus.FAILED
+    assert result.stop_reason == (
+        InvestigationStopReason.REASONER_ERROR
+    )
+    assert result.failure_code == (
+        "InvalidEvidenceReference"
+    )
+    assert probes.calls == []

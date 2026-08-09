@@ -1,0 +1,540 @@
+from datetime import timedelta
+from pathlib import Path
+
+import httpx
+import pytest
+from fastapi import FastAPI
+
+from services.agent_runtime.app.action.kubernetes_production_executor import (
+    KubernetesProductionExecutor,
+    KubernetesProductionExecutorPolicy,
+    KubernetesProductionOutcomeIndeterminateError,
+)
+from services.agent_runtime.app.runtime.runtime import (
+    AgentRuntime,
+)
+from services.agent_runtime.app.security.models import (
+    OperatorRole,
+)
+from services.agent_runtime.app.verification.models import (
+    VerificationCheck,
+)
+from services.agent_runtime.tests.api_security_support import (
+    ApiTestSecurityHarness,
+    wire_api_test_security,
+)
+from services.agent_runtime.tests.production_action_expiry_support import (
+    APPROVAL_ID,
+    ARTIFACT_ID,
+    MutableClock,
+    NOW,
+    persist_prepared_workflow,
+    resolver,
+    workload_scope,
+)
+
+
+class StubProductionExecutor(
+    KubernetesProductionExecutor
+):
+    """Model one bounded production outcome without network access."""
+
+    def __init__(
+        self,
+        outcome,
+    ) -> None:
+        super().__init__(
+            api_url=(
+                "https://kubernetes.test"
+            ),
+            cluster_name="production-a",
+            policy=(
+                KubernetesProductionExecutorPolicy(
+                    enabled=True,
+                    allowed_targets=(
+                        workload_scope(),
+                    ),
+                )
+            ),
+            bearer_token=(
+                "production-api-test-token-0001"
+            ),
+        )
+        self.outcome = outcome
+        self.calls = 0
+
+    async def execute_claimed(
+        self,
+        execution,
+        record,
+    ):
+        self.calls += 1
+        if isinstance(
+            self.outcome,
+            Exception,
+        ):
+            raise self.outcome
+        return dict(
+            self.outcome
+        )
+
+
+class CountingCollector:
+    """Return explicit recovery evidence and count external collection."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def collect(
+        self,
+        probes,
+        context=None,
+    ) -> list[VerificationCheck]:
+        self.calls += 1
+        return [
+            VerificationCheck(
+                name=probe.name,
+                source=probe.source,
+                passed=True,
+                required=probe.required,
+                observed_value=(
+                    "production-api-recovered"
+                ),
+                expected_value=(
+                    "profile-rule"
+                ),
+                message=(
+                    "Explicit pilot recovery evidence"
+                ),
+            )
+            for probe in probes
+        ]
+
+
+def api_client(
+    app: FastAPI,
+) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(
+            app=app
+        ),
+        base_url="http://test",
+    )
+
+
+async def prepared_api(
+    monkeypatch,
+    tmp_path: Path,
+    *,
+    outcome,
+):
+    """Build one authenticated, pytest-local production workflow."""
+
+    monkeypatch.chdir(
+        tmp_path
+    )
+    monkeypatch.setenv(
+        "PROMETHEUS_ALLOW_MOCK_FALLBACK",
+        "true",
+    )
+    monkeypatch.setenv(
+        "KUBERNETES_ALLOW_DRY_RUN_FALLBACK",
+        "true",
+    )
+
+    executor = StubProductionExecutor(
+        outcome
+    )
+    runtime = AgentRuntime(
+        kubernetes_preflight=resolver(),
+        kubernetes_production_executor=(
+            executor
+        ),
+    )
+    clock = MutableClock(
+        NOW
+        + timedelta(minutes=1)
+    )
+    runtime.production_action_guard._clock = (
+        clock
+    )
+
+    from services.agent_runtime.app.api import (
+        runtime as api_module,
+    )
+
+    security = wire_api_test_security(
+        monkeypatch,
+        api_module,
+        runtime,
+    )
+    app = FastAPI()
+    app.include_router(
+        api_module.router
+    )
+    record, approval, incident = (
+        await persist_prepared_workflow(
+            artifact_service=(
+                runtime.preflight_artifact_service
+            ),
+            approval_service=runtime.approval,
+            incident_store=(
+                runtime.incident_store
+            ),
+        )
+    )
+    collector = CountingCollector()
+    runtime.verification_coordinator.collector = (
+        collector
+    )
+    return (
+        app,
+        runtime,
+        security,
+        executor,
+        collector,
+        record,
+        approval,
+        incident,
+    )
+
+
+def approval_headers(
+    security: ApiTestSecurityHarness,
+) -> dict[str, str]:
+    return security.headers(
+        OperatorRole.APPROVER,
+        include_operator_id=True,
+        idempotency_key=(
+            "approve-production-api-0001"
+        ),
+    )
+
+
+def execution_headers(
+    security: ApiTestSecurityHarness,
+) -> dict[str, str]:
+    return security.headers(
+        OperatorRole.EXECUTOR,
+        include_operator_id=True,
+        idempotency_key=(
+            "execute-production-api-0001"
+        ),
+    )
+
+
+async def approve(
+    client: httpx.AsyncClient,
+    security: ApiTestSecurityHarness,
+) -> None:
+    response = await client.post(
+        f"/approvals/{APPROVAL_ID}/approve",
+        json={
+            "reason": (
+                "Approve bounded OOMKilled pilot"
+            ),
+        },
+        headers=approval_headers(
+            security
+        ),
+    )
+    assert response.status_code == 200
+
+
+def successful_outcome() -> dict:
+    return {
+        "success": True,
+        "mode": "kubernetes_production",
+        "action": "increase_memory_limit",
+        "resource": "deployment",
+        "cluster": "production-a",
+        "namespace": "payment",
+        "target": "payment-api",
+        "container": "payment-api",
+        "contract_id": str(
+            ARTIFACT_ID
+        ),
+        "resource_version": "501",
+        "generation": 10,
+        "message": (
+            "Bounded Kubernetes update acknowledged"
+        ),
+    }
+
+
+@pytest.mark.asyncio
+async def test_authenticated_production_resume_replays_once_and_is_auditable(
+    monkeypatch,
+    tmp_path,
+):
+    (
+        app,
+        runtime,
+        security,
+        executor,
+        collector,
+        record,
+        _,
+        incident,
+    ) = await prepared_api(
+        monkeypatch,
+        tmp_path,
+        outcome=successful_outcome(),
+    )
+    resume_path = (
+        f"/approvals/{APPROVAL_ID}/resume"
+    )
+    headers = execution_headers(
+        security
+    )
+
+    async with api_client(
+        app
+    ) as client:
+        # Security failures happen before Approval, execution, or Kubernetes.
+        unauthenticated = await client.post(
+            resume_path,
+            headers={
+                "X-Operator-ID": (
+                    headers["X-Operator-ID"]
+                ),
+                "Idempotency-Key": (
+                    headers["Idempotency-Key"]
+                ),
+            },
+        )
+        forbidden = await client.post(
+            resume_path,
+            headers=security.headers(
+                OperatorRole.VIEWER,
+                include_operator_id=True,
+                idempotency_key=(
+                    "viewer-production-api-0001"
+                ),
+            ),
+        )
+
+        assert unauthenticated.status_code == 401
+        assert forbidden.status_code == 403
+        assert executor.calls == 0
+        assert collector.calls == 0
+        assert await (
+            runtime.action_execution_service
+            .get_by_approval(
+                APPROVAL_ID
+            )
+        ) is None
+
+        await approve(
+            client,
+            security,
+        )
+        first = await client.post(
+            resume_path,
+            headers=headers,
+        )
+        replay = await client.post(
+            resume_path,
+            headers=headers,
+        )
+        first_query = await client.get(
+            (
+                "/workflows/approvals/"
+                f"{APPROVAL_ID}"
+            ),
+            headers=security.headers(
+                OperatorRole.VIEWER
+            ),
+        )
+        replay_query = await client.get(
+            (
+                "/workflows/approvals/"
+                f"{APPROVAL_ID}"
+            ),
+            headers=security.headers(
+                OperatorRole.VIEWER
+            ),
+        )
+
+    assert first.status_code == 200
+    assert replay.status_code == 200
+    assert first_query.status_code == 200
+    assert replay_query.status_code == 200
+    assert executor.calls == 1
+    assert collector.calls == 1
+
+    first_body = first.json()
+    replay_body = replay.json()
+    assert first_body[
+        "workflow_status"
+    ] == "resolved"
+    assert first_body[
+        "execution"
+    ]["mode"] == "kubernetes_production"
+    assert replay_body[
+        "execution"
+    ]["idempotent_replay"] is True
+    assert replay_body[
+        "execution"
+    ]["execution_id"] == first_body[
+        "execution"
+    ]["execution_id"]
+    assert replay_body[
+        "verification"
+    ]["id"] == first_body[
+        "verification"
+    ]["id"]
+    assert first_body[
+        "incident"
+    ]["id"] == str(incident.id)
+    assert first_body[
+        "incident"
+    ]["status"] == "resolved"
+
+    query = first_query.json()
+    audit = query[
+        "action_execution_audit"
+    ]
+    assert query[
+        "workflow_status"
+    ] == "resolved"
+    assert audit == {
+        "mode": "kubernetes_production",
+        "production": True,
+        "status": "succeeded",
+        "operator_id": (
+            security.principal_id(
+                OperatorRole.EXECUTOR
+            )
+        ),
+        "preflight_artifact_id": str(
+            record.artifact_id
+        ),
+        "safety_contract_id": str(
+            ARTIFACT_ID
+        ),
+        "safety_policy_version": (
+            "oom-memory-increase-v1"
+        ),
+        "safety_patch_sha256": (
+            record.artifact.contract
+            .dry_run.patch_sha256
+        ),
+        "real_write_attempted": True,
+        "requires_reconciliation": False,
+        "reconciled": False,
+        "automatic_replay_allowed": False,
+    }
+    assert replay_query.json() == query
+
+    audit_text = str(
+        audit
+    ).lower()
+    for forbidden_name in (
+        "patch_json",
+        "workload_uid",
+        "resource_version",
+        "authorization",
+        "bearer",
+        "credential",
+        "token",
+    ):
+        assert forbidden_name not in audit_text
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_production_resume_is_frozen_and_never_verifies(
+    monkeypatch,
+    tmp_path,
+):
+    outcome = (
+        KubernetesProductionOutcomeIndeterminateError(
+            "Kubernetes acknowledgement unavailable"
+        )
+    )
+    (
+        app,
+        _,
+        security,
+        executor,
+        collector,
+        _,
+        _,
+        _,
+    ) = await prepared_api(
+        monkeypatch,
+        tmp_path,
+        outcome=outcome,
+    )
+    resume_path = (
+        f"/approvals/{APPROVAL_ID}/resume"
+    )
+    headers = execution_headers(
+        security
+    )
+
+    async with api_client(
+        app
+    ) as client:
+        await approve(
+            client,
+            security,
+        )
+        first = await client.post(
+            resume_path,
+            headers=headers,
+        )
+        replay = await client.post(
+            resume_path,
+            headers=headers,
+        )
+        query_response = await client.get(
+            (
+                "/workflows/approvals/"
+                f"{APPROVAL_ID}"
+            ),
+            headers=security.headers(
+                OperatorRole.VIEWER
+            ),
+        )
+
+    assert first.status_code == 503
+    assert replay.status_code == 503
+    assert query_response.status_code == 200
+    assert executor.calls == 1
+    assert collector.calls == 0
+    assert first.json()[
+        "workflow_status"
+    ] == "action_indeterminate"
+    assert replay.json()[
+        "execution"
+    ]["idempotent_replay"] is True
+    assert first.json()[
+        "verification"
+    ] is None
+
+    query = query_response.json()
+    audit = query[
+        "action_execution_audit"
+    ]
+    assert query[
+        "workflow_status"
+    ] == "action_indeterminate"
+    assert query[
+        "manual_reconciliation_required"
+    ] is True
+    assert audit[
+        "mode"
+    ] == "kubernetes_production"
+    assert audit[
+        "status"
+    ] == "indeterminate"
+    assert audit[
+        "real_write_attempted"
+    ] is True
+    assert audit[
+        "requires_reconciliation"
+    ] is True
+    assert audit[
+        "automatic_replay_allowed"
+    ] is False

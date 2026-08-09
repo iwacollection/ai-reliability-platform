@@ -16,6 +16,7 @@ dependencies = [
     "python-json-logger>=3.3.0",
     "pyyaml>=6.0.3",
     "httpx>=0.28.1",
+    "lark-channel-sdk==1.2.0",
 ]
 
 [dependency-groups]

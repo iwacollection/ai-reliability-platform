@@ -109,7 +109,7 @@ async def execute_runtime(
 
 
 
-        results = await runtime.pipeline.execute(
+        results = await runtime.execute(
             context
         )
 

@@ -1,0 +1,478 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+import traceback
+from datetime import UTC, datetime
+from pathlib import Path
+
+
+TEXT_REPORT = (
+    "investigation_intelligence_benchmark_v1_report.txt"
+)
+
+JSON_REPORT = (
+    "investigation_intelligence_benchmark_v1_report.json"
+)
+
+ERROR_REPORT = (
+    "investigation_intelligence_benchmark_v1_error.txt"
+)
+
+
+def find_repo_root(
+    start: Path,
+) -> Path:
+    for candidate in (
+        start,
+        *start.parents,
+    ):
+        if (
+            (candidate / "pyproject.toml").exists()
+            and (candidate / "services").exists()
+            and (candidate / "packages").exists()
+        ):
+            return candidate
+
+    raise RuntimeError(
+        "Repository root not found."
+    )
+
+
+def install_import_paths(
+    root: Path,
+) -> None:
+    for candidate in reversed(
+        [
+            root,
+            root / "packages" / "common" / "src",
+        ]
+    ):
+        value = str(
+            candidate
+        )
+
+        if value not in sys.path:
+            sys.path.insert(
+                0,
+                value,
+            )
+
+
+def write_text(
+    path: Path,
+    value: str,
+) -> None:
+    path.write_text(
+        value.replace(
+            "\r\n",
+            "\n",
+        ).replace(
+            "\r",
+            "\n",
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
+
+
+def verify_app_yaml_mock(
+    root: Path,
+) -> None:
+    path = (
+        root
+        / "configs"
+        / "app.yaml"
+    )
+
+    text = path.read_text(
+        encoding="utf-8-sig"
+    )
+
+    start = text.find(
+        "llm:"
+    )
+
+    if start < 0:
+        raise RuntimeError(
+            "configs/app.yaml has no llm section"
+        )
+
+    provider = None
+
+    for line in text[
+        start
+        + len(
+            "llm:"
+        ) :
+    ].splitlines():
+        stripped = line.strip()
+
+        if (
+            stripped
+            and not line.startswith(
+                (
+                    " ",
+                    "\t",
+                )
+            )
+        ):
+            break
+
+        if stripped.startswith(
+            "provider:"
+        ):
+            provider = (
+                stripped
+                .split(
+                    ":",
+                    1,
+                )[1]
+                .strip()
+            )
+            break
+
+    if provider != "mock":
+        raise RuntimeError(
+            "Safety invariant failed: configs/app.yaml must remain provider: mock"
+        )
+
+
+async def run_live(
+    *,
+    provider: str,
+    mode: str,
+    selected_keys: list[str],
+):
+    from services.agent_runtime.app.evaluation.intelligence_benchmark import (
+        build_bailian_reasoner,
+        build_report,
+        render_report,
+        run_scenario,
+        scenario_by_key,
+        scenarios_for_mode,
+    )
+    from services.agent_runtime.app.investigation.models import (
+        InvestigationLimits,
+    )
+
+    limits = InvestigationLimits(
+        max_iterations=5,
+        max_tool_calls=4,
+        timeout_seconds=60,
+    )
+
+    reasoner = (
+        build_bailian_reasoner(
+            provider_name=provider,
+            limits=limits,
+        )
+    )
+
+    if selected_keys:
+        scenarios = [
+            scenario_by_key(
+                key
+            )
+            for key in selected_keys
+        ]
+    else:
+        scenarios = scenarios_for_mode(
+            mode
+        )
+
+    observed_at = datetime(
+        2026,
+        8,
+        10,
+        8,
+        45,
+        tzinfo=UTC,
+    )
+
+    scores = []
+
+    for scenario in scenarios:
+        print(
+            f"[RUN] {scenario.key}"
+        )
+
+        score = await run_scenario(
+            reasoner=reasoner,
+            scenario=scenario,
+            limits=limits,
+            observed_at=observed_at,
+        )
+
+        scores.append(
+            score
+        )
+
+        print(
+            (
+                f"[DONE] {scenario.key}: "
+                f"{score.score:.1f}/100 "
+                f"stop={score.final_stop_reason} "
+                f"tools={score.tool_call_count}"
+            )
+        )
+
+    report = build_report(
+        provider=provider,
+        mode=(
+            "custom"
+            if selected_keys
+            else mode
+        ),
+        scenarios=scores,
+    )
+
+    return (
+        report,
+        render_report(
+            report
+        ),
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run the real Investigation LLM reasoner against hidden-label "
+            "synthetic evidence scenarios."
+        )
+    )
+
+    parser.add_argument(
+        "--provider",
+        default="bailian",
+    )
+
+    parser.add_argument(
+        "--mode",
+        choices=(
+            "smoke",
+            "full",
+        ),
+        default="smoke",
+    )
+
+    parser.add_argument(
+        "--scenario",
+        action="append",
+        default=[],
+        help=(
+            "Run one named scenario. Repeat to run multiple. "
+            "Overrides --mode."
+        ),
+    )
+
+    args = parser.parse_args()
+
+    root = find_repo_root(
+        Path.cwd().resolve()
+    )
+
+    install_import_paths(
+        root
+    )
+
+    text_path = (
+        root
+        / TEXT_REPORT
+    )
+
+    json_path = (
+        root
+        / JSON_REPORT
+    )
+
+    error_path = (
+        root
+        / ERROR_REPORT
+    )
+
+    for path in (
+        text_path,
+        json_path,
+        error_path,
+    ):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+    try:
+        verify_app_yaml_mock(
+            root
+        )
+
+        provider = (
+            args.provider
+            .strip()
+            .lower()
+        )
+
+        if not provider:
+            raise RuntimeError(
+                "Provider cannot be blank"
+            )
+
+        if provider == "mock":
+            raise RuntimeError(
+                "Intelligence Benchmark requires a real LLM provider"
+            )
+
+        # Preserve existing working configuration if explicitly set.
+        # These process-local defaults match the already-proven Bailian
+        # connectivity path used earlier in this repository.
+        if provider == "bailian":
+            os.environ.setdefault(
+                "BAILIAN_BASE_URL",
+                (
+                    "https://dashscope.aliyuncs.com"
+                    "/compatible-mode/v1"
+                ),
+            )
+
+            os.environ.setdefault(
+                "BAILIAN_MODEL",
+                "qwen-plus",
+            )
+
+            if not os.getenv(
+                "DASHSCOPE_API_KEY",
+                "",
+            ).strip():
+                raise RuntimeError(
+                    "DASHSCOPE_API_KEY is not present"
+                )
+
+        print(
+            "=" * 72
+        )
+        print(
+            "INVESTIGATION INTELLIGENCE BENCHMARK V1"
+        )
+        print(
+            "=" * 72
+        )
+        print(
+            f"Provider: {provider}"
+        )
+        print(
+            f"Mode: {args.mode}"
+        )
+        print(
+            "Ground truth is evaluator-only and is never sent to the model."
+        )
+        print("")
+
+        report, rendered = asyncio.run(
+            run_live(
+                provider=provider,
+                mode=args.mode,
+                selected_keys=(
+                    args.scenario
+                ),
+            )
+        )
+
+        write_text(
+            text_path,
+            rendered,
+        )
+
+        write_text(
+            json_path,
+            (
+                json.dumps(
+                    report.model_dump(
+                        mode="json"
+                    ),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n"
+            ),
+        )
+
+        print("")
+        print(
+            "=" * 72
+        )
+        print(
+            "BENCHMARK COMPLETED"
+        )
+        print(
+            "=" * 72
+        )
+        print(
+            (
+                f"Overall: "
+                f"{report.overall_score:.1f}/100"
+            )
+        )
+        print(
+            (
+                f"Outcome accuracy: "
+                f"{report.outcome_accuracy:.1f}%"
+            )
+        )
+        print(
+            (
+                f"Average tool calls: "
+                f"{report.average_tool_calls:.2f}"
+            )
+        )
+        print("")
+        print(
+            "Upload BOTH:"
+        )
+        print(
+            text_path
+        )
+        print(
+            json_path
+        )
+
+        return 0
+
+    except Exception as exc:
+        write_text(
+            error_path,
+            (
+                "Investigation Intelligence Benchmark v1 FAILED\n\n"
+                f"{type(exc).__name__}: {exc}\n\n"
+                + traceback.format_exc()
+            ),
+        )
+
+        print("")
+        print(
+            "=" * 72
+        )
+        print(
+            "BENCHMARK FAILED"
+        )
+        print(
+            "=" * 72
+        )
+        print(
+            "Upload:"
+        )
+        print(
+            error_path
+        )
+
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(
+        main()
+    )

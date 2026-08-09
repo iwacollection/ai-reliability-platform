@@ -1,0 +1,315 @@
+from collections.abc import Callable, Mapping
+from datetime import datetime
+from os import environ
+from pathlib import Path
+from typing import Any
+
+import httpx
+
+from common.config import get_settings
+from common.config.settings import (
+    KubernetesPreflightConfig,
+    KubernetesProductionExecutionConfig,
+)
+from services.agent_runtime.app.action.kubernetes_production_executor import (
+    KubernetesProductionExecutor,
+    KubernetesProductionExecutorPolicy,
+)
+from services.agent_runtime.app.action.production_pilot import (
+    KubernetesProductionPilotBlockedError,
+    KubernetesProductionPilotControl,
+)
+from services.agent_runtime.app.action.production_pilot_factory import (
+    create_kubernetes_production_pilot_control,
+)
+from services.agent_runtime.app.action.production_pilot_budget_service import (
+    ProductionPilotBudgetService,
+)
+from services.agent_runtime.app.action.safety_models import (
+    KubernetesWorkloadScope,
+)
+
+
+class KubernetesProductionFactoryConfigurationError(RuntimeError):
+    """The real-write executor cannot be assembled safely."""
+
+
+_MAX_TOKEN_FILE_BYTES = 16 * 1024
+
+
+def _resolve_configs(
+    preflight_config: KubernetesPreflightConfig | None,
+    execution_config: KubernetesProductionExecutionConfig | None,
+) -> tuple[KubernetesPreflightConfig, KubernetesProductionExecutionConfig]:
+    if preflight_config is None or execution_config is None:
+        settings = get_settings()
+        if preflight_config is None:
+            preflight_config = settings.remediation.kubernetes_preflight
+        if execution_config is None:
+            execution_config = (
+                settings.remediation.kubernetes_production_execution
+            )
+
+    if not isinstance(preflight_config, KubernetesPreflightConfig):
+        raise KubernetesProductionFactoryConfigurationError(
+            "Kubernetes production factory requires preflight configuration"
+        )
+    if not isinstance(
+        execution_config,
+        KubernetesProductionExecutionConfig,
+    ):
+        raise KubernetesProductionFactoryConfigurationError(
+            "Kubernetes production factory requires execution configuration"
+        )
+    return preflight_config, execution_config
+
+
+def _resolve_environment(
+    environment: Mapping[str, str] | None,
+) -> Mapping[str, str]:
+    resolved = environ if environment is None else environment
+    if not isinstance(resolved, Mapping):
+        raise KubernetesProductionFactoryConfigurationError(
+            "Kubernetes production credential source must be a mapping"
+        )
+    return resolved
+
+
+def _default_token_file_reader(path: str) -> str:
+    token_path = Path(path)
+    try:
+        if not token_path.is_file():
+            raise KubernetesProductionFactoryConfigurationError(
+                "Kubernetes production token file is unavailable"
+            )
+        if token_path.stat().st_size > _MAX_TOKEN_FILE_BYTES:
+            raise KubernetesProductionFactoryConfigurationError(
+                "Kubernetes production token file is too large"
+            )
+        return token_path.read_text(encoding="utf-8")
+    except KubernetesProductionFactoryConfigurationError:
+        raise
+    except OSError:
+        raise KubernetesProductionFactoryConfigurationError(
+            "Kubernetes production token file is unavailable"
+        ) from None
+
+
+def _validate_token(value: Any) -> str:
+    if not isinstance(value, str):
+        raise KubernetesProductionFactoryConfigurationError(
+            "Kubernetes production credential is invalid"
+        )
+    normalized = value.rstrip("\r\n")
+    if (
+        not normalized
+        or normalized != normalized.strip()
+        or len(normalized) < 16
+        or len(normalized.encode("utf-8")) > _MAX_TOKEN_FILE_BYTES
+        or "\x00" in normalized
+    ):
+        raise KubernetesProductionFactoryConfigurationError(
+            "Kubernetes production credential is invalid"
+        )
+    return normalized
+
+
+def _load_token(
+    *,
+    environment_name: str | None,
+    file_name: str | None,
+    environment: Mapping[str, str] | None,
+    token_file_reader: Callable[[str], str] | None,
+    label: str,
+) -> str:
+    if environment_name is not None:
+        source = _resolve_environment(environment)
+        value = source.get(environment_name)
+        if value is None:
+            raise KubernetesProductionFactoryConfigurationError(
+                f"Kubernetes {label} credential environment variable is missing"
+            )
+        return _validate_token(value)
+
+    if file_name is not None:
+        reader = token_file_reader or _default_token_file_reader
+        try:
+            return _validate_token(reader(file_name))
+        except KubernetesProductionFactoryConfigurationError:
+            raise
+        except Exception:
+            raise KubernetesProductionFactoryConfigurationError(
+                f"Kubernetes {label} token file is unavailable"
+            ) from None
+
+    raise KubernetesProductionFactoryConfigurationError(
+        f"Kubernetes {label} has no credential source"
+    )
+
+
+def _validate_ca_file(path: str | None) -> bool | str:
+    if path is None:
+        return True
+    try:
+        if not Path(path).is_file():
+            raise KubernetesProductionFactoryConfigurationError(
+                "Kubernetes production CA file is unavailable"
+            )
+    except OSError:
+        raise KubernetesProductionFactoryConfigurationError(
+            "Kubernetes production CA file is unavailable"
+        ) from None
+    return path
+
+
+def create_kubernetes_production_executor(
+    preflight_config: KubernetesPreflightConfig | None = None,
+    execution_config: KubernetesProductionExecutionConfig | None = None,
+    *,
+    environment: Mapping[str, str] | None = None,
+    production_token_file_reader: Callable[[str], str] | None = None,
+    preflight_token_file_reader: Callable[[str], str] | None = None,
+    client: httpx.AsyncClient | None = None,
+    clock: Callable[[], datetime] | None = None,
+    pilot_control: (
+        KubernetesProductionPilotControl | None
+    ) = None,
+    pilot_budget_service: (
+        ProductionPilotBudgetService | None
+    ) = None,
+) -> KubernetesProductionExecutor | None:
+    """
+    Build the production writer without enabling ActionRuntime execution.
+
+    Disabled execution returns None before environment, credential file, CA
+    file, or client access. Enabled mode fails startup unless preflight and
+    real-write identities are independently configured and resolve to
+    different credentials.
+    """
+
+    preflight, execution = _resolve_configs(
+        preflight_config,
+        execution_config,
+    )
+    if not execution.enabled:
+        return None
+
+    if pilot_control is None:
+        pilot_control = (
+            create_kubernetes_production_pilot_control(
+                preflight,
+                execution,
+                environment=environment,
+                clock=clock,
+            )
+        )
+    if not isinstance(
+        pilot_control,
+        KubernetesProductionPilotControl,
+    ):
+        raise KubernetesProductionFactoryConfigurationError(
+            "Kubernetes production pilot control is invalid"
+        )
+    try:
+        pilot_control.require_enablement()
+    except KubernetesProductionPilotBlockedError as exc:
+        raise KubernetesProductionFactoryConfigurationError(
+            "Kubernetes production pilot manifest is not ready"
+        ) from exc
+    if not isinstance(
+        pilot_budget_service,
+        ProductionPilotBudgetService,
+    ):
+        raise KubernetesProductionFactoryConfigurationError(
+            "Kubernetes production pilot budget service is required"
+        )
+
+    if (
+        not preflight.enabled
+        or preflight.api_url is None
+        or preflight.cluster_name is None
+        or not preflight.allowed_targets
+    ):
+        raise KubernetesProductionFactoryConfigurationError(
+            "Kubernetes production execution requires complete preflight"
+        )
+
+    production_reference = (
+        ("env", execution.bearer_token_env)
+        if execution.bearer_token_env is not None
+        else ("file", execution.bearer_token_file)
+    )
+    preflight_reference = (
+        ("env", preflight.bearer_token_env)
+        if preflight.bearer_token_env is not None
+        else ("file", preflight.bearer_token_file)
+    )
+    if production_reference == preflight_reference:
+        raise KubernetesProductionFactoryConfigurationError(
+            "Kubernetes production and preflight credentials must be separate"
+        )
+
+    production_token = _load_token(
+        environment_name=execution.bearer_token_env,
+        file_name=execution.bearer_token_file,
+        environment=environment,
+        token_file_reader=production_token_file_reader,
+        label="production execution",
+    )
+    preflight_token = _load_token(
+        environment_name=preflight.bearer_token_env,
+        file_name=preflight.bearer_token_file,
+        environment=environment,
+        token_file_reader=preflight_token_file_reader,
+        label="preflight",
+    )
+    if production_token == preflight_token:
+        raise KubernetesProductionFactoryConfigurationError(
+            "Kubernetes production and preflight credentials must differ"
+        )
+
+    verify_tls = _validate_ca_file(preflight.ca_file)
+    targets = tuple(
+        KubernetesWorkloadScope(
+            cluster=item.cluster,
+            namespace=item.namespace,
+            name=item.deployment,
+            container=item.container,
+        )
+        for item in preflight.allowed_targets
+    )
+    policy = KubernetesProductionExecutorPolicy(
+        enabled=True,
+        allowed_targets=targets,
+        request_timeout_seconds=execution.request_timeout_seconds,
+        minimum_remaining_seconds=execution.minimum_remaining_seconds,
+        field_manager=preflight.field_manager,
+        policy_version=preflight.policy_version,
+    )
+
+    try:
+        return KubernetesProductionExecutor(
+            api_url=preflight.api_url,
+            cluster_name=preflight.cluster_name,
+            policy=policy,
+            bearer_token=production_token,
+            verify_tls=verify_tls,
+            client=client,
+            clock=clock,
+            pilot_control=pilot_control,
+            pilot_budget_service=(
+                pilot_budget_service
+            ),
+        )
+    except KubernetesProductionFactoryConfigurationError:
+        raise
+    except Exception:
+        raise KubernetesProductionFactoryConfigurationError(
+            "Kubernetes production executor configuration is invalid"
+        ) from None
+
+
+__all__ = [
+    "KubernetesProductionFactoryConfigurationError",
+    "create_kubernetes_production_executor",
+]

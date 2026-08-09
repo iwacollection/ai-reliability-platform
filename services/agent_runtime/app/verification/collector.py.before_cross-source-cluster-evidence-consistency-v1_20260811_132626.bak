@@ -1,0 +1,426 @@
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from services.agent_runtime.app.tools.manager import (
+    ToolManager,
+)
+from services.agent_runtime.app.verification.models import (
+    VerificationCheck,
+    VerificationSource,
+)
+
+
+@dataclass(
+    frozen=True,
+    slots=True,
+)
+class VerificationEvaluation:
+    """
+    Result produced after trusted evidence is evaluated.
+    """
+
+    passed: bool | None
+    observed_value: Any = None
+    expected_value: Any = None
+    message: str = ""
+    metadata: Mapping[str, Any] = field(
+        default_factory=dict
+    )
+
+
+EvidenceEvaluator = Callable[
+    [Mapping[str, Any]],
+    VerificationEvaluation,
+]
+
+
+@dataclass(
+    frozen=True,
+    slots=True,
+)
+class VerificationProbe:
+    """
+    Definition of one read-only verification probe.
+
+    The tool response must use this evidence envelope:
+    - success: true
+    - source: expected provider name
+    - mode: live / production / read_only
+    - production_signal: true
+    - observed_at: timezone-aware datetime or ISO-8601 text
+    """
+
+    name: str
+    source: VerificationSource
+    tool: str
+    provider: str
+    arguments: Mapping[str, Any]
+    evaluator: EvidenceEvaluator
+    required: bool = True
+
+
+class VerificationEvidenceCollector:
+    """
+    Collect and evaluate production verification evidence.
+
+    This class is fail-closed:
+    untrusted, stale, malformed, or unavailable evidence produces
+    an inconclusive VerificationCheck instead of a passing check.
+    """
+
+    _TRUSTED_MODES = {
+        "live",
+        "production",
+        "read_only",
+    }
+
+    _UNTRUSTED_MARKERS = {
+        "dry_run",
+        "fake",
+        "mock",
+        "simulated",
+        "simulation",
+        "test",
+    }
+
+    def __init__(
+        self,
+        tools: ToolManager,
+        max_evidence_age: timedelta = timedelta(
+            minutes=5
+        ),
+        max_future_skew: timedelta = timedelta(
+            seconds=30
+        ),
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        if max_evidence_age <= timedelta(0):
+            raise ValueError(
+                "max_evidence_age must be positive"
+            )
+
+        if max_future_skew < timedelta(0):
+            raise ValueError(
+                "max_future_skew cannot be negative"
+            )
+
+        self.tools = tools
+        self.max_evidence_age = max_evidence_age
+        self.max_future_skew = max_future_skew
+        self._clock = clock or (
+            lambda: datetime.now(UTC)
+        )
+
+    async def collect(
+        self,
+        probes: list[VerificationProbe],
+        context=None,
+    ) -> list[VerificationCheck]:
+        """
+        Run probes sequentially to avoid verification load spikes.
+        """
+
+        checks: list[VerificationCheck] = []
+
+        for probe in probes:
+            check = await self.collect_one(
+                probe,
+                context=context,
+            )
+            checks.append(check)
+
+        return checks
+
+    async def collect_one(
+        self,
+        probe: VerificationProbe,
+        context=None,
+    ) -> VerificationCheck:
+        checked_at = self._now()
+
+        try:
+            result = await self.tools.call(
+                probe.tool,
+                context=context,
+                **dict(probe.arguments),
+            )
+        except Exception as exc:
+            return self._inconclusive_check(
+                probe=probe,
+                checked_at=checked_at,
+                message=(
+                    "Verification evidence collection failed"
+                ),
+                metadata={
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+
+        if not isinstance(result, Mapping):
+            return self._inconclusive_check(
+                probe=probe,
+                checked_at=checked_at,
+                message=(
+                    "Verification evidence was rejected"
+                ),
+                metadata={
+                    "rejection_reasons": [
+                        "tool result is not a mapping"
+                    ]
+                },
+            )
+
+        rejection_reasons, observed_at = (
+            self._validate_evidence(
+                probe=probe,
+                evidence=result,
+                now=checked_at,
+            )
+        )
+
+        if rejection_reasons:
+            return self._inconclusive_check(
+                probe=probe,
+                checked_at=checked_at,
+                message=(
+                    "Verification evidence was rejected"
+                ),
+                metadata={
+                    "rejection_reasons": (
+                        rejection_reasons
+                    )
+                },
+            )
+
+        try:
+            evaluation = probe.evaluator(
+                result
+            )
+        except Exception as exc:
+            return self._inconclusive_check(
+                probe=probe,
+                checked_at=checked_at,
+                message=(
+                    "Verification evidence evaluation failed"
+                ),
+                metadata={
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+
+        if not isinstance(
+            evaluation,
+            VerificationEvaluation,
+        ):
+            return self._inconclusive_check(
+                probe=probe,
+                checked_at=checked_at,
+                message=(
+                    "Verification evaluator returned "
+                    "an invalid result"
+                ),
+            )
+
+        metadata = dict(
+            evaluation.metadata
+        )
+        metadata.update(
+            {
+                "trusted": True,
+                "tool": probe.tool,
+                "provider": probe.provider,
+                "evidence_observed_at": (
+                    observed_at.isoformat()
+                    if observed_at
+                    else None
+                ),
+            }
+        )
+
+        return VerificationCheck(
+            name=probe.name,
+            source=probe.source,
+            passed=evaluation.passed,
+            required=probe.required,
+            observed_value=(
+                evaluation.observed_value
+            ),
+            expected_value=(
+                evaluation.expected_value
+            ),
+            message=evaluation.message,
+            checked_at=checked_at,
+            metadata=metadata,
+        )
+
+    def _validate_evidence(
+        self,
+        probe: VerificationProbe,
+        evidence: Mapping[str, Any],
+        now: datetime,
+    ) -> tuple[list[str], datetime | None]:
+        reasons: list[str] = []
+
+        if evidence.get("success") is not True:
+            reasons.append(
+                "success is not true"
+            )
+
+        provider = str(
+            evidence.get(
+                "source",
+                "",
+            )
+        ).strip().lower()
+
+        expected_provider = (
+            probe.provider.strip().lower()
+        )
+
+        if provider != expected_provider:
+            reasons.append(
+                "source does not match expected provider"
+            )
+
+        mode = str(
+            evidence.get(
+                "mode",
+                "",
+            )
+        ).strip().lower()
+
+        if mode not in self._TRUSTED_MODES:
+            reasons.append(
+                "mode is not trusted"
+            )
+
+        identity_text = (
+            f"{provider} {mode}"
+        ).lower()
+
+        if any(
+            marker in identity_text
+            for marker in self._UNTRUSTED_MARKERS
+        ):
+            reasons.append(
+                "mock, test, or simulated evidence "
+                "is not allowed"
+            )
+
+        if (
+            evidence.get(
+                "production_signal"
+            )
+            is not True
+        ):
+            reasons.append(
+                "production_signal is not true"
+            )
+
+        observed_at = self._parse_datetime(
+            evidence.get(
+                "observed_at"
+            )
+        )
+
+        if observed_at is None:
+            reasons.append(
+                "observed_at is missing or invalid"
+            )
+            return reasons, None
+
+        age = now - observed_at
+
+        if age > self.max_evidence_age:
+            reasons.append(
+                "evidence is stale"
+            )
+
+        if age < -self.max_future_skew:
+            reasons.append(
+                "observed_at is too far in the future"
+            )
+
+        return reasons, observed_at
+
+    def _inconclusive_check(
+        self,
+        probe: VerificationProbe,
+        checked_at: datetime,
+        message: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> VerificationCheck:
+        check_metadata = dict(
+            metadata or {}
+        )
+        check_metadata.update(
+            {
+                "trusted": False,
+                "tool": probe.tool,
+                "provider": probe.provider,
+            }
+        )
+
+        return VerificationCheck(
+            name=probe.name,
+            source=probe.source,
+            passed=None,
+            required=probe.required,
+            message=message,
+            checked_at=checked_at,
+            metadata=check_metadata,
+        )
+
+    def _now(
+        self,
+    ) -> datetime:
+        value = self._clock()
+
+        if value.tzinfo is None:
+            raise ValueError(
+                "clock must return a timezone-aware datetime"
+            )
+
+        return value.astimezone(
+            UTC
+        )
+
+    @staticmethod
+    def _parse_datetime(
+        value: Any,
+    ) -> datetime | None:
+        if isinstance(
+            value,
+            datetime,
+        ):
+            parsed = value
+        elif isinstance(
+            value,
+            str,
+        ):
+            text = value.strip()
+
+            if text.endswith("Z"):
+                text = (
+                    f"{text[:-1]}+00:00"
+                )
+
+            try:
+                parsed = datetime.fromisoformat(
+                    text
+                )
+            except ValueError:
+                return None
+        else:
+            return None
+
+        if parsed.tzinfo is None:
+            return None
+
+        return parsed.astimezone(
+            UTC
+        )

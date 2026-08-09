@@ -1,20 +1,39 @@
+from common.config import (
+    get_settings,
+)
+
 from services.agent_runtime.app.llm.client import (
     LLMClient,
 )
-
 from services.agent_runtime.app.llm.models import (
     ChatRequest,
 )
-
 from services.agent_runtime.app.llm.gateway.models import (
     LLMGatewayRequest,
     LLMGatewayResponse,
 )
-
 from services.agent_runtime.app.llm.gateway.router import (
     LLMRouter,
 )
-
+from services.agent_runtime.app.llm.gateway.provider_manager import (
+    ProviderManager,
+)
+from services.agent_runtime.app.llm.gateway.executor import (
+    LLMExecutionError,
+    LLMExecutor,
+)
+from services.agent_runtime.app.llm.gateway.rate_limiter import (
+    RateLimiter,
+)
+from services.agent_runtime.app.llm.gateway.fallback import (
+    FallbackManager,
+)
+from services.agent_runtime.app.llm.gateway.circuit_breaker import (
+    CircuitBreaker,
+)
+from services.agent_runtime.app.llm.gateway.provider_health import (
+    ProviderHealthManager,
+)
 
 
 class LLMGateway:
@@ -22,118 +41,207 @@ class LLMGateway:
     Production LLM Gateway.
 
     Responsibilities:
-
     - Route LLM request
     - Convert gateway request
-    - Select provider client
-    - Return unified response
-
+    - Manage provider client
+    - Rate limit protection
+    - Circuit breaker protection
+    - Provider health management
+    - Provider fallback
+    - Execute LLM safely
     """
-
 
     def __init__(
         self,
         clients: dict[str, LLMClient],
         router: LLMRouter | None = None,
+        executor: LLMExecutor | None = None,
+        rate_limiter: RateLimiter | None = None,
+        fallback_manager: FallbackManager | None = None,
+        circuit_breaker: CircuitBreaker | None = None,
+        health_manager: ProviderHealthManager | None = None,
     ) -> None:
-
-
-        self.clients = clients
-
+        self.provider_manager = (
+            ProviderManager(
+                clients
+            )
+        )
 
         self.router = (
             router
-            or
-            LLMRouter()
+            or LLMRouter()
         )
 
+        settings = get_settings()
 
+        self.rate_limiter = (
+            rate_limiter
+            or RateLimiter(
+                enabled=(
+                    settings
+                    .llm
+                    .gateway
+                    .rate_limit
+                    .enabled
+                ),
+                requests_per_minute=(
+                    settings
+                    .llm
+                    .gateway
+                    .rate_limit
+                    .requests_per_minute
+                ),
+            )
+        )
+
+        self.circuit_breaker = (
+            circuit_breaker
+            or CircuitBreaker()
+        )
+
+        self.health_manager = (
+            health_manager
+            or ProviderHealthManager(
+                list(
+                    clients.keys()
+                )
+            )
+        )
+
+        self.fallback_manager = (
+            fallback_manager
+            or FallbackManager(
+                clients,
+                self.health_manager,
+            )
+        )
+
+        self.executor = (
+            executor
+            or LLMExecutor(
+                retry_attempts=(
+                    settings
+                    .llm
+                    .gateway
+                    .retry_attempts
+                ),
+                timeout=(
+                    settings
+                    .llm
+                    .gateway
+                    .request_timeout
+                ),
+            )
+        )
+
+    def _get_client(
+        self,
+        provider: str,
+    ) -> LLMClient:
+        return self.provider_manager.get(
+            provider
+        )
 
     async def chat(
         self,
         request: LLMGatewayRequest,
     ) -> LLMGatewayResponse:
-        """
-        Execute LLM request.
-        """
+        # 1. Rate limit one logical Gateway request. Executor retries do not
+        # consume additional Gateway rate-limit slots.
+        self.rate_limiter.check()
 
-
-        #
-        # Route decision
-        #
-
+        # 2. Route.
         route = self.router.route(
             request.context
         )
 
+        # 3. Circuit check.
+        self.circuit_breaker.check()
 
-
-        #
-        # Get provider client
-        #
-
-        client = self.clients.get(
+        # 4. Primary provider.
+        client = self._get_client(
             route.provider
         )
 
-
-
-        if client is None:
-
-            raise RuntimeError(
-
-                f"LLM provider '{route.provider}' "
-                "not configured."
-
-            )
-
-
-
-        #
-        # Convert Gateway request
-        #
-        # Gateway model
-        #        |
-        #        v
-        # Chat model
-        #
+        fallback_used = False
+        provider_used = (
+            route.provider
+        )
 
         chat_request = ChatRequest(
-
             system_prompt=(
                 request.system_prompt
             ),
-
             user_prompt=(
                 request.prompt
             ),
-
             temperature=(
                 request.temperature
             ),
-
         )
 
+        try:
+            response = await self.executor.execute(
+                client,
+                chat_request,
+            )
 
+            self.circuit_breaker.record_success()
 
-        #
-        # Execute LLM
-        #
+            self.health_manager.mark_healthy(
+                route.provider
+            )
 
-        response = await client.chat(
-            chat_request
-        )
+        except LLMExecutionError as exc:
+            # Only transient/provider-availability failures affect provider
+            # health or the circuit. Configuration/client-contract failures
+            # are not availability signals.
+            if exc.retryable:
+                self.circuit_breaker.record_failure()
 
+                self.health_manager.mark_unhealthy(
+                    route.provider
+                )
 
+            fallback_client = None
+
+            if (
+                exc.retryable
+                and request.context.enable_fallback
+            ):
+                fallback_client = (
+                    self.fallback_manager
+                    .get_fallback(
+                        route.provider
+                    )
+                )
+
+            if fallback_client is None:
+                raise
+
+            response = await self.executor.execute(
+                fallback_client,
+                chat_request,
+            )
+
+            fallback_used = True
+
+            provider_used = (
+                fallback_client.provider.name
+                if hasattr(
+                    fallback_client,
+                    "provider",
+                )
+                else "fallback"
+            )
+
+            self.health_manager.mark_healthy(
+                provider_used
+            )
 
         return LLMGatewayResponse(
-
             content=response.content,
-
-            provider=route.provider,
-
+            provider=provider_used,
             model=response.model,
-
-            fallback_used=False,
-
+            fallback_used=fallback_used,
         )

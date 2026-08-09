@@ -1,0 +1,166 @@
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from uuid import UUID
+
+from services.agent_runtime.app.action.kubernetes_preflight import (
+    KubernetesPreflightArtifact,
+    KubernetesPreflightRequest,
+)
+from services.agent_runtime.app.action.preflight_artifact_models import (
+    PreflightArtifactRecord,
+)
+from services.agent_runtime.app.action.preflight_artifact_store import (
+    PreflightArtifactConflictError,
+    PreflightArtifactStore,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PreflightArtifactClaimResult:
+    record: PreflightArtifactRecord
+    created: bool
+
+    @property
+    def is_replay(self) -> bool:
+        return not self.created
+
+
+class PreflightArtifactService:
+    """Application service for immutable Preflight Artifact persistence."""
+
+    def __init__(
+        self,
+        store: PreflightArtifactStore | None = None,
+    ) -> None:
+        self.store = store or PreflightArtifactStore()
+
+    async def claim_prepared(
+        self,
+        artifact: KubernetesPreflightArtifact,
+        idempotency_key: str,
+    ) -> PreflightArtifactClaimResult:
+        now = datetime.now(UTC)
+        candidate = PreflightArtifactRecord(
+            artifact_id=artifact.contract.contract_id,
+            incident_id=artifact.contract.incident_id,
+            idempotency_key=idempotency_key,
+            artifact=artifact,
+            created_at=now,
+            updated_at=now,
+        )
+
+        try:
+            persisted = await self.store.insert_prepared(candidate)
+            return PreflightArtifactClaimResult(
+                record=persisted,
+                created=True,
+            )
+        except PreflightArtifactConflictError as exc:
+            existing = await self.store.get_by_request(
+                candidate.incident_id,
+                candidate.idempotency_key,
+            )
+            if existing is None:
+                raise PreflightArtifactConflictError(
+                    "Preflight Artifact conflict cannot be resolved"
+                ) from exc
+            if not self._same_logical_preflight(existing.artifact, artifact):
+                raise PreflightArtifactConflictError(
+                    "Preflight idempotency key is bound to another request"
+                ) from exc
+            return PreflightArtifactClaimResult(
+                record=existing,
+                created=False,
+            )
+
+    async def get(
+        self,
+        artifact_id: UUID | str,
+    ) -> PreflightArtifactRecord | None:
+        return await self.store.get(artifact_id)
+
+    async def get_by_request(
+        self,
+        incident_id: UUID | str,
+        idempotency_key: str,
+    ) -> PreflightArtifactRecord | None:
+        return await self.store.get_by_request(
+            incident_id,
+            idempotency_key,
+        )
+
+    async def get_by_approval_id(
+        self,
+        approval_id: str,
+    ) -> PreflightArtifactRecord | None:
+        return await self.store.get_by_approval_id(
+            approval_id
+        )
+
+    async def bind_approval(
+        self,
+        record: PreflightArtifactRecord,
+        approval_id: str,
+        *,
+        updated_at: datetime | None = None,
+    ) -> PreflightArtifactRecord:
+        bound = record.bind_approval(
+            approval_id,
+            updated_at=updated_at or datetime.now(UTC),
+        )
+        return await self.store.bind_approval(bound)
+
+    async def list_by_incident(
+        self,
+        incident_id: UUID | str,
+    ) -> list[PreflightArtifactRecord]:
+        return await self.store.list_by_incident(incident_id)
+
+    @classmethod
+    def require_matches_request(
+        cls,
+        record: PreflightArtifactRecord,
+        request: KubernetesPreflightRequest,
+    ) -> None:
+        artifact = record.artifact
+        scope = artifact.contract.scope
+        matches = (
+            record.incident_id == request.incident_id
+            and scope.cluster == request.cluster
+            and scope.namespace == request.namespace
+            and artifact.plan.metadata.get("source_pod") == request.pod_name
+            and (
+                request.container is None
+                or scope.container == request.container
+            )
+            and artifact.plan.metadata.get("reason") == request.reason
+        )
+        if not matches:
+            raise PreflightArtifactConflictError(
+                "Preflight idempotency key does not match the stored request"
+            )
+
+    @staticmethod
+    def _same_logical_preflight(
+        left: KubernetesPreflightArtifact,
+        right: KubernetesPreflightArtifact,
+    ) -> bool:
+        left_contract = left.contract
+        right_contract = right.contract
+        return (
+            left_contract.incident_id == right_contract.incident_id
+            and left_contract.scope == right_contract.scope
+            and left_contract.precondition == right_contract.precondition
+            and left_contract.memory == right_contract.memory
+            and left_contract.policy_version == right_contract.policy_version
+            and left.plan.metadata.get("source_pod")
+            == right.plan.metadata.get("source_pod")
+            and left.plan.metadata.get("reason")
+            == right.plan.metadata.get("reason")
+        )
+
+
+__all__ = [
+    "PreflightArtifactClaimResult",
+    "PreflightArtifactService",
+]

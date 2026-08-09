@@ -1,0 +1,406 @@
+import json
+from copy import deepcopy
+
+import pytest
+
+from services.agent_runtime.app.evaluation.real_incident.loader import (
+    RealIncidentDatasetLoader,
+    RealIncidentDatasetLoadError,
+)
+from services.agent_runtime.app.evaluation.real_incident.models import (
+    RealIncidentDataset,
+)
+
+
+GROUND_TRUTH_SECRET = (
+    "Human verified root cause must never "
+    "enter the Agent replay source"
+)
+
+
+def dataset_payload():
+    return {
+        "schema_version": "v1",
+        "incident_id": (
+            "incident-unit-test-001"
+        ),
+        "event": {
+            "header": {
+                "event_id": (
+                    "11111111-1111-4111-8111-111111111111"
+                ),
+                "trace_id": (
+                    "22222222-2222-4222-8222-222222222222"
+                ),
+                "source": (
+                    "alertmanager"
+                ),
+                "occurred_at": (
+                    "2026-07-18T06:01:00Z"
+                ),
+            },
+            "signal": {
+                "type": "alert",
+                "name": "PodOOMKilled",
+                "severity": "critical",
+                "message": (
+                    "payment-api restarted"
+                ),
+                "labels": {},
+            },
+            "resources": [
+                {
+                    "kind": "pod",
+                    "name": "payment-api",
+                    "namespace": "payment",
+                    "cluster": (
+                        "production-a"
+                    ),
+                }
+            ],
+        },
+        "observations": [
+            {
+                "observation_id": (
+                    "obs-change-1"
+                ),
+                "source": "change",
+                "kind": (
+                    "deployment_revision"
+                ),
+                "observed_at": (
+                    "2026-07-18T05:55:00Z"
+                ),
+                "production_signal": True,
+                "data": {
+                    "revision": "abc123",
+                },
+            },
+            {
+                "observation_id": (
+                    "obs-pod-1"
+                ),
+                "source": "kubernetes",
+                "kind": "pod_state",
+                "observed_at": (
+                    "2026-07-18T06:02:00Z"
+                ),
+                "production_signal": True,
+                "data": {
+                    "phase": "Running",
+                    "oom_killed": True,
+                },
+            },
+        ],
+        "timeline": [
+            {
+                "timeline_id": "tl-1",
+                "occurred_at": (
+                    "2026-07-18T06:01:00Z"
+                ),
+                "source": "alertmanager",
+                "event_type": (
+                    "alert_fired"
+                ),
+                "summary": (
+                    "Pod alert fired"
+                ),
+                "evidence_refs": [],
+            },
+            {
+                "timeline_id": "tl-2",
+                "occurred_at": (
+                    "2026-07-18T06:02:00Z"
+                ),
+                "source": "kubernetes",
+                "event_type": (
+                    "pod_observed"
+                ),
+                "summary": (
+                    "Pod state captured"
+                ),
+                "evidence_refs": [
+                    "obs-pod-1"
+                ],
+            },
+        ],
+        "ground_truth": {
+            "root_cause": (
+                GROUND_TRUTH_SECRET
+            ),
+            "contributing_factors": [
+                "unit-test factor"
+            ],
+            "evidence_refs": [
+                "obs-change-1",
+                "obs-pod-1",
+            ],
+            "source": (
+                "unit-test-review"
+            ),
+            "quality": "verified",
+            "reviewed_at": (
+                "2026-07-19T01:00:00Z"
+            ),
+            "resolution_summary": (
+                "unit-test resolution"
+            ),
+        },
+        "metadata": {
+            "test_only": True,
+        },
+    }
+
+
+def test_dataset_preserves_historical_event_time():
+    dataset = (
+        RealIncidentDataset.model_validate(
+            dataset_payload()
+        )
+    )
+
+    assert (
+        dataset.event.header.occurred_at.isoformat()
+        == "2026-07-18T06:01:00+00:00"
+    )
+
+    assert (
+        dataset.observations[0]
+        .observed_at.isoformat()
+        == "2026-07-18T05:55:00+00:00"
+    )
+
+
+def test_replay_source_excludes_ground_truth_and_human_timeline():
+    dataset = (
+        RealIncidentDataset.model_validate(
+            dataset_payload()
+        )
+    )
+
+    replay = dataset.to_replay_source()
+
+    serialized = json.dumps(
+        replay.model_dump(
+            mode="json"
+        ),
+        sort_keys=True,
+    )
+
+    assert (
+        GROUND_TRUTH_SECRET
+        not in serialized
+    )
+
+    assert (
+        "ground_truth"
+        not in type(replay).model_fields
+    )
+
+    assert (
+        "timeline"
+        not in type(replay).model_fields
+    )
+
+    assert replay.incident_id == (
+        dataset.incident_id
+    )
+
+    assert replay.event is not (
+        dataset.event
+    )
+
+
+def test_ground_truth_must_reference_known_observations():
+    payload = dataset_payload()
+
+    payload[
+        "ground_truth"
+    ][
+        "evidence_refs"
+    ] = [
+        "missing-observation"
+    ]
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Ground Truth references unknown evidence"
+        ),
+    ):
+        RealIncidentDataset.model_validate(
+            payload
+        )
+
+
+def test_timeline_must_reference_known_observations():
+    payload = dataset_payload()
+
+    payload[
+        "timeline"
+    ][1][
+        "evidence_refs"
+    ] = [
+        "missing-observation"
+    ]
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "timeline references unknown evidence"
+        ),
+    ):
+        RealIncidentDataset.model_validate(
+            payload
+        )
+
+
+def test_duplicate_observation_ids_are_rejected():
+    payload = dataset_payload()
+
+    duplicate = deepcopy(
+        payload[
+            "observations"
+        ][0]
+    )
+
+    payload[
+        "observations"
+    ].append(
+        duplicate
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "observation_id values must be unique"
+        ),
+    ):
+        RealIncidentDataset.model_validate(
+            payload
+        )
+
+
+def test_naive_observation_time_is_rejected():
+    payload = dataset_payload()
+
+    payload[
+        "observations"
+    ][0][
+        "observed_at"
+    ] = (
+        "2026-07-18T05:55:00"
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="timezone-aware",
+    ):
+        RealIncidentDataset.model_validate(
+            payload
+        )
+
+
+def test_timeline_must_be_chronological():
+    payload = dataset_payload()
+
+    payload[
+        "timeline"
+    ] = list(
+        reversed(
+            payload[
+                "timeline"
+            ]
+        )
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="timeline must be chronological",
+    ):
+        RealIncidentDataset.model_validate(
+            payload
+        )
+
+
+def test_loader_reads_valid_json_without_changing_event_time(
+    tmp_path,
+):
+    path = (
+        tmp_path
+        / "incident.json"
+    )
+
+    path.write_text(
+        json.dumps(
+            dataset_payload()
+        ),
+        encoding="utf-8",
+    )
+
+    dataset = (
+        RealIncidentDatasetLoader()
+        .load(
+            path
+        )
+    )
+
+    assert dataset.incident_id == (
+        "incident-unit-test-001"
+    )
+
+    assert (
+        dataset.event.header.occurred_at.isoformat()
+        == "2026-07-18T06:01:00+00:00"
+    )
+
+
+def test_loader_rejects_non_json_file(
+    tmp_path,
+):
+    path = (
+        tmp_path
+        / "incident.yaml"
+    )
+
+    path.write_text(
+        "not: json",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        RealIncidentDatasetLoadError,
+        match="must be JSON",
+    ):
+        RealIncidentDatasetLoader().load(
+            path
+        )
+
+
+def test_directory_loader_rejects_duplicate_incident_ids(
+    tmp_path,
+):
+    for name in (
+        "a.json",
+        "b.json",
+    ):
+        (
+            tmp_path
+            / name
+        ).write_text(
+            json.dumps(
+                dataset_payload()
+            ),
+            encoding="utf-8",
+        )
+
+    with pytest.raises(
+        RealIncidentDatasetLoadError,
+        match="duplicate incident_id",
+    ):
+        (
+            RealIncidentDatasetLoader()
+            .load_directory(
+                tmp_path
+            )
+        )

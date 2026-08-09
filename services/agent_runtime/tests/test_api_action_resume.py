@@ -1,0 +1,564 @@
+from uuid import uuid4
+
+import httpx
+import pytest
+from fastapi import FastAPI
+
+from services.agent_runtime.app.action.models import (
+    ActionPlan,
+    ActionType,
+)
+from services.agent_runtime.app.incident.state import (
+    IncidentState,
+)
+from services.agent_runtime.app.runtime.runtime import (
+    AgentRuntime,
+)
+from services.agent_runtime.app.security.models import (
+    OperatorRole,
+)
+from services.agent_runtime.tests.api_security_support import (
+    ApiTestSecurityHarness,
+    wire_api_test_security,
+)
+
+
+@pytest.fixture
+def api_environment(
+    monkeypatch,
+    tmp_path,
+):
+    """Create an API whose Runtime and SQLite files are test-local."""
+
+    monkeypatch.chdir(
+        tmp_path
+    )
+
+    from services.agent_runtime.app.api import (
+        runtime as api_module,
+    )
+
+    isolated_runtime = AgentRuntime()
+    security = wire_api_test_security(
+        monkeypatch,
+        api_module,
+        isolated_runtime,
+    )
+
+    app = FastAPI()
+    app.include_router(
+        api_module.router
+    )
+
+    return (
+        app,
+        isolated_runtime,
+        security,
+    )
+
+
+def api_client(
+    app: FastAPI,
+) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(
+            app=app
+        ),
+        base_url="http://test",
+    )
+
+
+def approval_headers(
+    security: ApiTestSecurityHarness,
+    approval_id: str,
+) -> dict[str, str]:
+    return security.headers(
+        OperatorRole.APPROVER,
+        include_operator_id=True,
+        idempotency_key=(
+            f"approval-decision:{approval_id}"
+        ),
+    )
+
+
+def execution_headers(
+    security: ApiTestSecurityHarness,
+    *,
+    idempotency_key: str = "action-execution-key-1",
+) -> dict[str, str]:
+    return security.headers(
+        OperatorRole.EXECUTOR,
+        include_operator_id=True,
+        idempotency_key=idempotency_key,
+    )
+
+
+def healing_result() -> dict:
+    return {
+        "agent": "healing",
+        "success": True,
+        "score": 1.0,
+        "message": "increase memory limit",
+        "data": {
+            "action": "increase_memory_limit",
+            "target": "payment-api",
+            "risk": "medium",
+            "reason": "Pod memory limit exceeded",
+            "approval_required": True,
+        },
+    }
+
+
+async def create_pending_action(
+    runtime: AgentRuntime,
+):
+    incident = IncidentState()
+
+    plan, execution = await (
+        runtime.action_runtime.execute(
+            healing_result(),
+            incident=incident,
+            namespace="payment",
+            cluster="production-a",
+        )
+    )
+
+    assert execution["status"] == (
+        "pending_approval"
+    )
+
+    return (
+        incident,
+        plan,
+        execution["approval_id"],
+    )
+
+
+async def approve_action(
+    client: httpx.AsyncClient,
+    security: ApiTestSecurityHarness,
+    approval_id: str,
+):
+    response = await client.post(
+        f"/approvals/{approval_id}/approve",
+        json={
+            "reason": "Execution approved"
+        },
+        headers=approval_headers(
+            security,
+            approval_id
+        ),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["approval"][
+        "status"
+    ] == "approved"
+
+
+def persisted_execution_status(
+    execution: dict,
+) -> str:
+    return (
+        execution.get(
+            "execution_status"
+        )
+        or execution.get(
+            "status"
+        )
+        or ""
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_requires_identity_key_and_known_approval(
+    api_environment,
+):
+    app, runtime, security = api_environment
+    _, _, approval_id = (
+        await create_pending_action(
+            runtime
+        )
+    )
+    path = (
+        f"/approvals/{approval_id}/resume"
+    )
+
+    async with api_client(
+        app
+    ) as client:
+        blank_operator_headers = (
+            execution_headers(
+                security
+            )
+        )
+        blank_operator_headers[
+            "X-Operator-ID"
+        ] = "   "
+        blank_key_headers = execution_headers(
+            security,
+            idempotency_key=(
+                "temporary-valid-key"
+            ),
+        )
+        blank_key_headers[
+            "Idempotency-Key"
+        ] = "   "
+
+        missing_headers = await client.post(
+            path
+        )
+        blank_operator = await client.post(
+            path,
+            headers=blank_operator_headers,
+        )
+        blank_key = await client.post(
+            path,
+            headers=blank_key_headers,
+        )
+        unknown = await client.post(
+            f"/approvals/{uuid4()}/resume",
+            headers=execution_headers(
+                security
+            ),
+        )
+
+    assert missing_headers.status_code == 422
+    assert blank_operator.status_code == 422
+    assert blank_key.status_code == 422
+    assert unknown.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_pending_and_rejected_approvals_cannot_resume(
+    api_environment,
+):
+    app, runtime, security = api_environment
+    _, _, pending_id = (
+        await create_pending_action(
+            runtime
+        )
+    )
+    _, _, rejected_id = (
+        await create_pending_action(
+            runtime
+        )
+    )
+
+    async with api_client(
+        app
+    ) as client:
+        reject_response = await client.post(
+            f"/approvals/{rejected_id}/reject",
+            json={
+                "reason": "Risk is not acceptable"
+            },
+            headers=security.headers(
+                OperatorRole.APPROVER,
+                include_operator_id=True,
+                idempotency_key=(
+                    f"reject:{rejected_id}"
+                ),
+            ),
+        )
+        pending_resume = await client.post(
+            f"/approvals/{pending_id}/resume",
+            headers=execution_headers(
+                security,
+                idempotency_key=(
+                    "pending-execution-key"
+                )
+            ),
+        )
+        rejected_resume = await client.post(
+            f"/approvals/{rejected_id}/resume",
+            headers=execution_headers(
+                security,
+                idempotency_key=(
+                    "rejected-execution-key"
+                )
+            ),
+        )
+
+    assert reject_response.status_code == 200
+    assert pending_resume.status_code == 409
+    assert rejected_resume.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_approved_request_without_incident_link_is_fail_closed(
+    api_environment,
+):
+    app, runtime, security = api_environment
+    approval = await (
+        runtime.approval.create_approval(
+            action=ActionPlan(
+                type=(
+                    ActionType.INCREASE_MEMORY_LIMIT
+                ),
+                target="payment-api",
+                namespace="payment",
+                cluster="production-a",
+            ),
+            reason="Approval without Incident",
+        )
+    )
+
+    async with api_client(
+        app
+    ) as client:
+        await approve_action(
+            client,
+            security,
+            approval.id,
+        )
+        response = await client.post(
+            f"/approvals/{approval.id}/resume",
+            headers=execution_headers(
+                security
+            ),
+        )
+
+    assert response.status_code == 409
+    assert "Incident" in response.json()[
+        "detail"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_successful_resume_and_exact_replay_execute_once(
+    api_environment,
+    monkeypatch,
+):
+    app, runtime, security = api_environment
+    incident, _, approval_id = (
+        await create_pending_action(
+            runtime
+        )
+    )
+
+    original_execute = (
+        runtime.action_runtime.executor.execute
+    )
+    call_count = 0
+
+    async def counting_execute(
+        *args,
+        **kwargs,
+    ):
+        nonlocal call_count
+        call_count += 1
+        return await original_execute(
+            *args,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(
+        runtime.action_runtime.executor,
+        "execute",
+        counting_execute,
+    )
+
+    path = (
+        f"/approvals/{approval_id}/resume"
+    )
+    headers = execution_headers(
+        security
+    )
+
+    async with api_client(
+        app
+    ) as client:
+        await approve_action(
+            client,
+            security,
+            approval_id,
+        )
+        first_response = await client.post(
+            path,
+            headers=headers,
+        )
+        replay_response = await client.post(
+            path,
+            headers=headers,
+        )
+
+    assert first_response.status_code == 200
+    assert replay_response.status_code == 200
+    assert call_count == 1
+
+    first = first_response.json()
+    replay = replay_response.json()
+    first_execution = first["execution"]
+    replay_execution = replay["execution"]
+
+    assert first["success"] is True
+    assert replay["success"] is True
+    assert first_execution["success"] is True
+    assert replay_execution["success"] is True
+    assert persisted_execution_status(
+        first_execution
+    ) == "succeeded"
+    assert persisted_execution_status(
+        replay_execution
+    ) == "succeeded"
+    assert first_execution[
+        "execution_id"
+    ] == replay_execution[
+        "execution_id"
+    ]
+    assert first_execution[
+        "idempotent_replay"
+    ] is False
+    assert replay_execution[
+        "idempotent_replay"
+    ] is True
+    assert first[
+        "manual_reconciliation_required"
+    ] is False
+    assert replay[
+        "manual_reconciliation_required"
+    ] is False
+    assert first["incident"]["id"] == str(
+        incident.id
+    )
+    assert first["incident"][
+        "status"
+    ] == "healing"
+
+
+@pytest.mark.asyncio
+async def test_different_execution_key_returns_conflict(
+    api_environment,
+):
+    app, runtime, security = api_environment
+    _, _, approval_id = (
+        await create_pending_action(
+            runtime
+        )
+    )
+    path = (
+        f"/approvals/{approval_id}/resume"
+    )
+
+    async with api_client(
+        app
+    ) as client:
+        await approve_action(
+            client,
+            security,
+            approval_id,
+        )
+        first_response = await client.post(
+            path,
+            headers=execution_headers(
+                security,
+                idempotency_key="execution-key-a"
+            ),
+        )
+        conflict_response = await client.post(
+            path,
+            headers=execution_headers(
+                security,
+                idempotency_key="execution-key-b"
+            ),
+        )
+
+    assert first_response.status_code == 200
+    assert conflict_response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_indeterminate_execution_returns_503_and_replays_once(
+    api_environment,
+    monkeypatch,
+):
+    app, runtime, security = api_environment
+    incident, _, approval_id = (
+        await create_pending_action(
+            runtime
+        )
+    )
+    call_count = 0
+
+    async def failing_execute(
+        *args,
+        **kwargs,
+    ):
+        nonlocal call_count
+        call_count += 1
+        raise RuntimeError(
+            "Executor outcome is unknown"
+        )
+
+    monkeypatch.setattr(
+        runtime.action_runtime.executor,
+        "execute",
+        failing_execute,
+    )
+
+    path = (
+        f"/approvals/{approval_id}/resume"
+    )
+    headers = execution_headers(
+        security,
+        idempotency_key=(
+            "indeterminate-execution-key"
+        )
+    )
+
+    async with api_client(
+        app
+    ) as client:
+        await approve_action(
+            client,
+            security,
+            approval_id,
+        )
+        first_response = await client.post(
+            path,
+            headers=headers,
+        )
+        replay_response = await client.post(
+            path,
+            headers=headers,
+        )
+
+    assert first_response.status_code == 503
+    assert replay_response.status_code == 503
+    assert call_count == 1
+
+    first = first_response.json()
+    replay = replay_response.json()
+
+    assert first["success"] is False
+    assert replay["success"] is False
+    assert first[
+        "manual_reconciliation_required"
+    ] is True
+    assert replay[
+        "manual_reconciliation_required"
+    ] is True
+    assert persisted_execution_status(
+        first["execution"]
+    ) == "indeterminate"
+    assert persisted_execution_status(
+        replay["execution"]
+    ) == "indeterminate"
+    assert first["execution"][
+        "execution_id"
+    ] == replay["execution"][
+        "execution_id"
+    ]
+    assert first["execution"][
+        "idempotent_replay"
+    ] is False
+    assert replay["execution"][
+        "idempotent_replay"
+    ] is True
+    assert first["incident"]["id"] == str(
+        incident.id
+    )
+    assert first["incident"][
+        "status"
+    ] == "healing"

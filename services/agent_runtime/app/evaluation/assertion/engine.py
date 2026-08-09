@@ -1,3 +1,7 @@
+from collections.abc import Mapping
+from enum import Enum
+from typing import Any
+
 from services.agent_runtime.app.evaluation.assertion.models import (
     AssertionResult,
 )
@@ -184,8 +188,10 @@ class AssertionEngine:
             )
 
 
-            action = healing_data.get(
-                "action"
+            action = self._normalize_action(
+                healing_data.get(
+                    "action"
+                )
             )
 
 
@@ -241,3 +247,84 @@ class AssertionEngine:
             checks=checks,
 
         )
+
+
+    @classmethod
+    def _normalize_action(
+        cls,
+        action: Any,
+    ) -> str | None:
+        """
+        Convert supported action representations to one comparable value.
+
+        Supported inputs:
+        - legacy action strings
+        - ActionType or another string Enum
+        - ActionPlan-like objects exposing .type
+        - nested mappings containing type or action
+
+        Unknown structures remain invalid and therefore fail the assertion.
+        """
+
+        if isinstance(
+            action,
+            Mapping,
+        ):
+            action = action.get(
+                "type",
+                action.get(
+                    "action"
+                ),
+            )
+
+        elif hasattr(
+            action,
+            "type",
+        ):
+            action = getattr(
+                action,
+                "type"
+            )
+
+        if isinstance(
+            action,
+            Mapping,
+        ):
+            return cls._normalize_action(
+                action
+            )
+
+        if isinstance(
+            action,
+            Enum,
+        ):
+            value = action.value
+
+            return (
+                value
+                if isinstance(
+                    value,
+                    str,
+                )
+                else None
+            )
+
+        if isinstance(
+            action,
+            str,
+        ):
+            return action
+
+        value = getattr(
+            action,
+            "value",
+            None,
+        )
+
+        if isinstance(
+            value,
+            str,
+        ):
+            return value
+
+        return None

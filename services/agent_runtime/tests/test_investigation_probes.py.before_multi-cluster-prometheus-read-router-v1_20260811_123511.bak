@@ -1,0 +1,210 @@
+from datetime import UTC, datetime
+from types import SimpleNamespace
+
+import pytest
+
+from services.agent_runtime.app.investigation.models import (
+    InvestigationProbe,
+    InvestigationScope,
+)
+from services.agent_runtime.app.investigation.probes import (
+    ReadOnlyInvestigationProbeExecutor,
+)
+
+
+NOW = datetime(
+    2026,
+    8,
+    9,
+    15,
+    0,
+    tzinfo=UTC,
+)
+
+
+class FakeToolManager:
+    def __init__(self):
+        self.calls = []
+
+    async def call(
+        self,
+        name,
+        context=None,
+        **kwargs,
+    ):
+        self.calls.append(
+            {
+                "name": name,
+                "context": context,
+                "kwargs": kwargs,
+            }
+        )
+
+        if name == "kubernetes":
+            return {
+                "success": True,
+                "source": "kubernetes",
+                "mode": "read_only",
+                "production_signal": True,
+                "observed_at": NOW.isoformat(),
+                "data": {
+                    "uid": "must-not-be-retained",
+                    "resource_version": "secret-version",
+                    "phase": "Running",
+                    "ready": False,
+                    "scheduled": True,
+                    "oom_killed": True,
+                    "containers": [
+                        {
+                            "restart_count": 7,
+                            "state_reason": (
+                                "CrashLoopBackOff"
+                            ),
+                            "last_termination_reason": (
+                                "OOMKilled"
+                            ),
+                        }
+                    ],
+                },
+            }
+
+        return {
+            "success": True,
+            "source": "prometheus",
+            "mode": "read_only",
+            "production_signal": True,
+            "observed_at": NOW.isoformat(),
+            "query": "must-not-be-retained",
+            "data": {
+                "resultType": "vector",
+                "result": [
+                    {
+                        "metric": {
+                            "pod": "payment-api"
+                        },
+                        "value": [
+                            1786300000,
+                            "123.5",
+                        ],
+                    }
+                ],
+            },
+        }
+
+
+def scope() -> InvestigationScope:
+    return InvestigationScope(
+        alert_name="PodOOMKilled",
+        alert_message="Pod restarted",
+        resource='payment"api',
+        namespace="team\\blue",
+        cluster="prod\nwest",
+    )
+
+
+@pytest.mark.asyncio
+async def test_kubernetes_probe_has_fixed_read_only_call():
+    tools = FakeToolManager()
+    context = SimpleNamespace(
+        tools=tools
+    )
+    executor = ReadOnlyInvestigationProbeExecutor()
+
+    evidence = await executor.collect(
+        context,
+        scope(),
+        InvestigationProbe.KUBERNETES_POD_STATE,
+    )
+
+    assert tools.calls == [
+        {
+            "name": "kubernetes",
+            "context": context,
+            "kwargs": {
+                "action": "describe",
+                "resource": "pod",
+                "target": 'payment"api',
+                "namespace": "team\\blue",
+                "cluster": "prod\nwest",
+            },
+        }
+    ]
+    assert evidence.trusted is True
+    assert evidence.facts["oom_killed"] is True
+    assert evidence.facts["max_restart_count"] == 7
+
+    payload = evidence.model_dump(
+        mode="json"
+    )
+    serialized = str(payload)
+
+    assert "must-not-be-retained" not in serialized
+    assert "secret-version" not in serialized
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("probe", "metric"),
+    [
+        (
+            InvestigationProbe.PROMETHEUS_MEMORY_WORKING_SET,
+            "container_memory_working_set_bytes",
+        ),
+        (
+            InvestigationProbe.PROMETHEUS_MEMORY_LIMIT,
+            "kube_pod_container_resource_limits",
+        ),
+        (
+            InvestigationProbe.PROMETHEUS_RESTART_COUNT,
+            "kube_pod_container_status_restarts_total",
+        ),
+    ],
+)
+async def test_prometheus_probe_uses_bounded_template(
+    probe,
+    metric,
+):
+    tools = FakeToolManager()
+    context = SimpleNamespace(
+        tools=tools
+    )
+    executor = ReadOnlyInvestigationProbeExecutor()
+
+    evidence = await executor.collect(
+        context,
+        scope(),
+        probe,
+    )
+
+    assert len(tools.calls) == 1
+    call = tools.calls[0]
+    assert call["name"] == "prometheus"
+    assert set(call["kwargs"]) == {"query"}
+
+    query = call["kwargs"]["query"]
+    assert metric in query
+    assert 'pod="payment\\"api"' in query
+    assert 'namespace="team\\\\blue"' in query
+    assert 'cluster="prod\\nwest"' in query
+    assert "\n" not in query
+
+    assert evidence.source == "prometheus"
+    assert evidence.facts["sample_count"] == 1
+    assert evidence.facts["value_sum"] == 123.5
+    assert "query" not in evidence.model_dump()
+
+
+@pytest.mark.asyncio
+async def test_probe_requires_tool_manager():
+    executor = ReadOnlyInvestigationProbeExecutor()
+
+    with pytest.raises(
+        RuntimeError,
+        match="tools are unavailable",
+    ):
+        await executor.collect(
+            SimpleNamespace(tools=None),
+            scope(),
+            InvestigationProbe.KUBERNETES_POD_STATE,
+        )
+

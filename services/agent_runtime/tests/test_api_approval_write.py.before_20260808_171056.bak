@@ -1,0 +1,459 @@
+import asyncio
+from uuid import uuid4
+
+import httpx
+import pytest
+from fastapi import FastAPI
+
+from services.agent_runtime.app.action.models import (
+    ActionPlan,
+    ActionType,
+)
+from services.agent_runtime.app.approval.models import (
+    ApprovalStatus,
+)
+from services.agent_runtime.app.incident.enums import (
+    IncidentStatus,
+)
+from services.agent_runtime.app.incident.state import (
+    IncidentState,
+)
+from services.agent_runtime.app.runtime.runtime import (
+    AgentRuntime,
+)
+
+
+@pytest.fixture
+def api_environment(
+    monkeypatch,
+    tmp_path,
+):
+    """Create an API whose Runtime and SQLite files are test-local."""
+
+    monkeypatch.chdir(
+        tmp_path
+    )
+
+    from services.agent_runtime.app.api import (
+        runtime as api_module,
+    )
+
+    isolated_runtime = AgentRuntime()
+    monkeypatch.setattr(
+        api_module,
+        "runtime",
+        isolated_runtime,
+    )
+
+    app = FastAPI()
+    app.include_router(
+        api_module.router
+    )
+
+    return app, isolated_runtime
+
+
+def api_client(
+    app: FastAPI,
+) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(
+            app=app
+        ),
+        base_url="http://test",
+    )
+
+
+def decision_headers(
+    *,
+    operator_id: str = "sre-user-1",
+    idempotency_key: str = "decision-key-1",
+) -> dict[str, str]:
+    return {
+        "X-Operator-ID": operator_id,
+        "Idempotency-Key": idempotency_key,
+    }
+
+
+def decision_body() -> dict:
+    return {
+        "reason": "Validated remediation plan",
+        "metadata": {
+            "source": "untrusted-client-value",
+            "ticket": "INC-1001",
+        },
+    }
+
+
+def create_plan() -> ActionPlan:
+    return ActionPlan(
+        type=ActionType.INCREASE_MEMORY_LIMIT,
+        target="payment-api",
+        namespace="payment",
+        cluster="production-a",
+    )
+
+
+async def create_pending_approval(
+    runtime: AgentRuntime,
+):
+    return await runtime.approval.create_approval(
+        action=create_plan(),
+        reason="Medium risk action requires approval",
+    )
+
+
+def healing_result() -> dict:
+    return {
+        "agent": "healing",
+        "success": True,
+        "score": 1.0,
+        "message": "increase memory limit",
+        "data": {
+            "action": "increase_memory_limit",
+            "target": "payment-api",
+            "risk": "medium",
+            "reason": "Pod memory limit exceeded",
+            "approval_required": True,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_approval_write_requires_headers_body_and_nonblank_identity(
+    api_environment,
+):
+    app, runtime = api_environment
+    approval = await create_pending_approval(
+        runtime
+    )
+    path = (
+        f"/approvals/{approval.id}/approve"
+    )
+
+    async with api_client(
+        app
+    ) as client:
+        missing_headers = await client.post(
+            path,
+            json={},
+        )
+        missing_body = await client.post(
+            path,
+            headers=decision_headers(),
+        )
+        blank_operator = await client.post(
+            path,
+            json={},
+            headers=decision_headers(
+                operator_id="   "
+            ),
+        )
+        unexpected_body_field = await client.post(
+            path,
+            json={
+                "unexpected": True
+            },
+            headers=decision_headers(),
+        )
+
+    assert missing_headers.status_code == 422
+    assert missing_body.status_code == 422
+    assert blank_operator.status_code == 422
+    assert unexpected_body_field.status_code == 422
+
+    stored = await runtime.approval.get(
+        approval.id
+    )
+
+    assert stored is not None
+    assert stored.status == (
+        ApprovalStatus.PENDING
+    )
+    assert stored.decision is None
+
+
+@pytest.mark.asyncio
+async def test_unknown_approval_returns_404(
+    api_environment,
+):
+    app, _ = api_environment
+    unknown_id = str(
+        uuid4()
+    )
+
+    async with api_client(
+        app
+    ) as client:
+        response = await client.post(
+            f"/approvals/{unknown_id}/approve",
+            json={},
+            headers=decision_headers(),
+        )
+
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_approve_and_exact_replay_return_same_persisted_decision(
+    api_environment,
+):
+    app, runtime = api_environment
+    approval = await create_pending_approval(
+        runtime
+    )
+    path = (
+        f"/approvals/{approval.id}/approve"
+    )
+
+    async with api_client(
+        app
+    ) as client:
+        first_response = await client.post(
+            path,
+            json=decision_body(),
+            headers=decision_headers(),
+        )
+        replay_response = await client.post(
+            path,
+            json=decision_body(),
+            headers=decision_headers(),
+        )
+        read_response = await client.get(
+            f"/approvals/{approval.id}"
+        )
+
+    assert first_response.status_code == 200
+    assert replay_response.status_code == 200
+    assert read_response.status_code == 200
+
+    first = first_response.json()[
+        "approval"
+    ]
+    replay = replay_response.json()[
+        "approval"
+    ]
+    stored = read_response.json()[
+        "approval"
+    ]
+
+    assert first["status"] == "approved"
+    assert first["action"]["approved"] is True
+    assert first["decision"][
+        "operator_id"
+    ] == "sre-user-1"
+    assert first["decision"][
+        "idempotency_key"
+    ] == "decision-key-1"
+    assert first["decision"]["metadata"][
+        "source"
+    ] == "api"
+    assert first["decision"]["metadata"][
+        "ticket"
+    ] == "INC-1001"
+
+    assert replay["decision"] == (
+        first["decision"]
+    )
+    assert replay["updated_at"] == (
+        first["updated_at"]
+    )
+    assert stored == replay
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "operation,headers,body",
+    [
+        (
+            "approve",
+            decision_headers(
+                idempotency_key="different-key"
+            ),
+            decision_body(),
+        ),
+        (
+            "approve",
+            decision_headers(
+                operator_id="sre-user-2"
+            ),
+            decision_body(),
+        ),
+        (
+            "approve",
+            decision_headers(),
+            {
+                "reason": "Changed reason",
+                "metadata": {
+                    "source": (
+                        "untrusted-client-value"
+                    ),
+                    "ticket": "INC-1001",
+                },
+            },
+        ),
+        (
+            "reject",
+            decision_headers(
+                idempotency_key="reject-key"
+            ),
+            {
+                "reason": "Reject remediation"
+            },
+        ),
+    ],
+)
+async def test_conflicting_terminal_decision_returns_409(
+    api_environment,
+    operation,
+    headers,
+    body,
+):
+    app, runtime = api_environment
+    approval = await create_pending_approval(
+        runtime
+    )
+
+    async with api_client(
+        app
+    ) as client:
+        first_response = await client.post(
+            f"/approvals/{approval.id}/approve",
+            json=decision_body(),
+            headers=decision_headers(),
+        )
+        conflict_response = await client.post(
+            f"/approvals/{approval.id}/{operation}",
+            json=body,
+            headers=headers,
+        )
+
+    assert first_response.status_code == 200
+    assert conflict_response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_concurrent_opposite_api_decisions_have_one_winner(
+    api_environment,
+):
+    app, runtime = api_environment
+    approval = await create_pending_approval(
+        runtime
+    )
+
+    async with api_client(
+        app
+    ) as client:
+        approve_request = client.post(
+            f"/approvals/{approval.id}/approve",
+            json={
+                "reason": "Approve remediation"
+            },
+            headers=decision_headers(
+                operator_id="sre-approver",
+                idempotency_key="approve-key",
+            ),
+        )
+        reject_request = client.post(
+            f"/approvals/{approval.id}/reject",
+            json={
+                "reason": "Reject remediation"
+            },
+            headers=decision_headers(
+                operator_id="sre-reviewer",
+                idempotency_key="reject-key",
+            ),
+        )
+
+        responses = await asyncio.gather(
+            approve_request,
+            reject_request,
+        )
+
+    assert sorted(
+        response.status_code
+        for response in responses
+    ) == [
+        200,
+        409,
+    ]
+
+    stored = await runtime.approval.get(
+        approval.id
+    )
+
+    assert stored is not None
+    assert stored.decision is not None
+    assert stored.status == (
+        stored.decision.status
+    )
+    assert stored.action.approved is (
+        stored.status
+        == ApprovalStatus.APPROVED
+    )
+
+
+@pytest.mark.asyncio
+async def test_rejected_api_approval_cannot_resume_action(
+    api_environment,
+):
+    app, runtime = api_environment
+    incident = IncidentState()
+
+    _, pending = await (
+        runtime.action_runtime.execute(
+            healing_result(),
+            incident=incident,
+            namespace="payment",
+            cluster="production-a",
+        )
+    )
+
+    approval_id = pending[
+        "approval_id"
+    ]
+
+    async with api_client(
+        app
+    ) as client:
+        response = await client.post(
+            f"/approvals/{approval_id}/reject",
+            json={
+                "reason": "Risk is not acceptable"
+            },
+            headers=decision_headers(
+                idempotency_key="reject-action-key"
+            ),
+        )
+
+    assert response.status_code == 200
+    assert response.json()["approval"][
+        "status"
+    ] == "rejected"
+
+    execution = await (
+        runtime.action_runtime.resume(
+            approval_id
+        )
+    )
+
+    assert execution["success"] is False
+    assert execution["status"] == (
+        "approval_not_approved"
+    )
+    assert execution["current_status"] == (
+        "rejected"
+    )
+
+    stored_incident = await (
+        runtime.incident_store.get(
+            str(
+                incident.id
+            )
+        )
+    )
+
+    assert stored_incident is not None
+    assert stored_incident.status == (
+        IncidentStatus.CONFIRMED
+    )

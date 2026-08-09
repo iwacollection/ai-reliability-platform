@@ -1,15 +1,15 @@
 from enum import Enum
 
-
 from pydantic import (
     BaseModel,
-    ConfigDict,
     Field,
 )
 
 
-
 class ActionType(str, Enum):
+    """
+    Supported remediation action types.
+    """
 
     NONE = "none"
 
@@ -32,8 +32,10 @@ class ActionType(str, Enum):
     )
 
 
-
 class ActionRisk(str, Enum):
+    """
+    Remediation action risk level.
+    """
 
     LOW = "low"
 
@@ -42,28 +44,44 @@ class ActionRisk(str, Enum):
     HIGH = "high"
 
 
-
-
 class ActionPlan(BaseModel):
+    """
+    Executable remediation action plan.
 
+    namespace and cluster are first-class persisted fields instead of
+    free-form metadata. ApprovalStore serializes the complete ActionPlan, so
+    an approved action can recover its original resource scope after a
+    process restart.
 
-    model_config = ConfigDict(
-        use_enum_values=True
-    )
+    Both fields remain optional during the staged migration so legacy
+    approval records and actions outside Kubernetes can still be loaded.
+    Kubernetes execution and verification must validate the required scope
+    before using the plan; a missing namespace must not silently select the
+    default namespace.
 
+    Enum fields remain Enum objects inside Python so callers can safely use
+    comparisons such as:
 
+        action.type == ActionType.RESTART_POD
+
+    and access serialized values through:
+
+        action.type.value
+    """
 
     type: ActionType
 
-
     target: str
 
+    namespace: str | None = None
 
-    risk: ActionRisk
+    cluster: str | None = None
 
+    risk: ActionRisk = (
+        ActionRisk.MEDIUM
+    )
 
     approved: bool = False
-
 
     metadata: dict = Field(
         default_factory=dict

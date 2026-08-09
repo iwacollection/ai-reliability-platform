@@ -1,0 +1,180 @@
+import pytest
+
+from services.agent_runtime.app.investigation.llm_adapter import (
+    MAX_INVESTIGATION_PROMPT_CHARS,
+    MAX_INVESTIGATION_RESPONSE_CHARS,
+    InvestigationLLMGatewayAdapter,
+    InvestigationLLMPolicyError,
+    InvestigationLLMUnavailableError,
+)
+from services.agent_runtime.app.llm.gateway.models import (
+    LLMGatewayRequest,
+    LLMGatewayResponse,
+    LLMInvocationContext,
+    LLMPriority,
+    LLMTaskType,
+)
+
+
+class RecordingGateway:
+    def __init__(
+        self,
+        response=None,
+        error=None,
+    ):
+        self.response = response or LLMGatewayResponse(
+            content='{"stop": true}',
+            provider="mock",
+            model="mock-model",
+        )
+        self.error = error
+        self.requests = []
+
+    async def chat(self, request):
+        self.requests.append(request)
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+
+def request(
+    *,
+    agent="investigation",
+    task=LLMTaskType.ANALYSIS,
+    priority=LLMPriority.HIGH,
+    require_json=True,
+    preferred_provider=None,
+    preferred_model=None,
+    temperature=0.0,
+    prompt="bounded investigation state",
+):
+    return LLMGatewayRequest(
+        prompt=prompt,
+        system_prompt=(
+            "Bounded read-only SRE reasoner"
+        ),
+        context=LLMInvocationContext(
+            agent=agent,
+            task=task,
+            priority=priority,
+            require_json=require_json,
+            preferred_provider=preferred_provider,
+            preferred_model=preferred_model,
+        ),
+        temperature=temperature,
+    )
+
+
+@pytest.mark.asyncio
+async def test_adapter_delegates_one_bounded_request():
+    gateway = RecordingGateway()
+    adapter = InvestigationLLMGatewayAdapter(
+        gateway
+    )
+
+    response = await adapter.chat(
+        request()
+    )
+
+    assert response is gateway.response
+    assert len(gateway.requests) == 1
+    assert gateway.requests[0].context.agent == (
+        "investigation"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_request",
+    [
+        request(agent="healing"),
+        request(task=LLMTaskType.REMEDIATION),
+        request(priority=LLMPriority.NORMAL),
+        request(require_json=False),
+        request(preferred_provider="other"),
+        request(preferred_model="untrusted-model"),
+        request(temperature=0.1),
+        request(
+            prompt="x"
+            * (MAX_INVESTIGATION_PROMPT_CHARS + 1)
+        ),
+    ],
+)
+async def test_adapter_rejects_policy_violation_before_gateway(
+    invalid_request,
+):
+    gateway = RecordingGateway()
+    adapter = InvestigationLLMGatewayAdapter(
+        gateway
+    )
+
+    with pytest.raises(
+        InvestigationLLMPolicyError,
+    ):
+        await adapter.chat(
+            invalid_request
+        )
+
+    assert gateway.requests == []
+
+
+@pytest.mark.asyncio
+async def test_adapter_sanitizes_gateway_failure():
+    secret = "provider-secret-diagnostic"
+    gateway = RecordingGateway(
+        error=RuntimeError(secret)
+    )
+    adapter = InvestigationLLMGatewayAdapter(
+        gateway
+    )
+
+    with pytest.raises(
+        InvestigationLLMUnavailableError,
+    ) as captured:
+        await adapter.chat(
+            request()
+        )
+
+    assert secret not in str(
+        captured.value
+    )
+    assert captured.value.__cause__ is None
+
+
+@pytest.mark.asyncio
+async def test_adapter_rejects_invalid_or_oversized_response():
+    invalid_adapter = InvestigationLLMGatewayAdapter(
+        RecordingGateway(
+            response=object()
+        )
+    )
+
+    with pytest.raises(
+        InvestigationLLMUnavailableError,
+    ):
+        await invalid_adapter.chat(
+            request()
+        )
+
+    oversized_adapter = InvestigationLLMGatewayAdapter(
+        RecordingGateway(
+            response=LLMGatewayResponse(
+                content=(
+                    "x"
+                    * (
+                        MAX_INVESTIGATION_RESPONSE_CHARS
+                        + 1
+                    )
+                ),
+                provider="mock",
+                model="mock-model",
+            )
+        )
+    )
+
+    with pytest.raises(
+        InvestigationLLMUnavailableError,
+    ):
+        await oversized_adapter.chat(
+            request()
+        )

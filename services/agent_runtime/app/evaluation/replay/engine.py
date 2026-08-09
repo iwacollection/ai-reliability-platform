@@ -1,13 +1,11 @@
 from datetime import UTC, datetime
 
-
 from common.domain.event import (
     Header,
     Resource,
     Signal,
     StandardEvent,
 )
-
 
 from common.domain.event.enums import (
     EventSource,
@@ -16,201 +14,166 @@ from common.domain.event.enums import (
     SignalType,
 )
 
+from services.agent_runtime.app.evaluation.scenario.models import (
+    ScenarioDefinition,
+)
 
 from services.agent_runtime.app.model.context import (
     AgentContext,
 )
-
 
 from services.agent_runtime.app.runtime.runtime import (
     AgentRuntime,
 )
 
 
-from services.agent_runtime.app.runtime.action_runtime import (
-    ActionRuntime,
-)
-
-
-from services.agent_runtime.app.evaluation.scenario.models import (
-    ScenarioDefinition,
-)
-
-
-
 class ScenarioReplayEngine:
     """
-    Replay scenario through Agent Runtime.
+    Replay scenarios through Agent Runtime.
 
     Used for:
     - Harness engineering
     - Regression testing
     - Agent evaluation
+    - Action and Incident lifecycle validation
     """
-
-
 
     def __init__(
         self,
         runtime: AgentRuntime,
-    ):
-
+    ) -> None:
         self.runtime = runtime
-
-
 
     def build_event(
         self,
         scenario: ScenarioDefinition,
     ) -> StandardEvent:
         """
-        Convert scenario definition
-        into runtime event.
+        Convert a ScenarioDefinition into a runtime event.
         """
 
-
         return StandardEvent(
-
             header=Header(
-
-                source=EventSource.ALERTMANAGER,
-
+                source=(
+                    EventSource.ALERTMANAGER
+                ),
                 occurred_at=datetime.now(
                     UTC
                 ),
-
             ),
-
-
             signal=Signal(
-
                 type=SignalType.ALERT,
-
                 name=scenario.event.get(
                     "alertname",
                     "Unknown",
                 ),
-
-
                 severity=Severity(
                     scenario.event.get(
                         "severity",
                         "info",
                     )
                 ),
-
-
                 message=scenario.description,
-
             ),
-
-
             resources=[
-
                 Resource(
-
                     kind=ResourceKind.POD,
-
                     name=scenario.event.get(
                         "resource",
                         "unknown",
                     ),
-
+                    namespace=(
+                        scenario.event.get(
+                            "namespace"
+                        )
+                    ),
+                    cluster=(
+                        scenario.event.get(
+                            "cluster"
+                        )
+                    ),
                 )
-
             ],
-
         )
-
-
 
     async def replay(
         self,
         scenario: ScenarioDefinition,
     ):
-
-
         event = self.build_event(
             scenario
         )
 
-
-
         context = AgentContext(
-
             event=event,
-
             memory=self.runtime.memory,
-
             tools=self.runtime.tools,
-
             skills=self.runtime.skills,
-
         )
 
-
-
-        results = await self.runtime.pipeline.execute(
-            context
+        results = (
+            await self.runtime.execute(
+                context
+            )
         )
-
-
 
         action_result = None
 
-
-
         #
-        # Execute healing workflow
+        # Execute Healing workflow with the shared
+        # ActionRuntime and IncidentStore.
         #
-
-        healing_result = context.results.get(
-            "healing"
+        healing_result = (
+            context.results.get(
+                "healing"
+            )
         )
 
-
-
         if healing_result:
-
-
-            action_runtime = ActionRuntime()
-
-
-
-            plan, execution = await action_runtime.execute(
-                healing_result
+            # The scenario event is the trusted replay input. Resource scope
+            # is never taken from the HealingAgent result.
+            plan, execution = (
+                await self.runtime.action_runtime.execute(
+                    healing_result,
+                    incident=context.incident,
+                    namespace=(
+                        event.resources[0].namespace
+                        if event.resources
+                        else None
+                    ),
+                    cluster=(
+                        event.resources[0].cluster
+                        if event.resources
+                        else None
+                    ),
+                )
             )
 
-
-
             action_result = {
-
                 "plan":
-                plan.model_dump(),
-
+                plan.model_dump(
+                    mode="json"
+                ),
 
                 "execution":
                 execution,
 
+                "incident":
+                context.incident.model_dump(
+                    mode="json"
+                ),
             }
 
-
-
         return {
-
             "scenario":
             scenario.name,
-
 
             "results":
             results,
 
-
             "context":
             context,
 
-
             "action":
             action_result,
-
         }

@@ -1,0 +1,1186 @@
+from copy import deepcopy
+
+from services.agent_runtime.app.registry.factory import (
+    create_agent_registry,
+)
+from services.agent_runtime.app.llm.gateway.factory import (
+    create_llm_gateway,
+)
+from services.agent_runtime.app.llm.gateway.gateway import (
+    LLMGateway,
+)
+from services.agent_runtime.app.planner.agent_planner import (
+    AgentPlanner,
+)
+from services.agent_runtime.app.pipeline.planner_pipeline import (
+    PlannerPipeline,
+)
+from services.agent_runtime.app.memory.store import (
+    MemoryStore,
+)
+from services.agent_runtime.app.tools.factory import (
+    create_tool_manager,
+)
+from services.agent_runtime.app.tools.kubernetes.router import (
+    KubernetesClusterRegistry,
+)
+from services.agent_runtime.app.skills.factory import (
+    create_skill_registry,
+)
+from services.agent_runtime.app.mcp.factory import (
+    create_mcp_registry,
+)
+from services.agent_runtime.app.observability.collector import (
+    TraceCollector,
+)
+from services.agent_runtime.app.evaluation.factory import (
+    create_evaluation_registry,
+)
+from services.agent_runtime.app.policy.factory import (
+    create_policy_engine,
+)
+from services.agent_runtime.app.approval.service import (
+    ApprovalService,
+)
+from services.agent_runtime.app.incident.store import (
+    IncidentStore,
+)
+from services.agent_runtime.app.incident.service import (
+    IncidentService,
+)
+from services.agent_runtime.app.investigation.comparison import (
+    build_rca_investigation_comparison,
+)
+from services.agent_runtime.app.investigation.factory import (
+    create_investigation_coordinator,
+)
+from services.agent_runtime.app.investigation.llm_gateway_adapter import (
+    InvestigationLLMGatewayAdapter,
+)
+from services.agent_runtime.app.investigation.reasoner import (
+    BaseInvestigationReasoner,
+    LLMInvestigationReasoner,
+)
+from services.agent_runtime.app.investigation.settings import (
+    InvestigationSettings,
+)
+from services.agent_runtime.app.investigation.models import (
+    InvestigationState,
+)
+from services.agent_runtime.app.model.context import (
+    AgentContext,
+)
+from services.agent_runtime.app.workflow.service import (
+    WorkflowService,
+)
+from services.agent_runtime.app.action.execution_service import (
+    ActionExecutionService,
+)
+from services.agent_runtime.app.action.execution_store import (
+    ActionExecutionStore,
+)
+from services.agent_runtime.app.action.kubernetes_preflight import (
+    KubernetesPreflightResolver,
+)
+from services.agent_runtime.app.action.kubernetes_preflight_factory import (
+    create_kubernetes_preflight_resolver,
+)
+from services.agent_runtime.app.action.kubernetes_production_executor import (
+    KubernetesProductionExecutor,
+)
+from services.agent_runtime.app.action.kubernetes_production_factory import (
+    create_kubernetes_production_executor,
+)
+from services.agent_runtime.app.action.preflight_artifact_service import (
+    PreflightArtifactService,
+)
+from services.agent_runtime.app.action.preflight_artifact_store import (
+    PreflightArtifactStore,
+)
+from services.agent_runtime.app.action.production_action_preparation import (
+    ProductionActionPreparationService,
+)
+from services.agent_runtime.app.action.production_action_query import (
+    ProductionActionQueryService,
+)
+from services.agent_runtime.app.action.production_action_guard import (
+    ProductionActionExpiryGuard,
+)
+from services.agent_runtime.app.action.production_pilot import (
+    KubernetesProductionPilotControl,
+    ProductionPilotReadinessService,
+)
+from services.agent_runtime.app.action.production_pilot_factory import (
+    create_kubernetes_production_pilot_control,
+)
+from services.agent_runtime.app.action.production_pilot_budget_service import (
+    ProductionPilotBudgetService,
+)
+from services.agent_runtime.app.action.production_pilot_budget_store import (
+    ProductionPilotBudgetStore,
+)
+from services.agent_runtime.app.action.production_pilot_rehearsal import (
+    ProductionPilotRehearsalService,
+)
+from services.agent_runtime.app.action.production_pilot_crash_rehearsal import (
+    ProductionPilotCrashRecoveryRehearsalService,
+)
+from services.agent_runtime.app.action.production_pilot_pre_enable_evidence import (
+    ProductionPilotPreEnableEvidenceService,
+)
+from services.agent_runtime.app.action.production_pilot_final_handoff import (
+    ProductionPilotFinalHandoffRehearsalService,
+)
+from services.agent_runtime.app.action.production_pilot_live_probe import (
+    ProductionPilotLiveReadinessProbe,
+    create_production_pilot_live_readiness_probe,
+)
+from services.agent_runtime.app.action.production_pilot_go_no_go_service import (
+    ProductionPilotGoNoGoService,
+)
+from services.agent_runtime.app.action.production_pilot_go_no_go_store import (
+    ProductionPilotGoNoGoStore,
+)
+from services.agent_runtime.app.action.production_pilot_ceremony_service import (
+    ProductionPilotCeremonyService,
+)
+from services.agent_runtime.app.action.production_pilot_ceremony_store import (
+    ProductionPilotCeremonyStore,
+)
+from services.agent_runtime.app.verification.collector import (
+    VerificationEvidenceCollector,
+)
+from services.agent_runtime.app.verification.coordinator import (
+    VerificationCoordinator,
+)
+from services.agent_runtime.app.verification.profiles import (
+    VerificationProfileFactory,
+)
+from services.agent_runtime.app.verification.service import (
+    VerificationService,
+)
+from services.agent_runtime.app.verification.store import (
+    VerificationStore,
+)
+from services.agent_runtime.app.runtime.action_runtime import (
+    ActionRuntime,
+)
+from services.agent_runtime.app.runtime.verification_runtime import (
+    VerificationRuntime,
+)
+from services.agent_runtime.app.security.factory import (
+    create_authentication_service,
+)
+from services.agent_runtime.app.security.policy import (
+    SecurityPolicyEngine,
+)
+from services.agent_runtime.app.security.service import (
+    AuthenticationService,
+)
+from services.sandbox.executor.local import (
+    LocalSandboxExecutor,
+)
+from services.sandbox.policy.validator import (
+    SandboxPolicyValidator,
+)
+
+
+from services.agent_runtime.app.incident_evidence.recorder import (
+    ProductionIncidentEvidenceRecorder,
+)
+from services.agent_runtime.app.incident_evidence.settings import (
+    IncidentEvidenceRecorderSettings,
+)
+
+class AgentRuntime:
+    """
+    Runtime container.
+
+    Owns and shares security and runtime infrastructure
+    across Pipeline, Action and Verification.
+
+    security_policy is the RBAC authorization policy. The existing policy
+    attribute remains the remediation business policy engine.
+    """
+
+    def __init__(
+        self,
+        authentication_service: (
+            AuthenticationService | None
+        ) = None,
+        security_policy: (
+            SecurityPolicyEngine | None
+        ) = None,
+        kubernetes_preflight: (
+            KubernetesPreflightResolver | None
+        ) = None,
+        kubernetes_production_executor: (
+            KubernetesProductionExecutor | None
+        ) = None,
+        production_pilot_control: (
+            KubernetesProductionPilotControl | None
+        ) = None,
+        production_pilot_budget_service: (
+            ProductionPilotBudgetService | None
+        ) = None,
+        production_pilot_live_probe: (
+            ProductionPilotLiveReadinessProbe | None
+        ) = None,
+        kubernetes_cluster_registry: (
+            KubernetesClusterRegistry | None
+        ) = None,
+        llm_gateway: (
+            LLMGateway | None
+        ) = None,
+        investigation_reasoner: (
+            BaseInvestigationReasoner | None
+        ) = None,
+        investigation_settings: (
+            InvestigationSettings | None
+        ) = None,
+    ) -> None:
+        # Validate every injected security component before factories, stores
+        # or other runtime components can produce side effects.
+        if (
+            authentication_service is not None
+            and not isinstance(
+                authentication_service,
+                AuthenticationService,
+            )
+        ):
+            raise TypeError(
+                "AgentRuntime authentication service is invalid"
+            )
+
+        if (
+            security_policy is not None
+            and not isinstance(
+                security_policy,
+                SecurityPolicyEngine,
+            )
+        ):
+            raise TypeError(
+                "AgentRuntime security policy is invalid"
+            )
+
+        if (
+            kubernetes_preflight is not None
+            and not isinstance(
+                kubernetes_preflight,
+                KubernetesPreflightResolver,
+            )
+        ):
+            raise TypeError(
+                "AgentRuntime Kubernetes preflight resolver is invalid"
+            )
+
+        if (
+            kubernetes_production_executor is not None
+            and not isinstance(
+                kubernetes_production_executor,
+                KubernetesProductionExecutor,
+            )
+        ):
+            raise TypeError(
+                "AgentRuntime Kubernetes production executor is invalid"
+            )
+
+        if (
+            production_pilot_control is not None
+            and not isinstance(
+                production_pilot_control,
+                KubernetesProductionPilotControl,
+            )
+        ):
+            raise TypeError(
+                "AgentRuntime Kubernetes production pilot control is invalid"
+            )
+
+        if (
+            production_pilot_budget_service is not None
+            and not isinstance(
+                production_pilot_budget_service,
+                ProductionPilotBudgetService,
+            )
+        ):
+            raise TypeError(
+                "AgentRuntime Kubernetes production pilot budget service is invalid"
+            )
+
+        if (
+            production_pilot_live_probe is not None
+            and not isinstance(
+                production_pilot_live_probe,
+                ProductionPilotLiveReadinessProbe,
+            )
+        ):
+            raise TypeError(
+                "AgentRuntime Production Pilot live probe is invalid"
+            )
+
+        if (
+            kubernetes_cluster_registry is not None
+            and not isinstance(
+                kubernetes_cluster_registry,
+                KubernetesClusterRegistry,
+            )
+        ):
+            raise TypeError(
+                "AgentRuntime Kubernetes cluster registry is invalid"
+            )
+
+        if (
+            llm_gateway is not None
+            and not isinstance(
+                llm_gateway,
+                LLMGateway,
+            )
+        ):
+            raise TypeError(
+                "AgentRuntime shared LLM gateway is invalid"
+            )
+
+        if (
+            investigation_reasoner is not None
+            and not isinstance(
+                investigation_reasoner,
+                BaseInvestigationReasoner,
+            )
+        ):
+            raise TypeError(
+                "AgentRuntime Investigation reasoner is invalid"
+            )
+
+        if (
+            investigation_settings is not None
+            and not isinstance(
+                investigation_settings,
+                InvestigationSettings,
+            )
+        ):
+            raise TypeError(
+                "AgentRuntime Investigation settings are invalid"
+            )
+
+        # Resolve disabled-default Investigation configuration before any
+        # Runtime store, tool, credential, network or LLM component is created.
+        self.investigation_settings = (
+            investigation_settings
+            if investigation_settings is not None
+            else InvestigationSettings.from_environment()
+        )
+
+        investigation_shared_gateway = None
+
+        # An enabled LLM-backed Investigation must use the exact shared
+        # LLMGateway instance that AgentRuntime will provide to its Agents.
+        #
+        # Disabled Investigation deliberately does not inspect or touch the
+        # supplied reasoner's LLM adapter.
+        if (
+            self.investigation_settings.enabled
+            and isinstance(
+                investigation_reasoner,
+                LLMInvestigationReasoner,
+            )
+        ):
+            investigation_llm = (
+                investigation_reasoner.investigation_llm
+            )
+
+            if not isinstance(
+                investigation_llm,
+                InvestigationLLMGatewayAdapter,
+            ):
+                raise TypeError(
+                    "AgentRuntime LLM Investigation requires "
+                    "InvestigationLLMGatewayAdapter"
+                )
+
+            investigation_shared_gateway = (
+                investigation_llm.llm_gateway
+            )
+
+            if not isinstance(
+                investigation_shared_gateway,
+                LLMGateway,
+            ):
+                raise TypeError(
+                    "AgentRuntime Investigation shared LLM gateway is invalid"
+                )
+
+            if (
+                llm_gateway is not None
+                and investigation_shared_gateway
+                is not llm_gateway
+            ):
+                raise TypeError(
+                    "AgentRuntime Investigation LLM gateway must be shared"
+                )
+
+        # Preserve the existing fail-closed Investigation assembly boundary.
+        # Enabled mode without an explicit reasoner still fails here before
+        # any Runtime or LLM infrastructure is constructed.
+        self.investigation_coordinator = (
+            create_investigation_coordinator(
+                reasoner=investigation_reasoner,
+                settings=self.investigation_settings,
+            )
+        )
+
+        # Do not construct a default Gateway yet. Keeping this unresolved
+        # preserves the previous initialization order. If Investigation
+        # already carries the approved Gateway Adapter, Runtime adopts that
+        # exact Gateway object as its shared instance.
+        self.llm_gateway = (
+            llm_gateway
+            if llm_gateway is not None
+            else investigation_shared_gateway
+        )
+
+        self.authentication = (
+            authentication_service
+            if authentication_service is not None
+            else create_authentication_service()
+        )
+
+        self.security_policy = (
+            security_policy
+            if security_policy is not None
+            else SecurityPolicyEngine()
+        )
+
+        self.kubernetes_preflight = (
+            kubernetes_preflight
+            if kubernetes_preflight is not None
+            else create_kubernetes_preflight_resolver()
+        )
+
+        self.production_pilot_control = (
+            production_pilot_control
+            if production_pilot_control is not None
+            else create_kubernetes_production_pilot_control()
+        )
+
+        # This independent gate may read both credential values at startup,
+        # but can construct only a two-GET probe. Disabled mode returns before
+        # any credential or CA access.
+        self.production_pilot_live_probe = (
+            production_pilot_live_probe
+            if production_pilot_live_probe is not None
+            else create_production_pilot_live_readiness_probe()
+        )
+
+        self.production_pilot_budget_store = None
+        self.production_pilot_budget_service = (
+            production_pilot_budget_service
+        )
+        if (
+            self.production_pilot_budget_service is None
+            and self.production_pilot_control.config.enabled
+        ):
+            self.production_pilot_budget_store = (
+                ProductionPilotBudgetStore()
+            )
+            self.production_pilot_budget_service = (
+                ProductionPilotBudgetService(
+                    store=(
+                        self.production_pilot_budget_store
+                    )
+                )
+            )
+
+        self.kubernetes_production_executor = (
+            kubernetes_production_executor
+            if kubernetes_production_executor is not None
+            else create_kubernetes_production_executor(
+                pilot_control=(
+                    self.production_pilot_control
+                ),
+                pilot_budget_service=(
+                    self.production_pilot_budget_service
+                ),
+            )
+        )
+
+        if self.kubernetes_production_executor is not None:
+            executor_control = getattr(
+                self.kubernetes_production_executor,
+                "pilot_control",
+                None,
+            )
+            if executor_control is None:
+                self.kubernetes_production_executor.pilot_control = (
+                    self.production_pilot_control
+                )
+            elif executor_control is not self.production_pilot_control:
+                raise TypeError(
+                    "AgentRuntime Kubernetes production pilot control must be shared"
+                )
+            executor_budget = getattr(
+                self.kubernetes_production_executor,
+                "pilot_budget_service",
+                None,
+            )
+            if executor_budget is None:
+                if self.production_pilot_budget_service is None:
+                    raise TypeError(
+                        "AgentRuntime Kubernetes production pilot budget is unavailable"
+                    )
+                self.kubernetes_production_executor.pilot_budget_service = (
+                    self.production_pilot_budget_service
+                )
+            elif executor_budget is not self.production_pilot_budget_service:
+                raise TypeError(
+                    "AgentRuntime Kubernetes production pilot budget must be shared"
+                )
+
+        if (
+            self.kubernetes_production_executor is not None
+            and self.kubernetes_preflight is None
+        ):
+            raise TypeError(
+                "AgentRuntime Kubernetes production executor requires "
+                "trusted preflight"
+            )
+
+        self.production_pilot_readiness = (
+            ProductionPilotReadinessService(
+                control=(
+                    self.production_pilot_control
+                ),
+                production_executor_configured=(
+                    self.kubernetes_production_executor
+                    is not None
+                ),
+            )
+        )
+        self.production_pilot_rehearsal = (
+            ProductionPilotRehearsalService(
+                control=(
+                    self.production_pilot_control
+                ),
+                budget_service=(
+                    self.production_pilot_budget_service
+                ),
+                production_executor_configured=(
+                    self.kubernetes_production_executor
+                    is not None
+                ),
+            )
+        )
+        # Pure recovery-policy proof. It owns no store, credential, network
+        # client or executor and is available while the production gate is
+        # disabled so operators can rehearse recovery before enablement.
+        self.production_pilot_crash_recovery_rehearsal = (
+            ProductionPilotCrashRecoveryRehearsalService()
+        )
+
+        self.memory = MemoryStore()
+
+        self.kubernetes_cluster_registry = (
+            kubernetes_cluster_registry
+        )
+
+        if (
+            self.kubernetes_cluster_registry
+            is None
+        ):
+            self.tools = create_tool_manager()
+        else:
+            self.tools = create_tool_manager(
+                kubernetes_cluster_registry=(
+                    self.kubernetes_cluster_registry
+                )
+            )
+
+        self.skills = create_skill_registry()
+        self.mcp = create_mcp_registry()
+        self.tracer = TraceCollector()
+        self.evaluators = create_evaluation_registry()
+
+        # Remediation business policy. This is intentionally separate from
+        # security_policy, which authorizes operator-facing operations.
+        self.policy = create_policy_engine()
+
+        self.preflight_artifact_store = None
+        self.preflight_artifact_service = None
+        self.production_action_guard = None
+        self.production_action_preparation = None
+        self.production_action_query = None
+
+        if self.kubernetes_preflight is not None:
+            self.preflight_artifact_store = PreflightArtifactStore()
+            self.preflight_artifact_service = PreflightArtifactService(
+                store=self.preflight_artifact_store
+            )
+            self.production_action_guard = (
+                ProductionActionExpiryGuard(
+                    artifact_service=(
+                        self.preflight_artifact_service
+                    )
+                )
+            )
+
+        self.approval = ApprovalService()
+
+        if self.production_action_guard is not None:
+            self.approval.manager.set_transition_guard(
+                self.production_action_guard
+            )
+
+        if self.preflight_artifact_service is not None:
+            self.production_action_preparation = (
+                ProductionActionPreparationService(
+                    resolver=self.kubernetes_preflight,
+                    artifact_service=self.preflight_artifact_service,
+                    approval_service=self.approval,
+                )
+            )
+
+        self.production_pilot_ceremony_store = None
+        self.production_pilot_ceremony = None
+        if (
+            self.production_pilot_control.config.enabled
+            and self.production_pilot_budget_service is not None
+            and self.preflight_artifact_service is not None
+        ):
+            self.production_pilot_ceremony_store = (
+                ProductionPilotCeremonyStore()
+            )
+            self.production_pilot_ceremony = (
+                ProductionPilotCeremonyService(
+                    store=(
+                        self.production_pilot_ceremony_store
+                    ),
+                    control=(
+                        self.production_pilot_control
+                    ),
+                    rehearsal=(
+                        self.production_pilot_rehearsal
+                    ),
+                    budget_service=(
+                        self.production_pilot_budget_service
+                    ),
+                    approval_service=self.approval,
+                    artifact_service=(
+                        self.preflight_artifact_service
+                    ),
+                )
+            )
+
+        self.incident_store = IncidentStore()
+
+        if self.preflight_artifact_service is not None:
+            self.production_action_query = (
+                ProductionActionQueryService(
+                    artifact_service=(
+                        self.preflight_artifact_service
+                    ),
+                    approval_service=self.approval,
+                    incident_store=self.incident_store,
+                )
+            )
+
+        self.incident_service = IncidentService(
+            store=self.incident_store
+        )
+
+        self.workflow_service = WorkflowService(
+            incident_service=self.incident_service
+        )
+
+        self.action_execution_store = ActionExecutionStore()
+
+        self.action_execution_service = ActionExecutionService(
+            store=self.action_execution_store
+        )
+
+        self.action_runtime = ActionRuntime(
+            approval_service=self.approval,
+            incident_store=self.incident_store,
+            action_execution_service=self.action_execution_service,
+            production_action_guard=(
+                self.production_action_guard
+            ),
+            kubernetes_production_executor=(
+                self.kubernetes_production_executor
+            ),
+            preflight_artifact_service=(
+                self.preflight_artifact_service
+                if self.kubernetes_production_executor is not None
+                else None
+            ),
+            production_pilot_control=(
+                self.production_pilot_control
+            ),
+            production_pilot_budget_service=(
+                self.production_pilot_budget_service
+            ),
+            production_pilot_ceremony_service=(
+                self.production_pilot_ceremony
+                if self.kubernetes_production_executor is not None
+                else None
+            ),
+        )
+
+        self.verification_store = VerificationStore()
+
+        self.verification = VerificationService(
+            store=self.verification_store
+        )
+
+        self.verification_runtime = VerificationRuntime(
+            verification_service=self.verification,
+            incident_store=self.incident_store,
+        )
+
+        self.verification_profile_factory = VerificationProfileFactory()
+
+        self.verification_collector = VerificationEvidenceCollector(
+            tools=self.tools
+        )
+
+        self.verification_coordinator = VerificationCoordinator(
+            profile_factory=self.verification_profile_factory,
+            collector=self.verification_collector,
+            verification_runtime=self.verification_runtime,
+        )
+
+        # Final pre-enable evidence is assembled only when every production
+        # preparation component is available. The service is read-only and
+        # deliberately owns no executor or mutable workflow operation.
+        self.production_pilot_pre_enable_evidence = None
+        if all(
+            component is not None
+            for component in (
+                self.production_pilot_ceremony,
+                self.production_pilot_budget_service,
+                self.preflight_artifact_service,
+            )
+        ):
+            self.production_pilot_pre_enable_evidence = (
+                ProductionPilotPreEnableEvidenceService(
+                    readiness_service=(
+                        self.production_pilot_readiness
+                    ),
+                    rehearsal_service=(
+                        self.production_pilot_rehearsal
+                    ),
+                    crash_rehearsal_service=(
+                        self.production_pilot_crash_recovery_rehearsal
+                    ),
+                    ceremony_service=(
+                        self.production_pilot_ceremony
+                    ),
+                    budget_service=(
+                        self.production_pilot_budget_service
+                    ),
+                    artifact_service=(
+                        self.preflight_artifact_service
+                    ),
+                    approval_service=self.approval,
+                    incident_store=self.incident_store,
+                    action_execution_service=(
+                        self.action_execution_service
+                    ),
+                    verification_service=self.verification,
+                )
+            )
+
+        # The final handoff rehearsal is also strictly read-only. It is
+        # available only with the full prepared Pilot chain and explicitly
+        # records whether production executors remain absent while the gate
+        # is disabled.
+        self.production_pilot_final_handoff_rehearsal = None
+        if self.production_pilot_pre_enable_evidence is not None:
+            self.production_pilot_final_handoff_rehearsal = (
+                ProductionPilotFinalHandoffRehearsalService(
+                    pilot_control=self.production_pilot_control,
+                    pre_enable_evidence_service=(
+                        self.production_pilot_pre_enable_evidence
+                    ),
+                    preflight_resolver=self.kubernetes_preflight,
+                    production_executor_configured=(
+                        self.kubernetes_production_executor is not None
+                    ),
+                    action_runtime_production_executor_configured=(
+                        getattr(
+                            self.action_runtime,
+                            "kubernetes_production_executor",
+                            None,
+                        )
+                        is not None
+                    ),
+                )
+            )
+
+        # A dedicated database is created only when the separately gated live
+        # probe exists and the full zero-write handoff chain is available.
+        self.production_pilot_go_no_go_store = None
+        self.production_pilot_go_no_go = None
+        if (
+            self.production_pilot_live_probe is not None
+            and self.production_pilot_final_handoff_rehearsal is not None
+            and self.preflight_artifact_service is not None
+        ):
+            self.production_pilot_go_no_go_store = (
+                ProductionPilotGoNoGoStore()
+            )
+            self.production_pilot_go_no_go = (
+                ProductionPilotGoNoGoService(
+                    store=self.production_pilot_go_no_go_store,
+                    live_probe=self.production_pilot_live_probe,
+                    final_handoff_service=(
+                        self.production_pilot_final_handoff_rehearsal
+                    ),
+                    artifact_service=self.preflight_artifact_service,
+                    pilot_control=self.production_pilot_control,
+                )
+            )
+
+        self.sandbox = LocalSandboxExecutor()
+
+        self.sandbox_policy = SandboxPolicyValidator()
+
+        if self.llm_gateway is None:
+            self.llm_gateway = create_llm_gateway()
+
+        self.registry = create_agent_registry(
+            llm_gateway=self.llm_gateway,
+        )
+
+        self.planner = AgentPlanner()
+
+        self.pipeline = PlannerPipeline(
+            self.registry,
+            self.planner,
+            self.tracer,
+            self.evaluators,
+            incident_store=self.incident_store,
+            incident_service=self.incident_service,
+            workflow_service=self.workflow_service,
+        )
+
+    async def execute(
+        self,
+        context: AgentContext,
+    ):
+        """
+        Execute the primary PlannerPipeline and, when explicitly enabled,
+        run Investigation automatically as a best-effort Shadow.
+
+        Ordering is deliberate:
+
+        1. PlannerPipeline completes first.
+        2. Investigation receives an isolated AgentContext.
+        3. Only the bounded investigation_shadow snapshot is copied back.
+
+        Investigation can never change the Pipeline result, Incident,
+        variables, results, trace, Approval, executions or evaluations.
+
+        Investigation orchestration failure is sanitized and recorded in
+        metadata without failing an otherwise successful Pipeline execution.
+        """
+
+        if not isinstance(
+            context,
+            AgentContext,
+        ):
+            raise TypeError(
+                "AgentRuntime execution context is invalid"
+            )
+
+        # Reserved Shadow metadata from a previous execution must never be
+        # visible to the primary Pipeline, even when this Runtime currently
+        # has Investigation disabled.
+        for reserved_key in (
+            "investigation_shadow",
+            "investigation_shadow_orchestration",
+            "investigation_rca_comparison",
+        ):
+            context.metadata.pop(
+                reserved_key,
+                None,
+            )
+
+        # Primary workflow semantics remain authoritative. Pipeline failure
+        # propagates normally and Investigation is not attempted afterward.
+        context.metadata.pop(
+            "incident_evidence_recorder",
+            None,
+        )
+
+        results = await self.pipeline.execute(
+            context
+        )
+
+        # Evidence Recorder is evaluation-only and best-effort.
+        await self._record_incident_evidence_shadow(
+            context
+        )
+
+        if self.investigation_coordinator is None:
+            return results
+
+        shadow_context = (
+            self._create_investigation_shadow_context(
+                context
+            )
+        )
+
+        try:
+            await self.run_investigation_shadow(
+                shadow_context
+            )
+
+            snapshot = shadow_context.metadata.get(
+                "investigation_shadow"
+            )
+
+            if (
+                not isinstance(
+                    snapshot,
+                    dict,
+                )
+                or snapshot.get(
+                    "shadow_mode"
+                )
+                is not True
+                or snapshot.get(
+                    "read_only"
+                )
+                is not True
+            ):
+                raise RuntimeError(
+                    "Investigation Shadow snapshot is invalid"
+                )
+
+            context.metadata[
+                "investigation_shadow"
+            ] = deepcopy(
+                snapshot
+            )
+
+        except Exception as exc:
+            # Shadow means Shadow: an Investigation orchestration fault must
+            # never convert a successful PlannerPipeline execution to failed.
+            #
+            # Raw exception text is deliberately excluded because provider,
+            # URL, credential or tool details may be present in it.
+            context.metadata[
+                "investigation_shadow_orchestration"
+            ] = {
+                "shadow_mode": True,
+                "read_only": True,
+                "automatic": True,
+                "status": "failed",
+                "failure_code": (
+                    type(exc).__name__[:256]
+                ),
+            }
+
+        # Comparison is evaluation-only. It cannot change the authoritative
+        # RCA stored in context.variables["rca"] and has no Healing authority.
+        try:
+            context.metadata[
+                "investigation_rca_comparison"
+            ] = build_rca_investigation_comparison(
+                rca=context.variables.get(
+                    "rca"
+                ),
+                investigation_snapshot=(
+                    context.metadata.get(
+                        "investigation_shadow"
+                    )
+                ),
+                orchestration_snapshot=(
+                    context.metadata.get(
+                        "investigation_shadow_orchestration"
+                    )
+                ),
+            )
+        except Exception as exc:
+            # A comparison bug must remain weaker than Shadow itself and must
+            # never fail a successful primary Pipeline.
+            context.metadata[
+                "investigation_rca_comparison"
+            ] = {
+                "schema_version": "v1",
+                "shadow_mode": True,
+                "read_only": True,
+                "decision_influence": False,
+                "available": False,
+                "comparison_status": (
+                    "comparison_failed"
+                ),
+                "failure_code": (
+                    type(exc).__name__[:256]
+                ),
+            }
+
+        return results
+
+    def _create_investigation_shadow_context(
+        self,
+        context: AgentContext,
+    ) -> AgentContext:
+        """
+        Build the minimum-privilege context for automatic Investigation.
+
+        Copied:
+        - event input
+        - request correlation ID
+
+        Shared:
+        - exact Runtime-owned ToolManager
+
+        Deliberately not shared:
+        - Incident
+        - variables
+        - results
+        - metadata
+        - trace
+        - memory
+        - skills
+        - MCP
+        - sandbox
+        - Approval
+        - executions
+        - evaluations
+        """
+
+        return AgentContext(
+            request_id=context.request_id,
+            event=deepcopy(
+                context.event
+            ),
+            tools=self.tools,
+            metadata={},
+        )
+
+    async def run_investigation_shadow(
+        self,
+        context: AgentContext,
+    ) -> InvestigationState:
+        """
+        Explicitly execute the enabled read-only Investigation Shadow.
+
+        This method is intentionally separate from PlannerPipeline.
+
+        PlannerPipeline itself never invokes Investigation. AgentRuntime
+        may call this lower-level entry point after a successful Pipeline
+        execution when automatic Shadow Investigation is enabled.
+
+        The supplied AgentContext must use the exact Runtime ToolManager so
+        Investigation probes cannot bypass Runtime-owned tool boundaries.
+        """
+
+        if not isinstance(
+            context,
+            AgentContext,
+        ):
+            raise TypeError(
+                "AgentRuntime Investigation Shadow context is invalid"
+            )
+
+        if self.investigation_coordinator is None:
+            raise RuntimeError(
+                "AgentRuntime Investigation Shadow is disabled"
+            )
+
+        if context.tools is not self.tools:
+            raise TypeError(
+                "AgentRuntime Investigation Shadow requires shared Runtime tools"
+            )
+
+        return await (
+            self.investigation_coordinator.investigate(
+                context
+            )
+        )
+
+    async def _record_incident_evidence_shadow(
+        self,
+        context: AgentContext,
+    ) -> None:
+        """
+        Best-effort, decision-isolated production evidence preservation.
+
+        Runs only after the authoritative PlannerPipeline succeeds.
+        Disabled mode constructs no Recorder and issues no production Probe.
+        """
+
+        try:
+            settings = (
+                IncidentEvidenceRecorderSettings
+                .from_environment()
+            )
+        except Exception as exc:
+            context.metadata[
+                "incident_evidence_recorder"
+            ] = {
+                "schema_version": "v1",
+                "shadow_mode": True,
+                "read_only": True,
+                "decision_influence": False,
+                "automatic": True,
+                "status": "failed",
+                "failure_code": (
+                    type(exc).__name__[:256]
+                ),
+            }
+            return
+
+        if not settings.enabled:
+            return
+
+        recorder_context = AgentContext(
+            request_id=context.request_id,
+            event=deepcopy(
+                context.event
+            ),
+            tools=self.tools,
+            metadata={},
+        )
+
+        try:
+            recorder = ProductionIncidentEvidenceRecorder(
+                settings.resolve_output_dir()
+            )
+
+            result = await recorder.record(
+                recorder_context
+            )
+
+            context.metadata[
+                "incident_evidence_recorder"
+            ] = {
+                "schema_version": "v1",
+                "shadow_mode": True,
+                "read_only": True,
+                "decision_influence": False,
+                "automatic": True,
+                "status": "captured",
+                "created": result.created,
+                "incident_id": result.incident_id,
+                "observation_count": (
+                    result.observation_count
+                ),
+                "capture_file": result.path.name,
+            }
+
+        except Exception as exc:
+            context.metadata[
+                "incident_evidence_recorder"
+            ] = {
+                "schema_version": "v1",
+                "shadow_mode": True,
+                "read_only": True,
+                "decision_influence": False,
+                "automatic": True,
+                "status": "failed",
+                "failure_code": (
+                    type(exc).__name__[:256]
+                ),
+            }

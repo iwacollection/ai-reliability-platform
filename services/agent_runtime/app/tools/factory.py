@@ -13,13 +13,36 @@ from services.agent_runtime.app.tools.mock.echo import (
 from services.agent_runtime.app.tools.prometheus.tool import (
     PrometheusTool,
 )
+from services.agent_runtime.app.tools.prometheus.router import (
+    MultiClusterPrometheusToolRouter,
+    PrometheusClusterRegistry,
+    PrometheusClusterRoutingError,
+)
 
 from services.agent_runtime.app.tools.kubernetes.tool import (
     KubernetesTool,
 )
 
+from services.agent_runtime.app.tools.kubernetes.change_tool import (
+    KubernetesChangeTool,
+)
 
-def create_tool_manager() -> ToolManager:
+from services.agent_runtime.app.tools.kubernetes.router import (
+    KubernetesClusterRegistry,
+    KubernetesClusterRoutingError,
+    MultiClusterKubernetesChangeToolRouter,
+    MultiClusterKubernetesToolRouter,
+)
+
+
+def create_tool_manager(
+    kubernetes_cluster_registry: (
+        KubernetesClusterRegistry | None
+    ) = None,
+    prometheus_cluster_registry: (
+        PrometheusClusterRegistry | None
+    ) = None,
+) -> ToolManager:
 
 
     registry = ToolRegistry()
@@ -30,14 +53,84 @@ def create_tool_manager() -> ToolManager:
     )
 
 
-    registry.register(
-        PrometheusTool()
-    )
+    if prometheus_cluster_registry is None:
+
+        registry.register(
+            PrometheusTool()
+        )
+
+    else:
+
+        if not isinstance(
+            prometheus_cluster_registry,
+            PrometheusClusterRegistry,
+        ):
+            raise TypeError(
+                "Tool factory Prometheus cluster registry is invalid"
+            )
+
+        if (
+            prometheus_cluster_registry.count
+            == 0
+        ):
+            raise PrometheusClusterRoutingError(
+                "Tool factory multi-cluster Prometheus mode requires at least one cluster"
+            )
+
+        registry.register(
+            MultiClusterPrometheusToolRouter(
+                prometheus_cluster_registry
+            )
+        )
 
 
-    registry.register(
-        KubernetesTool()
-    )
+    if kubernetes_cluster_registry is None:
+
+        kubernetes = KubernetesTool()
+
+
+        registry.register(
+            kubernetes
+        )
+
+
+        registry.register(
+            KubernetesChangeTool(
+                kubernetes
+            )
+        )
+
+    else:
+
+        if not isinstance(
+            kubernetes_cluster_registry,
+            KubernetesClusterRegistry,
+        ):
+            raise TypeError(
+                "Tool factory Kubernetes cluster registry is invalid"
+            )
+
+        if (
+            kubernetes_cluster_registry.count
+            == 0
+        ):
+            raise KubernetesClusterRoutingError(
+                "Tool factory multi-cluster mode requires at least one cluster"
+            )
+
+
+        registry.register(
+            MultiClusterKubernetesToolRouter(
+                kubernetes_cluster_registry
+            )
+        )
+
+
+        registry.register(
+            MultiClusterKubernetesChangeToolRouter(
+                kubernetes_cluster_registry
+            )
+        )
 
 
     return ToolManager(

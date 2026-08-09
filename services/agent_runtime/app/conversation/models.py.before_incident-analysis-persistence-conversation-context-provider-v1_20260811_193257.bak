@@ -1,0 +1,154 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from enum import Enum
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+class ConversationIntent(str, Enum):
+    STATUS = "status"
+    RCA = "rca"
+    EVIDENCE = "evidence"
+    NEXT_STEP = "next_step"
+    VERIFICATION = "verification"
+    APPROVE = "approve"
+    REJECT = "reject"
+    REMEDIATE = "remediate"
+    HELP = "help"
+    UNKNOWN = "unknown"
+
+
+class ConversationReplyMode(str, Enum):
+    READ_ONLY = "read_only"
+    WRITE_ACTION_REQUIRED = "write_action_required"
+    NEEDS_INCIDENT = "needs_incident"
+    INCIDENT_NOT_FOUND = "incident_not_found"
+
+
+class ConversationTurnRequest(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    conversation_id: str
+    text: str
+    incident_id: str | None = None
+
+    @field_validator(
+        "conversation_id",
+        "text",
+        "incident_id",
+        mode="before",
+    )
+    @classmethod
+    def validate_text(cls, value, info):
+        if value is None and info.field_name == "incident_id":
+            return None
+
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or "\x00" in value
+        ):
+            raise ValueError(
+                f"{info.field_name} is invalid"
+            )
+
+        limit = 4096 if info.field_name == "text" else 256
+        if len(value) > limit:
+            raise ValueError(
+                f"{info.field_name} is too long"
+            )
+
+        return value
+
+
+class ConversationEvidenceView(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    evidence_id: str
+    source: str
+    summary: str
+    trusted: bool = False
+    cluster_verified: bool = False
+
+
+class ConversationHypothesisView(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    cause: str
+    confidence: float = Field(ge=0.0, le=1.0)
+
+
+class ConversationIncidentContext(BaseModel):
+    """
+    Stable ChatOps-facing incident view.
+
+    Existing persistence remains authoritative. The conversation layer receives
+    only a read-only projection assembled by a provider adapter.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    incident_id: str
+    status: str
+    title: str | None = None
+    summary: str | None = None
+
+    root_cause: str | None = None
+    root_cause_confidence: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+    )
+
+    evidence: tuple[ConversationEvidenceView, ...] = ()
+    hypotheses: tuple[ConversationHypothesisView, ...] = ()
+
+    recommended_action: str | None = None
+    action_risk: str | None = None
+    approval_status: str | None = None
+    verification_status: str | None = None
+
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConversationReplySection(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    key: str
+    title: str
+    lines: tuple[str, ...] = ()
+
+
+class ConversationReplyPlan(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    conversation_id: str
+    incident_id: str | None
+    intent: ConversationIntent
+    mode: ConversationReplyMode
+
+    sections: tuple[ConversationReplySection, ...] = ()
+    suggested_actions: tuple[str, ...] = ()
+    write_operation: str | None = None
+
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC)
+    )
+
+
+class ConversationSession(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    conversation_id: str
+    incident_id: str | None = None
+    last_intent: ConversationIntent | None = None
+    turn_count: int = Field(default=0, ge=0)
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC)
+    )
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC)
+    )

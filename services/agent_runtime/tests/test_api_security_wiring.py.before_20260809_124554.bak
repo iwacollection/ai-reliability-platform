@@ -1,0 +1,455 @@
+from pathlib import Path
+import runpy
+
+import pytest
+
+from fastapi import HTTPException
+
+from common.config.settings import (
+    AuthenticationConfig,
+)
+
+import services.agent_runtime.app.runtime.runtime as runtime_module
+
+from services.agent_runtime.app.security.api import (
+    ApiSecurityAdapter,
+    ApiSecurityConfigurationError,
+)
+from services.agent_runtime.app.security.factory import (
+    create_authentication_service,
+)
+from services.agent_runtime.app.security.models import (
+    ProtectedOperation,
+)
+from services.agent_runtime.app.security.policy import (
+    SecurityPolicyEngine,
+)
+from services.agent_runtime.app.security.service import (
+    AuthenticationService,
+)
+
+
+def api_runtime_path() -> Path:
+    return (
+        Path(__file__)
+        .resolve()
+        .parents[1]
+        / "app"
+        / "api"
+        / "runtime.py"
+    )
+
+
+def disabled_authentication_service() -> AuthenticationService:
+    return create_authentication_service(
+        AuthenticationConfig()
+    )
+
+
+class FakeRuntime:
+    """Minimum startup contract required by the API module wiring."""
+
+    instances: list[
+        "FakeRuntime"
+    ] = []
+
+    def __init__(
+        self,
+        *,
+        authentication: AuthenticationService | None = None,
+        security_policy: SecurityPolicyEngine | None = None,
+    ) -> None:
+        self.authentication = (
+            authentication
+            or disabled_authentication_service()
+        )
+        self.security_policy = (
+            security_policy
+            or SecurityPolicyEngine()
+        )
+        type(self).instances.append(
+            self
+        )
+
+
+def execute_api_module(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_factory=FakeRuntime,
+) -> dict:
+    monkeypatch.setattr(
+        runtime_module,
+        "AgentRuntime",
+        runtime_factory,
+    )
+
+    return runpy.run_path(
+        str(
+            api_runtime_path()
+        ),
+        run_name=(
+            "api_security_wiring_test_module"
+        ),
+    )
+
+
+def test_api_module_wires_one_shared_security_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    monkeypatch.chdir(
+        tmp_path
+    )
+    FakeRuntime.instances.clear()
+
+    module = execute_api_module(
+        monkeypatch
+    )
+
+    runtime = module[
+        "runtime"
+    ]
+    adapter = module[
+        "api_security"
+    ]
+
+    assert len(
+        FakeRuntime.instances
+    ) == 1
+    assert runtime is FakeRuntime.instances[0]
+    assert isinstance(
+        adapter,
+        ApiSecurityAdapter,
+    )
+    assert (
+        adapter.authentication
+        is runtime.authentication
+    )
+    assert (
+        adapter.policy
+        is runtime.security_policy
+    )
+    assert adapter.authorization_scheme == (
+        "ApiKey"
+    )
+
+
+def test_api_module_preserves_complete_route_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    monkeypatch.chdir(
+        tmp_path
+    )
+    module = execute_api_module(
+        monkeypatch
+    )
+    router = module[
+        "router"
+    ]
+
+    actual_routes = {
+        (
+            route.path,
+            frozenset(
+                route.methods
+                or set()
+            ),
+        )
+        for route in router.routes
+    }
+    expected_routes = {
+        (
+            "/execute",
+            frozenset(
+                {
+                    "POST",
+                }
+            ),
+        ),
+        (
+            "/production-actions/prepare",
+            frozenset(
+                {
+                    "POST",
+                }
+            ),
+        ),
+        (
+            "/production-actions/preflight-artifacts/{artifact_id}",
+            frozenset(
+                {
+                    "GET",
+                }
+            ),
+        ),
+        (
+            "/incidents/{incident_id}",
+            frozenset(
+                {
+                    "GET",
+                }
+            ),
+        ),
+        (
+            "/incidents/{incident_id}/workflows",
+            frozenset(
+                {
+                    "GET",
+                }
+            ),
+        ),
+        (
+            "/approvals/{approval_id}",
+            frozenset(
+                {
+                    "GET",
+                }
+            ),
+        ),
+        (
+            "/workflows/approvals/{approval_id}",
+            frozenset(
+                {
+                    "GET",
+                }
+            ),
+        ),
+        (
+            "/approvals/{approval_id}/approve",
+            frozenset(
+                {
+                    "POST",
+                }
+            ),
+        ),
+        (
+            "/approvals/{approval_id}/reject",
+            frozenset(
+                {
+                    "POST",
+                }
+            ),
+        ),
+        (
+            "/approvals/{approval_id}/resume",
+            frozenset(
+                {
+                    "POST",
+                }
+            ),
+        ),
+        (
+            "/action-executions/{execution_id}/reconcile",
+            frozenset(
+                {
+                    "POST",
+                }
+            ),
+        ),
+        (
+            "/verifications/{verification_id}",
+            frozenset(
+                {
+                    "GET",
+                }
+            ),
+        ),
+    }
+
+    assert len(
+        router.routes
+    ) == 12
+    assert actual_routes == expected_routes
+
+
+def test_api_module_startup_does_not_authenticate_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    class CountingAuthenticationService(
+        AuthenticationService
+    ):
+        def __init__(
+            self,
+        ) -> None:
+            base = disabled_authentication_service()
+            super().__init__(
+                base.registry
+            )
+            self.authenticate_calls = 0
+
+        def authenticate(
+            self,
+            credential,
+            *,
+            provider_name=None,
+        ):
+            self.authenticate_calls += 1
+            return super().authenticate(
+                credential,
+                provider_name=provider_name,
+            )
+
+    authentication = (
+        CountingAuthenticationService()
+    )
+
+    class CountingRuntime(
+        FakeRuntime
+    ):
+        def __init__(
+            self,
+        ) -> None:
+            super().__init__(
+                authentication=authentication
+            )
+
+    monkeypatch.chdir(
+        tmp_path
+    )
+    module = execute_api_module(
+        monkeypatch,
+        CountingRuntime,
+    )
+
+    assert module[
+        "api_security"
+    ].authentication is authentication
+    assert authentication.authenticate_calls == 0
+
+
+def test_default_disabled_authentication_remains_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    monkeypatch.chdir(
+        tmp_path
+    )
+    module = execute_api_module(
+        monkeypatch
+    )
+    adapter = module[
+        "api_security"
+    ]
+
+    with pytest.raises(
+        HTTPException
+    ) as captured:
+        adapter.require(
+            None,
+            ProtectedOperation.READ_INCIDENT,
+        )
+
+    assert captured.value.status_code == 401
+    assert captured.value.detail == (
+        "Authentication failed"
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "authentication",
+        "security_policy",
+        "expected_message",
+    ),
+    [
+        (
+            object(),
+            SecurityPolicyEngine(),
+            "AuthenticationService",
+        ),
+        (
+            disabled_authentication_service(),
+            object(),
+            "SecurityPolicyEngine",
+        ),
+    ],
+)
+def test_invalid_runtime_security_contract_fails_api_startup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    authentication,
+    security_policy,
+    expected_message: str,
+):
+    class InvalidRuntime:
+        def __init__(
+            self,
+        ) -> None:
+            self.authentication = authentication
+            self.security_policy = security_policy
+
+    monkeypatch.chdir(
+        tmp_path
+    )
+
+    with pytest.raises(
+        ApiSecurityConfigurationError,
+        match=expected_message,
+    ):
+        execute_api_module(
+            monkeypatch,
+            InvalidRuntime,
+        )
+
+
+def test_separate_api_module_executions_do_not_share_runtime_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    monkeypatch.chdir(
+        tmp_path
+    )
+
+    first = execute_api_module(
+        monkeypatch
+    )
+    second = execute_api_module(
+        monkeypatch
+    )
+
+    assert first[
+        "runtime"
+    ] is not second[
+        "runtime"
+    ]
+    assert first[
+        "api_security"
+    ] is not second[
+        "api_security"
+    ]
+    assert (
+        first[
+            "api_security"
+        ].authentication
+        is first[
+            "runtime"
+        ].authentication
+    )
+    assert (
+        second[
+            "api_security"
+        ].authentication
+        is second[
+            "runtime"
+        ].authentication
+    )
+
+
+def test_wiring_test_creates_no_database_files(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    monkeypatch.chdir(
+        tmp_path
+    )
+
+    execute_api_module(
+        monkeypatch
+    )
+
+    assert list(
+        tmp_path.rglob(
+            "*.db"
+        )
+    ) == []

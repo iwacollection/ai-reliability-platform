@@ -1,0 +1,482 @@
+import json
+from abc import ABC, abstractmethod
+
+from pydantic import ValidationError
+
+from services.agent_runtime.app.investigation.llm_gateway_adapter import (
+    BaseInvestigationLLM,
+)
+from services.agent_runtime.app.investigation.models import (
+    InvestigationDecision,
+    InvestigationProbe,
+    InvestigationScope,
+    InvestigationState,
+)
+
+
+class InvestigationReasonerError(RuntimeError):
+    """
+    Sanitized reasoner failure.
+    """
+
+
+class InvestigationReasonerJSONError(
+    InvestigationReasonerError
+):
+    """
+    Primary decision was not valid JSON.
+    """
+
+
+class InvestigationReasonerValidationError(
+    InvestigationReasonerError
+):
+    """
+    Primary JSON did not satisfy InvestigationDecision.
+    """
+
+
+class InvestigationReasonerRepairJSONError(
+    InvestigationReasonerError
+):
+    """
+    One bounded repair attempt still did not return valid JSON.
+    """
+
+
+class InvestigationReasonerRepairValidationError(
+    InvestigationReasonerError
+):
+    """
+    One bounded repair attempt still violated InvestigationDecision.
+    """
+
+
+class InvestigationReasonerExecutionRetryError(
+    InvestigationReasonerError
+):
+    """
+    The sanitized LLM execution failed twice for the same reasoning request.
+    """
+
+
+class BaseInvestigationReasoner(ABC):
+    """
+    Select the next symbolic read-only probe or stop with a conclusion.
+    """
+
+    @abstractmethod
+    async def decide(
+        self,
+        scope: InvestigationScope,
+        state: InvestigationState,
+    ) -> InvestigationDecision:
+        ...
+
+
+class LLMInvestigationReasoner(
+    BaseInvestigationReasoner
+):
+    """
+    Structured LLM reasoner for the bounded InvestigationCoordinator.
+
+    The reasoner depends only on the Investigation-owned LLM abstraction.
+    Gateway routing, provider selection, fallback, rate limiting and circuit
+    breaking remain outside this class.
+
+    Transport execution retry ownership remains entirely in the shared
+    LLM Gateway. The Reasoner does not repeat a failed Gateway request.
+    Its only bounded second model call is structured Decision-contract repair
+    after a model response was successfully received but failed validation.
+
+    It can select only an InvestigationProbe enum value. It cannot construct
+    tool calls, resource scope, PromQL, URLs or credentials.
+    """
+
+    _SYSTEM_PROMPT = (
+        "You are a bounded SRE investigation reasoner. "
+        "Maintain competing hypotheses, use only supplied "
+        "evidence, and select only one allowed symbolic "
+        "read-only probe. Never propose or execute a write."
+    )
+
+    def __init__(
+        self,
+        investigation_llm: BaseInvestigationLLM,
+    ) -> None:
+        if not isinstance(
+            investigation_llm,
+            BaseInvestigationLLM,
+        ):
+            raise TypeError(
+                "Investigation LLM adapter is invalid"
+            )
+
+        self.investigation_llm = (
+            investigation_llm
+        )
+
+    async def decide(
+        self,
+        scope: InvestigationScope,
+        state: InvestigationState,
+    ) -> InvestigationDecision:
+        prompt = self._build_prompt(
+            scope=scope,
+            state=state,
+        )
+
+        content = await self.investigation_llm.complete(
+            system_prompt=self._SYSTEM_PROMPT,
+            prompt=prompt,
+        )
+
+        if not isinstance(
+            content,
+            str,
+        ):
+            raise InvestigationReasonerError(
+                "Investigation reasoner returned no JSON"
+            )
+
+        try:
+            decision = self._parse_decision(
+                content,
+                repair=False,
+            )
+
+            self._validate_decision_against_state(
+                decision=decision,
+                state=state,
+                repair=False,
+            )
+
+            return decision
+
+        except (
+            InvestigationReasonerJSONError,
+            InvestigationReasonerValidationError,
+        ) as primary_error:
+            repair_content = await self.investigation_llm.complete(
+                system_prompt=(
+                    self._SYSTEM_PROMPT
+                    + " Repair the decision contract only; "
+                    "do not invent new evidence."
+                ),
+                prompt=self._build_repair_prompt(
+                    scope=scope,
+                    state=state,
+                    primary_error=primary_error,
+                ),
+            )
+
+            if not isinstance(
+                repair_content,
+                str,
+            ):
+                raise InvestigationReasonerError(
+                    "Investigation reasoner repair returned no JSON"
+                ) from primary_error
+
+            try:
+                decision = self._parse_decision(
+                    repair_content,
+                    repair=True,
+                )
+
+                self._validate_decision_against_state(
+                    decision=decision,
+                    state=state,
+                    repair=True,
+                )
+
+                return decision
+
+            except InvestigationReasonerError as repair_error:
+                raise repair_error from primary_error
+
+    @staticmethod
+    def _validate_decision_against_state(
+        *,
+        decision: InvestigationDecision,
+        state: InvestigationState,
+        repair: bool,
+    ) -> None:
+        probe = decision.next_probe
+
+        if (
+            probe is not None
+            and probe in state.attempted_probes
+        ):
+            error_type = (
+                InvestigationReasonerRepairValidationError
+                if repair
+                else InvestigationReasonerValidationError
+            )
+
+            raise error_type(
+                "Investigation reasoner selected an already-attempted probe"
+            )
+
+    @staticmethod
+    def _parse_decision(
+        content: str,
+        *,
+        repair: bool,
+    ) -> InvestigationDecision:
+        try:
+            payload = json.loads(
+                content
+            )
+
+        except json.JSONDecodeError as exc:
+            error_type = (
+                InvestigationReasonerRepairJSONError
+                if repair
+                else InvestigationReasonerJSONError
+            )
+
+            raise error_type(
+                (
+                    "Investigation reasoner repair returned invalid JSON"
+                    if repair
+                    else "Investigation reasoner returned invalid JSON"
+                )
+            ) from exc
+
+        try:
+            return InvestigationDecision.model_validate(
+                payload
+            )
+
+        except (
+            ValidationError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            error_type = (
+                InvestigationReasonerRepairValidationError
+                if repair
+                else InvestigationReasonerValidationError
+            )
+
+            raise error_type(
+                (
+                    "Investigation reasoner repair returned an invalid decision"
+                    if repair
+                    else "Investigation reasoner returned an invalid decision"
+                )
+            ) from exc
+
+    @classmethod
+    def _build_repair_prompt(
+        cls,
+        *,
+        scope: InvestigationScope,
+        state: InvestigationState,
+        primary_error: InvestigationReasonerError,
+    ) -> str:
+        failure_kind = type(
+            primary_error
+        ).__name__
+
+        return (
+            "Your previous decision failed the bounded structured-output "
+            f"contract with failure type {failure_kind}.\n"
+            "Do not repeat or explain the invalid response.\n"
+            "Re-evaluate the SAME supplied state. Do not invent evidence, "
+            "do not add a tool call outside allowed_probes, and do not "
+            "change resource scope.\n"
+            "Return exactly one corrected JSON decision that satisfies every "
+            "shape and evidence rule below.\n\n"
+            + cls._build_prompt(
+                scope=scope,
+                state=state,
+            )
+        )
+
+    @staticmethod
+    def _build_prompt(
+        scope: InvestigationScope,
+        state: InvestigationState,
+    ) -> str:
+        trusted_evidence_ids = [
+            item.evidence_id
+            for item in state.evidence
+            if (
+                item.success
+                and item.trusted
+                and item.production_signal
+            )
+        ]
+
+        attempted_probe_set = set(
+            state.attempted_probes
+        )
+
+        state_payload = {
+            "scope": scope.model_dump(
+                mode="json"
+            ),
+            "iteration_count": state.iteration_count,
+            "tool_call_count": state.tool_call_count,
+            "attempted_probes": [
+                probe.value
+                for probe in state.attempted_probes
+            ],
+            "failed_probes": [
+                item.probe.value
+                for item in state.evidence
+                if not item.success
+            ],
+            "hypotheses": [
+                item.model_dump(mode="json")
+                for item in state.hypotheses
+            ],
+            "evidence": [
+                item.model_dump(mode="json")
+                for item in state.evidence
+            ],
+            "trusted_evidence_ids": trusted_evidence_ids,
+            "allowed_probes": [
+                probe.value
+                for probe in InvestigationProbe
+                if probe not in attempted_probe_set
+            ],
+        }
+
+        return (
+            "Investigate the incident using the bounded state below.\n"
+            "Return exactly one JSON object only. Do not return markdown.\n"
+            "Maintain competing hypotheses and update confidence from evidence.\n"
+            "Probe affordances:\n"
+            "- kubernetes_pod_state: current pod/container state, restart "
+            "indicators, and last termination reasons.\n"
+            "- kubernetes_previous_container_logs: bounded previous-container "
+            "output; high-information evidence for unexplained restart, startup, "
+            "panic, configuration, dependency, or crash symptoms.\n"
+            "- prometheus_memory_working_set: sampled container memory usage.\n"
+            "- prometheus_memory_limit: configured container memory limit.\n"
+            "- prometheus_restart_count: sampled restart frequency/corroboration.\n"
+            "If trusted evidence falsifies the current leading hypothesis but "
+            "the observed incident symptom remains unexplained, do not stop "
+            "solely because that hypothesis was rejected. Replan with at least "
+            "one evidence-plausible alternative hypothesis when an unattempted "
+            "allowed probe can materially discriminate plausible causes.\n"
+            "Use insufficient_evidence only when no unattempted safe probe can "
+            "materially discriminate the remaining plausible causes, or when "
+            "required evidence is unavailable.\n"
+            "State.allowed_probes already excludes every attempted probe. "
+            "Select next_probe only from State.allowed_probes.\n"
+            "A failed probe is still an attempted probe. Do not retry it inside "
+            "the same investigation; keep its required evidence missing and "
+            "use another unattempted discriminative probe or safely abstain.\n"
+            "Never repeat a probe already listed in attempted_probes.\n"
+            "Never cite an evidence ID that is absent from State.evidence.\n"
+            "Conflicting evidence can weaken a hypothesis but cannot by itself "
+            "positively establish an unrelated root cause.\n"
+            "Ruling out one hypothesis is not sufficient evidence for a different "
+            "causal claim.\n"
+            "Current-state evidence does not by itself prove that a historical "
+            "event never occurred.\n"
+            "For sufficient_evidence, the conclusion must affirm a positively "
+            "supported current hypothesis. Every conclusion.evidence_id must also "
+            "appear in that hypothesis supporting_evidence_ids and must not be "
+            "conflicting evidence for that same hypothesis.\n"
+            "Conclusion confidence must not materially exceed the confidence of "
+            "the positively supported hypothesis.\n"
+            "A symptom or failure-mode observation such as CrashLoopBackOff, "
+            "restart count, unready state, high latency, or high error rate can "
+            "confirm that a failure exists, but does not by itself establish the "
+            "specific underlying cause that produced it.\n"
+            "If several underlying causes remain plausible and current allowed "
+            "probes cannot discriminate among them, keep the required "
+            "root-cause evidence in hypothesis.missing_evidence and stop with "
+            "insufficient_evidence or no_safe_probe.\n"
+            "Use hypothesis.missing_evidence only for evidence that is REQUIRED "
+            "before the specific root cause can be accepted. Use "
+            "hypothesis.optional_evidence for corroboration that may increase "
+            "confidence or describe frequency/severity but is not required to "
+            "establish the root cause.\n"
+            "Do not put the same evidence need in both missing_evidence and "
+            "optional_evidence.\n"
+            "Do not clear missing_evidence merely because all allowed probes "
+            "have been attempted. For sufficient_evidence, the positively "
+            "supported hypothesis used by the conclusion must have an empty "
+            "missing_evidence list. optional_evidence may remain non-empty.\n"
+            "Treat event evidence separately from mechanism evidence. For example, "
+            "OOMKilled proves that an OOM termination occurred, but does not by "
+            "itself prove that a configured container memory limit was exceeded.\n"
+            "A point-in-time or sampled metric cannot establish an unobserved "
+            "transient peak, historical trend, or threshold crossing. Never invent "
+            "an unseen spike to make a hypothesis fit.\n"
+            "For quantitative threshold causes, supporting evidence must be "
+            "directionally consistent with the claimed mechanism. If a sampled "
+            "working value is below the sampled limit, that sample is not positive "
+            "support for the claim that the limit was exceeded.\n"
+            "If an event is confirmed but the available sampled metrics do not "
+            "explain its mechanism, keep the required historical/range/peak "
+            "evidence in missing_evidence and stop with insufficient_evidence "
+            "unless another direct causal observation establishes the cause.\n"
+            "If the available evidence only rejects hypotheses and does not "
+            "positively establish a root cause, stop with insufficient_evidence.\n"
+            "If the available evidence only rejects hypotheses or confirms a "
+            "symptom/failure mode without establishing its cause, stop with "
+            "insufficient_evidence.\n"
+            "For a conclusion, evidence_ids must be non-empty and copied "
+            "exactly from trusted_evidence_ids.\n"
+            "Allowed model terminal stop_reason values are exactly: "
+            "sufficient_evidence, insufficient_evidence, no_safe_probe.\n"
+            "Do not emit internal coordinator reasons such as timeout, "
+            "max_iterations, max_tool_calls, duplicate_probe or reasoner_error.\n"
+            "\n"
+            "Continuing shape:\n"
+            "{\n"
+            '  "hypotheses": [{"hypothesis_id": "h1", "cause": "candidate", '
+            '"confidence": 0.5, "supporting_evidence_ids": [], '
+            '"conflicting_evidence_ids": [], "missing_evidence": ["required evidence"], "optional_evidence": ["non-blocking corroboration"]}],\n'
+            '  "rationale_summary": "why this probe is most discriminative",\n'
+            '  "stop": false,\n'
+            '  "stop_reason": null,\n'
+            '  "next_probe": "one unattempted value from allowed_probes",\n'
+            '  "conclusion": null\n'
+            "}\n"
+            "\n"
+            "Terminal sufficient-evidence shape:\n"
+            "{\n"
+            '  "hypotheses": [{"hypothesis_id": "h1", "cause": "supported cause", '
+            '"confidence": 0.9, "supporting_evidence_ids": ["copy exact trusted id"], '
+            '"conflicting_evidence_ids": [], "missing_evidence": [], "optional_evidence": []}],\n'
+            '  "rationale_summary": "why trusted evidence is sufficient",\n'
+            '  "stop": true,\n'
+            '  "stop_reason": "sufficient_evidence",\n'
+            '  "next_probe": null,\n'
+            '  "conclusion": {"root_cause": "bounded root cause", '
+            '"confidence": 0.9, "evidence_ids": ["copy exact trusted id"], '
+            '"remaining_uncertainties": []}\n'
+            "}\n"
+            "\n"
+            "Terminal insufficient/no-safe-probe shape:\n"
+            "{\n"
+            '  "hypotheses": [{"hypothesis_id": "h1", "cause": "candidate", '
+            '"confidence": 0.3, "supporting_evidence_ids": [], '
+            '"conflicting_evidence_ids": [], "missing_evidence": ["required missing evidence"], "optional_evidence": ["non-blocking evidence if useful"]}],\n'
+            '  "rationale_summary": "why current bounded evidence cannot support an RCA",\n'
+            '  "stop": true,\n'
+            '  "stop_reason": "insufficient_evidence",\n'
+            '  "next_probe": null,\n'
+            '  "conclusion": null\n'
+            "}\n"
+            "\n"
+            "If no useful unattempted allowed probe can resolve the remaining "
+            "uncertainty, stop with insufficient_evidence or no_safe_probe.\n"
+            "State:\n"
+            f"{json.dumps(state_payload, ensure_ascii=True, sort_keys=True)}"
+        )
+
+
+__all__ = [
+    "BaseInvestigationReasoner",
+    "InvestigationReasonerError",
+    "LLMInvestigationReasoner",
+]

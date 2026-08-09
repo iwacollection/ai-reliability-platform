@@ -6,7 +6,7 @@ from services.agent_runtime.app.model.result import (
     AgentResult,
 )
 
-from services.agent_runtime.app.runtime.scheduler import (
+from services.agent_runtime.app.agent.runtime.scheduler import (
     AgentScheduler,
 )
 

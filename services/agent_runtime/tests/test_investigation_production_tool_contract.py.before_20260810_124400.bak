@@ -1,0 +1,456 @@
+from datetime import UTC, datetime
+from types import SimpleNamespace
+
+import httpx
+import pytest
+
+from services.agent_runtime.app.investigation.models import (
+    InvestigationProbe,
+    InvestigationScope,
+)
+from services.agent_runtime.app.investigation.probes import (
+    InvestigationProbeResponseError,
+    ReadOnlyInvestigationProbeExecutor,
+)
+from services.agent_runtime.app.tools.kubernetes.tool import (
+    KubernetesTool,
+)
+from services.agent_runtime.app.tools.manager import (
+    ToolManager,
+)
+from services.agent_runtime.app.tools.prometheus.tool import (
+    PrometheusTool,
+)
+from services.agent_runtime.app.tools.registry import (
+    ToolRegistry,
+)
+
+
+NOW = datetime(
+    2026,
+    8,
+    10,
+    4,
+    0,
+    tzinfo=UTC,
+)
+
+
+def scope() -> InvestigationScope:
+    return InvestigationScope(
+        alert_name="PodOOMKilled",
+        alert_message="Pod restarted",
+        resource="payment-api",
+        namespace="payment",
+        cluster="production-a",
+    )
+
+
+def context(
+    tools,
+):
+    return SimpleNamespace(
+        tools=tools,
+        trace=None,
+    )
+
+
+def manager_with(
+    *tools,
+):
+    registry = ToolRegistry()
+
+    for tool in tools:
+        registry.register(
+            tool
+        )
+
+    return ToolManager(
+        registry
+    )
+
+
+@pytest.mark.asyncio
+async def test_real_kubernetes_live_contract_is_trusted():
+    def handler(
+        request,
+    ):
+        return httpx.Response(
+            200,
+            json={
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "payment-api",
+                    "namespace": "payment",
+                    "uid": "pod-uid-secret",
+                    "resourceVersion": (
+                        "resource-version-secret"
+                    ),
+                },
+                "spec": {
+                    "nodeName": "worker-1",
+                },
+                "status": {
+                    "phase": "Running",
+                    "conditions": [
+                        {
+                            "type": "PodScheduled",
+                            "status": "True",
+                        },
+                        {
+                            "type": "Ready",
+                            "status": "False",
+                        },
+                    ],
+                    "containerStatuses": [
+                        {
+                            "name": "payment-api",
+                            "ready": False,
+                            "restartCount": 7,
+                            "state": {
+                                "waiting": {
+                                    "reason": (
+                                        "CrashLoopBackOff"
+                                    ),
+                                },
+                            },
+                            "lastState": {
+                                "terminated": {
+                                    "reason": "OOMKilled",
+                                    "finishedAt": (
+                                        "2026-08-10T03:59:00Z"
+                                    ),
+                                },
+                            },
+                            "image": "payment-api:v2",
+                            "imageID": "sha256:secret",
+                        }
+                    ],
+                },
+            },
+        )
+
+    transport = httpx.MockTransport(
+        handler
+    )
+
+    async with httpx.AsyncClient(
+        transport=transport,
+    ) as client:
+        kubernetes = KubernetesTool(
+            api_url=(
+                "https://kubernetes.test"
+            ),
+            cluster_name="production-a",
+            allow_dry_run_fallback=False,
+            client=client,
+            clock=lambda: NOW,
+        )
+
+        tools = manager_with(
+            kubernetes
+        )
+
+        evidence = await (
+            ReadOnlyInvestigationProbeExecutor()
+            .collect(
+                context(
+                    tools
+                ),
+                scope(),
+                InvestigationProbe.KUBERNETES_POD_STATE,
+            )
+        )
+
+    assert evidence.success is True
+    assert evidence.trusted is True
+    assert evidence.production_signal is True
+    assert evidence.source == "kubernetes"
+    assert evidence.observed_at == NOW
+    assert evidence.facts["phase"] == "Running"
+    assert evidence.facts["oom_killed"] is True
+    assert evidence.facts["max_restart_count"] == 7
+    assert evidence.facts["state_reasons"] == (
+        "CrashLoopBackOff"
+    )
+    assert evidence.facts[
+        "last_termination_reasons"
+    ] == "OOMKilled"
+
+    serialized = str(
+        evidence.model_dump(
+            mode="json"
+        )
+    )
+
+    assert "pod-uid-secret" not in serialized
+    assert "resource-version-secret" not in serialized
+    assert "sha256:secret" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_real_prometheus_live_contract_is_trusted():
+    def handler(
+        request,
+    ):
+        return httpx.Response(
+            200,
+            json={
+                "status": "success",
+                "data": {
+                    "resultType": "vector",
+                    "result": [
+                        {
+                            "metric": {
+                                "pod": "payment-api",
+                            },
+                            "value": [
+                                NOW.timestamp(),
+                                "503316480",
+                            ],
+                        }
+                    ],
+                },
+            },
+        )
+
+    transport = httpx.MockTransport(
+        handler
+    )
+
+    async with httpx.AsyncClient(
+        transport=transport,
+    ) as client:
+        prometheus = PrometheusTool(
+            base_url=(
+                "https://prometheus.test"
+            ),
+            allow_mock_fallback=False,
+            client=client,
+        )
+
+        tools = manager_with(
+            prometheus
+        )
+
+        evidence = await (
+            ReadOnlyInvestigationProbeExecutor()
+            .collect(
+                context(
+                    tools
+                ),
+                scope(),
+                InvestigationProbe.PROMETHEUS_MEMORY_WORKING_SET,
+            )
+        )
+
+    assert evidence.success is True
+    assert evidence.trusted is True
+    assert evidence.production_signal is True
+    assert evidence.source == "prometheus"
+    assert evidence.observed_at == NOW
+    assert evidence.facts["result_type"] == (
+        "vector"
+    )
+    assert evidence.facts["sample_count"] == 1
+    assert evidence.facts["value_sum"] == (
+        503316480.0
+    )
+
+    serialized = str(
+        evidence.model_dump(
+            mode="json"
+        )
+    )
+
+    assert (
+        "container_memory_working_set_bytes"
+        not in serialized
+    )
+
+
+@pytest.mark.asyncio
+async def test_real_tool_fallbacks_are_rejected(
+    monkeypatch,
+):
+    for name in (
+        "KUBERNETES_API_URL",
+        "KUBERNETES_SERVICE_HOST",
+        "KUBERNETES_SERVICE_PORT",
+        "KUBERNETES_SERVICE_PORT_HTTPS",
+    ):
+        monkeypatch.delenv(
+            name,
+            raising=False,
+        )
+
+    kubernetes = KubernetesTool(
+        allow_dry_run_fallback=True,
+        clock=lambda: NOW,
+    )
+
+    kubernetes_tools = manager_with(
+        kubernetes
+    )
+
+    with pytest.raises(
+        InvestigationProbeResponseError,
+        match="source is untrusted|mode is not read-only|not a production signal",
+    ):
+        await (
+            ReadOnlyInvestigationProbeExecutor()
+            .collect(
+                context(
+                    kubernetes_tools
+                ),
+                scope(),
+                InvestigationProbe.KUBERNETES_POD_STATE,
+            )
+        )
+
+    prometheus = PrometheusTool(
+        base_url="",
+        allow_mock_fallback=True,
+    )
+
+    prometheus_tools = manager_with(
+        prometheus
+    )
+
+    with pytest.raises(
+        InvestigationProbeResponseError,
+        match="source is untrusted|mode is not read-only|not a production signal",
+    ):
+        await (
+            ReadOnlyInvestigationProbeExecutor()
+            .collect(
+                context(
+                    prometheus_tools
+                ),
+                scope(),
+                InvestigationProbe.PROMETHEUS_MEMORY_WORKING_SET,
+            )
+        )
+
+
+class StaticToolManager:
+    def __init__(
+        self,
+        response,
+    ):
+        self.response = response
+
+    async def call(
+        self,
+        name,
+        context=None,
+        **kwargs,
+    ):
+        return self.response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        {
+            "success": True,
+            "source": "mock_kubernetes",
+            "mode": "read_only",
+            "production_signal": True,
+            "observed_at": NOW.isoformat(),
+            "data": {
+                "phase": "Running",
+                "containers": [],
+            },
+        },
+        {
+            "success": True,
+            "source": "kubernetes",
+            "mode": "dry_run",
+            "production_signal": True,
+            "observed_at": NOW.isoformat(),
+            "data": {
+                "phase": "Running",
+                "containers": [],
+            },
+        },
+        {
+            "success": True,
+            "source": "kubernetes",
+            "mode": "read_only",
+            "production_signal": True,
+            "observed_at": "not-a-time",
+            "data": {
+                "phase": "Running",
+                "containers": [],
+            },
+        },
+        {
+            "success": True,
+            "source": "kubernetes",
+            "mode": "read_only",
+            "production_signal": True,
+            "observed_at": "2026-08-10T04:00:00",
+            "data": {
+                "phase": "Running",
+                "containers": [],
+            },
+        },
+    ],
+)
+async def test_forged_or_malformed_evidence_fails_closed(
+    response,
+):
+    tools = StaticToolManager(
+        response
+    )
+
+    with pytest.raises(
+        InvestigationProbeResponseError,
+    ):
+        await (
+            ReadOnlyInvestigationProbeExecutor()
+            .collect(
+                SimpleNamespace(
+                    tools=tools,
+                    trace=None,
+                ),
+                scope(),
+                InvestigationProbe.KUBERNETES_POD_STATE,
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_prometheus_requires_numeric_samples():
+    tools = StaticToolManager(
+        {
+            "success": True,
+            "source": "prometheus",
+            "mode": "read_only",
+            "production_signal": True,
+            "observed_at": NOW.isoformat(),
+            "data": {
+                "resultType": "vector",
+                "result": [],
+            },
+        }
+    )
+
+    with pytest.raises(
+        InvestigationProbeResponseError,
+        match="no numeric samples",
+    ):
+        await (
+            ReadOnlyInvestigationProbeExecutor()
+            .collect(
+                SimpleNamespace(
+                    tools=tools,
+                    trace=None,
+                ),
+                scope(),
+                InvestigationProbe.PROMETHEUS_MEMORY_WORKING_SET,
+            )
+        )

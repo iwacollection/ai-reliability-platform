@@ -1,0 +1,147 @@
+import json
+from types import SimpleNamespace
+
+import pytest
+
+from services.agent_runtime.app.investigation.models import (
+    InvestigationScope,
+    InvestigationState,
+)
+from services.agent_runtime.app.investigation.reasoner import (
+    InvestigationReasonerError,
+    LLMInvestigationReasoner,
+)
+
+
+class FakeGateway:
+    def __init__(self, content):
+        self.content = content
+        self.requests = []
+
+    async def chat(self, request):
+        self.requests.append(request)
+        return SimpleNamespace(
+            content=self.content
+        )
+
+
+def state() -> InvestigationState:
+    return InvestigationState(
+        scope=InvestigationScope(
+            alert_name="PodOOMKilled",
+            alert_message="Pod restarted",
+            resource="payment-api",
+            namespace="payment",
+            cluster="production-a",
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_reasoner_returns_structured_probe_decision():
+    gateway = FakeGateway(
+        json.dumps(
+            {
+                "hypotheses": [
+                    {
+                        "hypothesis_id": (
+                            "memory_limit_too_low"
+                        ),
+                        "cause": (
+                            "Container memory limit is too low"
+                        ),
+                        "confidence": 0.5,
+                        "supporting_evidence_ids": [],
+                        "conflicting_evidence_ids": [],
+                        "missing_evidence": [
+                            "pod termination state"
+                        ],
+                    }
+                ],
+                "rationale_summary": (
+                    "Collect Pod termination evidence"
+                ),
+                "stop": False,
+                "stop_reason": None,
+                "next_probe": (
+                    "kubernetes_pod_state"
+                ),
+                "conclusion": None,
+            }
+        )
+    )
+    reasoner = LLMInvestigationReasoner(
+        gateway
+    )
+
+    decision = await reasoner.decide(
+        state().scope,
+        state(),
+    )
+
+    assert decision.next_probe.value == (
+        "kubernetes_pod_state"
+    )
+    assert len(gateway.requests) == 1
+
+    request = gateway.requests[0]
+    assert request.context.agent == (
+        "investigation"
+    )
+    assert request.context.require_json is True
+    assert request.temperature == 0.0
+    assert "kubernetes_patch" not in request.prompt
+    assert "allowed_probes" in request.prompt
+
+
+@pytest.mark.asyncio
+async def test_reasoner_rejects_unknown_or_mutating_probe():
+    gateway = FakeGateway(
+        json.dumps(
+            {
+                "hypotheses": [
+                    {
+                        "hypothesis_id": "bad",
+                        "cause": "Attempt a write",
+                        "confidence": 0.9,
+                    }
+                ],
+                "rationale_summary": "Patch the pod",
+                "stop": False,
+                "next_probe": "kubernetes_patch",
+            }
+        )
+    )
+    reasoner = LLMInvestigationReasoner(
+        gateway
+    )
+
+    with pytest.raises(
+        InvestigationReasonerError,
+        match="invalid decision",
+    ):
+        await reasoner.decide(
+            state().scope,
+            state(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_reasoner_error_does_not_echo_model_content():
+    secret = "super-secret-model-output"
+    reasoner = LLMInvestigationReasoner(
+        FakeGateway(secret)
+    )
+
+    with pytest.raises(
+        InvestigationReasonerError,
+    ) as captured:
+        await reasoner.decide(
+            state().scope,
+            state(),
+        )
+
+    assert secret not in str(
+        captured.value
+    )
+

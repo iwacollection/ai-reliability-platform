@@ -1,0 +1,59 @@
+from services.agent_runtime.app.tools.registry import (
+    ToolRegistry,
+)
+
+from services.agent_runtime.app.tools.manager import (
+    ToolManager,
+)
+
+from services.agent_runtime.app.tools.mock.echo import (
+    EchoTool,
+)
+
+from services.agent_runtime.app.tools.prometheus.tool import (
+    PrometheusTool,
+)
+
+from services.agent_runtime.app.tools.kubernetes.tool import (
+    KubernetesTool,
+)
+
+from services.agent_runtime.app.tools.kubernetes.change_tool import (
+    KubernetesChangeTool,
+)
+
+
+def create_tool_manager() -> ToolManager:
+
+
+    registry = ToolRegistry()
+
+
+    registry.register(
+        EchoTool()
+    )
+
+
+    registry.register(
+        PrometheusTool()
+    )
+
+
+    kubernetes = KubernetesTool()
+
+
+    registry.register(
+        kubernetes
+    )
+
+
+    registry.register(
+        KubernetesChangeTool(
+            kubernetes
+        )
+    )
+
+
+    return ToolManager(
+        registry
+    )

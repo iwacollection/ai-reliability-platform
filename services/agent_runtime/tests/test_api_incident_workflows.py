@@ -1,0 +1,772 @@
+from datetime import UTC, datetime, timedelta
+from typing import Any
+from uuid import uuid4
+
+import httpx
+import pytest
+from fastapi import FastAPI
+
+from services.agent_runtime.app.action.models import (
+    ActionPlan,
+    ActionType,
+)
+from services.agent_runtime.app.approval.models import (
+    ApprovalRequest,
+)
+from services.agent_runtime.app.incident.enums import (
+    IncidentStatus,
+)
+from services.agent_runtime.app.incident.state import (
+    IncidentState,
+)
+from services.agent_runtime.app.runtime.runtime import (
+    AgentRuntime,
+)
+from services.agent_runtime.app.security.models import (
+    OperatorRole,
+)
+from services.agent_runtime.app.verification.models import (
+    VerificationCheck,
+    VerificationSource,
+    VerificationStatus,
+)
+from services.agent_runtime.tests.api_security_support import (
+    ApiTestSecurityHarness,
+    wire_api_test_security,
+)
+
+
+@pytest.fixture
+def api_environment(
+    monkeypatch,
+    tmp_path,
+):
+    """Create an isolated API and temporary SQLite persistence."""
+
+    monkeypatch.chdir(
+        tmp_path
+    )
+
+    for name in (
+        "PROMETHEUS_URL",
+        "KUBERNETES_API_URL",
+        "KUBERNETES_SERVICE_HOST",
+        "KUBERNETES_SERVICE_PORT",
+        "KUBERNETES_SERVICE_PORT_HTTPS",
+    ):
+        monkeypatch.delenv(
+            name,
+            raising=False,
+        )
+
+    monkeypatch.setenv(
+        "PROMETHEUS_ALLOW_MOCK_FALLBACK",
+        "true",
+    )
+    monkeypatch.setenv(
+        "KUBERNETES_ALLOW_DRY_RUN_FALLBACK",
+        "true",
+    )
+
+    from services.agent_runtime.app.api import (
+        runtime as api_module,
+    )
+
+    isolated_runtime = AgentRuntime()
+    security = wire_api_test_security(
+        monkeypatch,
+        api_module,
+        isolated_runtime,
+    )
+
+    app = FastAPI()
+    app.include_router(
+        api_module.router
+    )
+
+    return (
+        app,
+        isolated_runtime,
+        security,
+    )
+
+
+def api_client(
+    app: FastAPI,
+) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(
+            app=app
+        ),
+        base_url="http://test",
+    )
+
+
+def workflow_path(
+    incident_id,
+) -> str:
+    return (
+        f"/incidents/{incident_id}/workflows"
+    )
+
+
+def action_plan() -> ActionPlan:
+    return ActionPlan(
+        type=(
+            ActionType.INCREASE_MEMORY_LIMIT
+        ),
+        target="payment-api",
+        namespace="payment",
+        cluster="production-a",
+    )
+
+
+async def save_incident(
+    runtime: AgentRuntime,
+    *,
+    status: IncidentStatus,
+) -> IncidentState:
+    incident = IncidentState(
+        status=status,
+    )
+
+    return await runtime.incident_store.save(
+        incident
+    )
+
+
+async def create_approved_request(
+    runtime: AgentRuntime,
+    security: ApiTestSecurityHarness,
+    *,
+    incident: IncidentState,
+    created_at: datetime,
+    label: str,
+) -> ApprovalRequest:
+    request = ApprovalRequest(
+        id=str(
+            uuid4()
+        ),
+        incident_id=incident.id,
+        action=action_plan(),
+        reason=(
+            f"Remediation attempt {label}"
+        ),
+        created_at=created_at,
+        updated_at=created_at,
+    )
+
+    await runtime.approval.manager.store.save(
+        request
+    )
+
+    return await runtime.approval.approve(
+        request.id,
+        operator_id=security.principal_id(
+            OperatorRole.APPROVER
+        ),
+        idempotency_key=(
+            f"approve:{request.id}"
+        ),
+        reason=(
+            f"Approved remediation attempt {label}"
+        ),
+    )
+
+
+async def create_execution(
+    runtime: AgentRuntime,
+    security: ApiTestSecurityHarness,
+    *,
+    incident: IncidentState,
+    approval: ApprovalRequest,
+    label: str,
+):
+    claim = await (
+        runtime.action_execution_service.claim(
+            approval_id=approval.id,
+            operator_id=security.principal_id(
+                OperatorRole.EXECUTOR
+            ),
+            idempotency_key=(
+                f"execute:{label}:{approval.id}"
+            ),
+            action=approval.action,
+            incident_id=incident.id,
+            metadata={
+                "test_attempt": label,
+            },
+        )
+    )
+
+    assert claim.created is True
+
+    return claim.execution
+
+
+async def pass_verification(
+    runtime: AgentRuntime,
+    *,
+    incident: IncidentState,
+    execution,
+):
+    claim = await (
+        runtime.verification.claim_verification(
+            action_execution_id=execution.id,
+            incident_id=incident.id,
+            action=execution.action.type.value,
+            target=execution.action.target,
+            attempt=1,
+            metadata={
+                "source": (
+                    "incident-workflow-api-test"
+                ),
+            },
+        )
+    )
+
+    assert claim.created is True
+
+    await runtime.verification.start(
+        claim.verification.id
+    )
+
+    return await runtime.verification.complete(
+        claim.verification.id,
+        status=VerificationStatus.PASSED,
+        checks=[
+            VerificationCheck(
+                name="workload_recovered",
+                source=(
+                    VerificationSource.WORKLOAD
+                ),
+                passed=True,
+                required=True,
+                observed_value="healthy",
+                expected_value="healthy",
+                message=(
+                    "Deterministic recovery evidence"
+                ),
+            )
+        ],
+        summary="Required recovery check passed",
+    )
+
+
+@pytest.mark.asyncio
+async def test_unknown_incident_returns_404(
+    api_environment,
+):
+    app, _, security = api_environment
+
+    async with api_client(
+        app
+    ) as client:
+        response = await client.get(
+            workflow_path(
+                uuid4()
+            ),
+            headers=security.headers(
+                OperatorRole.VIEWER
+            ),
+        )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == (
+        "Incident not found"
+    )
+
+
+@pytest.mark.asyncio
+async def test_existing_incident_without_workflow_is_explicit(
+    api_environment,
+):
+    app, runtime, security = api_environment
+    incident = await save_incident(
+        runtime,
+        status=IncidentStatus.CONFIRMED,
+    )
+
+    async with api_client(
+        app
+    ) as client:
+        response = await client.get(
+            workflow_path(
+                incident.id
+            ),
+            headers=security.headers(
+                OperatorRole.VIEWER
+            ),
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True
+    assert body["incident_id"] == str(
+        incident.id
+    )
+    assert body["workflow_status"] == (
+        "no_workflow"
+    )
+    assert body["workflow_success"] is False
+    assert body["terminal"] is False
+    assert body["follow_up_required"] is True
+    assert body[
+        "manual_reconciliation_required"
+    ] is False
+    assert body["current_workflow_approval_id"] is None
+    assert body["counts"] == {
+        "workflows": 0,
+        "approvals": 0,
+        "action_executions": 0,
+        "verifications": 0,
+        "manual_verifications": 0,
+        "orphan_action_executions": 0,
+        "orphan_verifications": 0,
+    }
+    assert body["consistency"] == {
+        "passed": True,
+        "issues": [],
+    }
+    assert body["workflows"] == []
+    assert body["unlinked_records"] == {
+        "action_executions": [],
+        "verifications": [],
+        "manual_verifications": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_multiple_attempts_use_latest_without_historical_conflict(
+    api_environment,
+):
+    app, runtime, security = api_environment
+    incident = await save_incident(
+        runtime,
+        status=IncidentStatus.HEALING,
+    )
+    started_at = datetime.now(
+        UTC
+    )
+
+    first_approval = await create_approved_request(
+        runtime,
+        security,
+        incident=incident,
+        created_at=started_at,
+        label="first",
+    )
+    first_execution = await create_execution(
+        runtime,
+        security,
+        incident=incident,
+        approval=first_approval,
+        label="first",
+    )
+    await runtime.action_execution_service.fail(
+        str(
+            first_execution.id
+        ),
+        {
+            "success": False,
+            "status": "failed",
+        },
+        error_type="InjectedFailure",
+        error_message=(
+            "First remediation attempt failed"
+        ),
+    )
+
+    second_approval = await create_approved_request(
+        runtime,
+        security,
+        incident=incident,
+        created_at=(
+            started_at
+            + timedelta(
+                seconds=1
+            )
+        ),
+        label="second",
+    )
+    second_execution = await create_execution(
+        runtime,
+        security,
+        incident=incident,
+        approval=second_approval,
+        label="second",
+    )
+    await runtime.action_execution_service.succeed(
+        str(
+            second_execution.id
+        ),
+        {
+            "success": True,
+            "status": "completed",
+        },
+    )
+    verification = await pass_verification(
+        runtime,
+        incident=incident,
+        execution=second_execution,
+    )
+
+    incident.update(
+        IncidentStatus.RESOLVED,
+        reason=(
+            "Second remediation attempt verified"
+        ),
+    )
+    await runtime.incident_store.update(
+        incident
+    )
+
+    async with api_client(
+        app
+    ) as client:
+        response = await client.get(
+            workflow_path(
+                incident.id
+            ),
+            headers=security.headers(
+                OperatorRole.VIEWER
+            ),
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True
+    assert body["workflow_success"] is True
+    assert body["workflow_status"] == "resolved"
+    assert body["terminal"] is True
+    assert body["follow_up_required"] is False
+    assert body[
+        "manual_reconciliation_required"
+    ] is False
+    assert body["consistency"] == {
+        "passed": True,
+        "issues": [],
+    }
+    assert body["current_workflow_approval_id"] == (
+        second_approval.id
+    )
+    assert body["counts"] == {
+        "workflows": 2,
+        "approvals": 2,
+        "action_executions": 2,
+        "verifications": 1,
+        "manual_verifications": 0,
+        "orphan_action_executions": 0,
+        "orphan_verifications": 0,
+    }
+    assert [
+        item["approval_id"]
+        for item in body["workflows"]
+    ] == [
+        first_approval.id,
+        second_approval.id,
+    ]
+    assert [
+        item["workflow_status"]
+        for item in body["workflows"]
+    ] == [
+        "action_failed",
+        "resolved",
+    ]
+    assert body["workflows"][0][
+        "consistency"
+    ] == {
+        "passed": True,
+        "issues": [],
+    }
+    assert body["workflows"][1][
+        "links"
+    ]["verification_id"] == str(
+        verification.id
+    )
+
+
+@pytest.mark.asyncio
+async def test_orphan_records_fail_closed_and_remain_visible(
+    api_environment,
+):
+    app, runtime, security = api_environment
+    incident = await save_incident(
+        runtime,
+        status=IncidentStatus.HEALING,
+    )
+
+    orphan_execution_claim = await (
+        runtime.action_execution_service.claim(
+            approval_id=str(
+                uuid4()
+            ),
+            operator_id=security.principal_id(
+                OperatorRole.EXECUTOR
+            ),
+            idempotency_key=(
+                f"orphan-execution:{uuid4()}"
+            ),
+            action=action_plan().model_copy(
+                update={
+                    "approved": True,
+                }
+            ),
+            incident_id=incident.id,
+        )
+    )
+    orphan_execution = (
+        orphan_execution_claim.execution
+    )
+
+    orphan_verification = await (
+        runtime.verification.create_verification(
+            incident_id=incident.id,
+            action_execution_id=uuid4(),
+            action=(
+                ActionType.INCREASE_MEMORY_LIMIT.value
+            ),
+            target="payment-api",
+            metadata={
+                "test_record": "orphan",
+            },
+        )
+    )
+    manual_verification = await (
+        runtime.verification.create_verification(
+            incident_id=incident.id,
+            action=(
+                ActionType.INCREASE_MEMORY_LIMIT.value
+            ),
+            target="payment-api",
+            metadata={
+                "test_record": "manual",
+            },
+        )
+    )
+
+    async with api_client(
+        app
+    ) as client:
+        response = await client.get(
+            workflow_path(
+                incident.id
+            ),
+            headers=security.headers(
+                OperatorRole.VIEWER
+            ),
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True
+    assert body["workflow_success"] is False
+    assert body["workflow_status"] == (
+        "inconsistent"
+    )
+    assert body[
+        "manual_reconciliation_required"
+    ] is True
+    assert body["follow_up_required"] is True
+    assert body["consistency"]["passed"] is False
+    assert any(
+        issue.startswith(
+            "orphan_action_execution:"
+        )
+        for issue in body["consistency"][
+            "issues"
+        ]
+    )
+    assert any(
+        issue.startswith(
+            "orphan_verification:"
+        )
+        for issue in body["consistency"][
+            "issues"
+        ]
+    )
+    assert body["counts"] == {
+        "workflows": 0,
+        "approvals": 0,
+        "action_executions": 1,
+        "verifications": 2,
+        "manual_verifications": 1,
+        "orphan_action_executions": 1,
+        "orphan_verifications": 1,
+    }
+    assert body["unlinked_records"][
+        "action_executions"
+    ][0]["id"] == str(
+        orphan_execution.id
+    )
+    assert body["unlinked_records"][
+        "verifications"
+    ][0]["id"] == str(
+        orphan_verification.id
+    )
+    assert body["unlinked_records"][
+        "manual_verifications"
+    ][0]["id"] == str(
+        manual_verification.id
+    )
+
+
+@pytest.mark.asyncio
+async def test_repeated_query_is_strictly_read_only(
+    api_environment,
+    monkeypatch,
+):
+    app, runtime, security = api_environment
+    incident = await save_incident(
+        runtime,
+        status=IncidentStatus.HEALING,
+    )
+    approval = await create_approved_request(
+        runtime,
+        security,
+        incident=incident,
+        created_at=datetime.now(
+            UTC
+        ),
+        label="read-only",
+    )
+    execution = await create_execution(
+        runtime,
+        security,
+        incident=incident,
+        approval=approval,
+        label="read-only",
+    )
+    await runtime.action_execution_service.succeed(
+        str(
+            execution.id
+        ),
+        {
+            "success": True,
+            "status": "completed",
+        },
+    )
+
+    async def forbidden_mutation(
+        *args,
+        **kwargs,
+    ):
+        pytest.fail(
+            "Incident Workflows query attempted a mutation"
+        )
+
+    mutation_targets: list[tuple[Any, str]] = [
+        (
+            runtime.action_runtime,
+            "execute",
+        ),
+        (
+            runtime.action_runtime,
+            "resume",
+        ),
+        (
+            runtime.action_runtime.executor,
+            "execute",
+        ),
+        (
+            runtime.approval,
+            "create_approval",
+        ),
+        (
+            runtime.approval,
+            "approve",
+        ),
+        (
+            runtime.approval,
+            "reject",
+        ),
+        (
+            runtime.action_execution_service,
+            "claim",
+        ),
+        (
+            runtime.action_execution_service,
+            "complete",
+        ),
+        (
+            runtime.verification,
+            "create_verification",
+        ),
+        (
+            runtime.verification,
+            "claim_verification",
+        ),
+        (
+            runtime.verification,
+            "start",
+        ),
+        (
+            runtime.verification,
+            "complete",
+        ),
+        (
+            runtime.verification_coordinator,
+            "run",
+        ),
+        (
+            runtime.verification_coordinator.collector,
+            "collect",
+        ),
+        (
+            runtime.incident_store,
+            "save",
+        ),
+        (
+            runtime.incident_store,
+            "update",
+        ),
+    ]
+
+    for target, attribute in mutation_targets:
+        monkeypatch.setattr(
+            target,
+            attribute,
+            forbidden_mutation,
+        )
+
+    async with api_client(
+        app
+    ) as client:
+        first_response = await client.get(
+            workflow_path(
+                incident.id
+            ),
+            headers=security.headers(
+                OperatorRole.VIEWER
+            ),
+        )
+        replay_response = await client.get(
+            workflow_path(
+                incident.id
+            ),
+            headers=security.headers(
+                OperatorRole.VIEWER
+            ),
+        )
+
+    assert first_response.status_code == 200
+    assert replay_response.status_code == 200
+    assert first_response.json() == (
+        replay_response.json()
+    )
+
+    body = first_response.json()
+    assert body["success"] is True
+    assert body["workflow_status"] == (
+        "awaiting_verification"
+    )
+    assert body["workflow_success"] is False
+    assert body["consistency"] == {
+        "passed": True,
+        "issues": [],
+    }
+    assert body["counts"]["workflows"] == 1
+    assert body["counts"][
+        "action_executions"
+    ] == 1
+    assert body["counts"]["verifications"] == 0

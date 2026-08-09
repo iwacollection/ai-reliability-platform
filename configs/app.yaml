@@ -2,11 +2,34 @@ app:
   name: AI Reliability Platform
   version: 0.1.0
 
+
 llm:
+
   provider: mock
+
   temperature: 0.0
+
   timeout: 30
 
+
+  gateway:
+
+    fallback_enabled: true
+
+    retry_attempts: 3
+
+    request_timeout: 30
+
+    rate_limit:
+
+      enabled: true
+
+      requests_per_minute: 60
+
+
+
 runtime:
+
   pipeline: sequential
+
   max_workers: 4

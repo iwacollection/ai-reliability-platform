@@ -1,0 +1,728 @@
+from typing import Any
+
+import httpx
+import pytest
+from fastapi import FastAPI
+
+from services.agent_runtime.app.incident.enums import (
+    IncidentStatus,
+)
+from services.agent_runtime.app.incident.state import (
+    IncidentState,
+)
+from services.agent_runtime.app.runtime.runtime import (
+    AgentRuntime,
+)
+from services.agent_runtime.app.verification.models import (
+    VerificationCheck,
+)
+
+
+class CountingCollector:
+    """Return deterministic checks and count real evidence collection."""
+
+    def __init__(
+        self,
+        *,
+        required_passed: bool | None = True,
+    ) -> None:
+        self.required_passed = (
+            required_passed
+        )
+        self.calls = 0
+
+    async def collect(
+        self,
+        probes,
+        context=None,
+    ) -> list[VerificationCheck]:
+        self.calls += 1
+
+        return [
+            VerificationCheck(
+                name=probe.name,
+                source=probe.source,
+                passed=(
+                    self.required_passed
+                    if probe.required
+                    else True
+                ),
+                required=probe.required,
+                observed_value=(
+                    "api-test-evidence"
+                ),
+                expected_value=(
+                    "profile-rule"
+                ),
+                message=(
+                    "Deterministic API verification result"
+                ),
+            )
+            for probe in probes
+        ]
+
+
+@pytest.fixture
+def api_environment(
+    monkeypatch,
+    tmp_path,
+):
+    """Create an isolated API and temporary SQLite persistence."""
+
+    monkeypatch.chdir(
+        tmp_path
+    )
+
+    from services.agent_runtime.app.api import (
+        runtime as api_module,
+    )
+
+    isolated_runtime = AgentRuntime()
+    monkeypatch.setattr(
+        api_module,
+        "runtime",
+        isolated_runtime,
+    )
+
+    app = FastAPI()
+    app.include_router(
+        api_module.router
+    )
+
+    return (
+        app,
+        isolated_runtime,
+    )
+
+
+def api_client(
+    app: FastAPI,
+) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(
+            app=app
+        ),
+        base_url="http://test",
+    )
+
+
+def approval_headers(
+    approval_id: str,
+) -> dict[str, str]:
+    return {
+        "X-Operator-ID": "sre-approver",
+        "Idempotency-Key": (
+            f"approval-decision:{approval_id}"
+        ),
+    }
+
+
+def execution_headers() -> dict[str, str]:
+    return {
+        "X-Operator-ID": "sre-executor",
+        "Idempotency-Key": (
+            "api-action-verification-key"
+        ),
+    }
+
+
+def healing_result() -> dict[str, Any]:
+    return {
+        "agent": "healing",
+        "success": True,
+        "score": 1.0,
+        "message": "increase memory limit",
+        "data": {
+            "action": (
+                "increase_memory_limit"
+            ),
+            "target": "payment-api",
+            "risk": "medium",
+            "reason": (
+                "Pod memory limit exceeded"
+            ),
+            "approval_required": True,
+        },
+    }
+
+
+async def create_pending_action(
+    runtime: AgentRuntime,
+):
+    incident = IncidentState()
+
+    plan, execution = await (
+        runtime.action_runtime.execute(
+            healing_result(),
+            incident=incident,
+            namespace="payment",
+            cluster="production-a",
+        )
+    )
+
+    assert execution["status"] == (
+        "pending_approval"
+    )
+
+    return (
+        incident,
+        plan,
+        execution["approval_id"],
+    )
+
+
+async def approve_action(
+    client: httpx.AsyncClient,
+    approval_id: str,
+) -> None:
+    response = await client.post(
+        f"/approvals/{approval_id}/approve",
+        json={
+            "reason": "Execution approved"
+        },
+        headers=approval_headers(
+            approval_id
+        ),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["approval"][
+        "status"
+    ] == "approved"
+
+
+def install_counting_executor(
+    monkeypatch,
+    runtime: AgentRuntime,
+):
+    original_execute = (
+        runtime.action_runtime.executor.execute
+    )
+    calls = {
+        "count": 0
+    }
+
+    async def counting_execute(
+        *args,
+        **kwargs,
+    ):
+        calls["count"] += 1
+        return await original_execute(
+            *args,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(
+        runtime.action_runtime.executor,
+        "execute",
+        counting_execute,
+    )
+
+    return calls
+
+
+def build_claim_metadata(
+    runtime: AgentRuntime,
+    *,
+    plan,
+    approval_id: str,
+    action_execution_id: str,
+) -> tuple[Any, dict[str, Any]]:
+    """Build the exact immutable claim payload produced by the API."""
+
+    profile = (
+        runtime.verification_profile_factory.create(
+            plan,
+            namespace=plan.namespace,
+            cluster=plan.cluster,
+        )
+    )
+    metadata: dict[str, Any] = {
+        "source": "api",
+        "trigger": "post_action_execution",
+        "approval_id": approval_id,
+        "profile": profile.name,
+        "namespace": profile.namespace,
+        "cluster": profile.cluster,
+        "required_probes": [
+            probe.name
+            for probe in profile.probes
+            if probe.required
+        ],
+        "optional_probes": [
+            probe.name
+            for probe in profile.probes
+            if not probe.required
+        ],
+        "action_execution_id": (
+            action_execution_id
+        ),
+    }
+
+    return (
+        profile,
+        metadata,
+    )
+
+
+@pytest.mark.asyncio
+async def test_successful_api_replay_executes_action_and_probes_once(
+    api_environment,
+    monkeypatch,
+):
+    app, runtime = api_environment
+    incident, _, approval_id = (
+        await create_pending_action(
+            runtime
+        )
+    )
+    executor_calls = install_counting_executor(
+        monkeypatch,
+        runtime,
+    )
+    collector = CountingCollector(
+        required_passed=True
+    )
+    runtime.verification_coordinator.collector = (
+        collector
+    )
+    path = (
+        f"/approvals/{approval_id}/resume"
+    )
+    headers = execution_headers()
+
+    async with api_client(
+        app
+    ) as client:
+        await approve_action(
+            client,
+            approval_id,
+        )
+        first_response = await client.post(
+            path,
+            headers=headers,
+        )
+        replay_response = await client.post(
+            path,
+            headers=headers,
+        )
+
+    assert first_response.status_code == 200
+    assert replay_response.status_code == 200
+    assert executor_calls["count"] == 1
+    assert collector.calls == 1
+
+    first = first_response.json()
+    replay = replay_response.json()
+
+    assert first["success"] is True
+    assert first["workflow_success"] is True
+    assert first["workflow_status"] == "resolved"
+    assert first[
+        "verification_follow_up_required"
+    ] is False
+    assert first[
+        "manual_reconciliation_required"
+    ] is False
+    assert first["verification_error"] is None
+    assert first["incident"]["id"] == str(
+        incident.id
+    )
+    assert first["incident"][
+        "status"
+    ] == "resolved"
+    assert first["verification"][
+        "status"
+    ] == "passed"
+    assert first["execution"][
+        "execution_status"
+    ] == "succeeded"
+    assert first["verification"][
+        "action_execution_id"
+    ] == first["execution"][
+        "execution_id"
+    ]
+
+    assert replay["workflow_success"] is True
+    assert replay["verification"][
+        "id"
+    ] == first["verification"]["id"]
+    assert replay["execution"][
+        "execution_id"
+    ] == first["execution"][
+        "execution_id"
+    ]
+    assert replay["execution"][
+        "idempotent_replay"
+    ] is True
+
+    stored = await (
+        runtime.verification
+        .get_by_action_execution(
+            first["execution"][
+                "execution_id"
+            ]
+        )
+    )
+    assert stored is not None
+    assert str(stored.id) == first[
+        "verification"
+    ]["id"]
+
+
+@pytest.mark.asyncio
+async def test_inconclusive_evidence_is_replayed_without_false_success(
+    api_environment,
+):
+    app, runtime = api_environment
+    incident, _, approval_id = (
+        await create_pending_action(
+            runtime
+        )
+    )
+    collector = CountingCollector(
+        required_passed=None
+    )
+    runtime.verification_coordinator.collector = (
+        collector
+    )
+    path = (
+        f"/approvals/{approval_id}/resume"
+    )
+
+    async with api_client(
+        app
+    ) as client:
+        await approve_action(
+            client,
+            approval_id,
+        )
+        first_response = await client.post(
+            path,
+            headers=execution_headers(),
+        )
+        replay_response = await client.post(
+            path,
+            headers=execution_headers(),
+        )
+
+    assert first_response.status_code == 200
+    assert replay_response.status_code == 200
+    assert collector.calls == 1
+
+    first = first_response.json()
+    replay = replay_response.json()
+
+    assert first["success"] is True
+    assert first["workflow_success"] is False
+    assert first["workflow_status"] == (
+        "verification_inconclusive"
+    )
+    assert first["incident"]["id"] == str(
+        incident.id
+    )
+    assert first["incident"][
+        "status"
+    ] == "healing"
+    assert first["verification"][
+        "status"
+    ] == "inconclusive"
+    assert first[
+        "verification_follow_up_required"
+    ] is True
+    assert first[
+        "manual_reconciliation_required"
+    ] is False
+    assert first["verification_error"] is None
+    assert replay["verification"][
+        "id"
+    ] == first["verification"]["id"]
+
+
+@pytest.mark.asyncio
+async def test_pending_claim_replay_returns_202_without_probes(
+    api_environment,
+    monkeypatch,
+):
+    app, runtime = api_environment
+    incident, plan, approval_id = (
+        await create_pending_action(
+            runtime
+        )
+    )
+    executor_calls = install_counting_executor(
+        monkeypatch,
+        runtime,
+    )
+    headers = execution_headers()
+
+    async with api_client(
+        app
+    ) as client:
+        await approve_action(
+            client,
+            approval_id,
+        )
+
+        execution = await (
+            runtime.action_runtime.resume(
+                approval_id,
+                incident=incident,
+                operator_id=(
+                    headers["X-Operator-ID"]
+                ),
+                idempotency_key=(
+                    headers["Idempotency-Key"]
+                ),
+            )
+        )
+
+        assert execution[
+            "execution_status"
+        ] == "succeeded"
+
+        execution_id = execution[
+            "execution_id"
+        ]
+        profile, metadata = (
+            build_claim_metadata(
+                runtime,
+                plan=plan,
+                approval_id=approval_id,
+                action_execution_id=(
+                    execution_id
+                ),
+            )
+        )
+        claim = await (
+            runtime.verification_runtime.claim(
+                action_execution_id=(
+                    execution_id
+                ),
+                incident_id=incident.id,
+                action=profile.action.value,
+                target=profile.target,
+                attempt=1,
+                metadata=metadata,
+            )
+        )
+        assert claim.created is True
+
+        collector = CountingCollector()
+        runtime.verification_coordinator.collector = (
+            collector
+        )
+
+        response = await client.post(
+            f"/approvals/{approval_id}/resume",
+            headers=headers,
+        )
+
+    assert response.status_code == 202
+    assert executor_calls["count"] == 1
+    assert collector.calls == 0
+
+    body = response.json()
+    assert body["success"] is False
+    assert body["workflow_success"] is False
+    assert body["workflow_status"] == (
+        "verification_pending"
+    )
+    assert body["verification"]["id"] == str(
+        claim.verification.id
+    )
+    assert body["verification"][
+        "status"
+    ] == "pending"
+    assert body[
+        "verification_follow_up_required"
+    ] is True
+    assert body[
+        "manual_reconciliation_required"
+    ] is False
+
+
+@pytest.mark.asyncio
+async def test_persisted_pass_recovers_after_incident_sync_failure(
+    api_environment,
+    monkeypatch,
+):
+    app, runtime = api_environment
+    incident, _, approval_id = (
+        await create_pending_action(
+            runtime
+        )
+    )
+    executor_calls = install_counting_executor(
+        monkeypatch,
+        runtime,
+    )
+    collector = CountingCollector(
+        required_passed=True
+    )
+    runtime.verification_coordinator.collector = (
+        collector
+    )
+    original_update = (
+        runtime.incident_store.update
+    )
+    failed_once = {
+        "value": False
+    }
+
+    async def fail_first_resolved_update(
+        incident_state,
+        *args,
+        **kwargs,
+    ):
+        if (
+            incident_state.status
+            == IncidentStatus.RESOLVED
+            and not failed_once["value"]
+        ):
+            failed_once["value"] = True
+            raise RuntimeError(
+                "Injected Incident sync failure"
+            )
+
+        return await original_update(
+            incident_state,
+            *args,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(
+        runtime.incident_store,
+        "update",
+        fail_first_resolved_update,
+    )
+    path = (
+        f"/approvals/{approval_id}/resume"
+    )
+    headers = execution_headers()
+
+    async with api_client(
+        app
+    ) as client:
+        await approve_action(
+            client,
+            approval_id,
+        )
+        first_response = await client.post(
+            path,
+            headers=headers,
+        )
+        replay_response = await client.post(
+            path,
+            headers=headers,
+        )
+
+    assert first_response.status_code == 503
+    assert replay_response.status_code == 200
+    assert executor_calls["count"] == 1
+    assert collector.calls == 1
+    assert failed_once["value"] is True
+
+    first = first_response.json()
+    replay = replay_response.json()
+
+    assert first["success"] is False
+    assert first["workflow_success"] is False
+    assert first["workflow_status"] == (
+        "verification_reconciliation_required"
+    )
+    assert first["verification"][
+        "status"
+    ] == "passed"
+    assert first["incident"][
+        "status"
+    ] == "healing"
+    assert first[
+        "verification_follow_up_required"
+    ] is True
+    assert first[
+        "manual_reconciliation_required"
+    ] is True
+    assert first["verification_error"][
+        "type"
+    ] == "VerificationIncidentSyncError"
+
+    assert replay["success"] is True
+    assert replay["workflow_success"] is True
+    assert replay["workflow_status"] == "resolved"
+    assert replay["verification_error"] is None
+    assert replay["verification"][
+        "id"
+    ] == first["verification"]["id"]
+    assert replay["incident"]["id"] == str(
+        incident.id
+    )
+    assert replay["incident"][
+        "status"
+    ] == "resolved"
+    assert replay[
+        "manual_reconciliation_required"
+    ] is False
+
+
+@pytest.mark.asyncio
+async def test_indeterminate_action_never_starts_verification(
+    api_environment,
+    monkeypatch,
+):
+    app, runtime = api_environment
+    _, _, approval_id = (
+        await create_pending_action(
+            runtime
+        )
+    )
+    executor_calls = {
+        "count": 0
+    }
+
+    async def indeterminate_execute(
+        *args,
+        **kwargs,
+    ):
+        executor_calls["count"] += 1
+        raise RuntimeError(
+            "External action outcome is unknown"
+        )
+
+    monkeypatch.setattr(
+        runtime.action_runtime.executor,
+        "execute",
+        indeterminate_execute,
+    )
+    collector = CountingCollector()
+    runtime.verification_coordinator.collector = (
+        collector
+    )
+
+    async with api_client(
+        app
+    ) as client:
+        await approve_action(
+            client,
+            approval_id,
+        )
+        response = await client.post(
+            f"/approvals/{approval_id}/resume",
+            headers=execution_headers(),
+        )
+
+    assert response.status_code == 503
+    assert executor_calls["count"] == 1
+    assert collector.calls == 0
+
+    body = response.json()
+    assert body["success"] is False
+    assert body["workflow_success"] is False
+    assert body["workflow_status"] == (
+        "action_indeterminate"
+    )
+    assert body["verification"] is None
+    assert body["verification_required"] is False
+    assert body[
+        "manual_reconciliation_required"
+    ] is True

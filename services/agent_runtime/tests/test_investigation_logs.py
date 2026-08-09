@@ -1,0 +1,663 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from types import SimpleNamespace
+from urllib.parse import parse_qs, urlparse
+
+import httpx
+import pytest
+
+from services.agent_runtime.app.investigation.evidence_time import (
+    InvestigationEvidenceTimePolicy,
+)
+from services.agent_runtime.app.investigation.models import (
+    InvestigationProbe,
+    InvestigationScope,
+    InvestigationState,
+)
+from services.agent_runtime.app.investigation.probes import (
+    InvestigationProbeResponseError,
+    ReadOnlyInvestigationProbeExecutor,
+)
+from services.agent_runtime.app.investigation.reasoner import (
+    LLMInvestigationReasoner,
+)
+from services.agent_runtime.app.tools.kubernetes.tool import (
+    KubernetesQueryError,
+    KubernetesTool,
+)
+from services.agent_runtime.app.tools.manager import (
+    ToolManager,
+)
+from services.agent_runtime.app.tools.registry import (
+    ToolRegistry,
+)
+
+
+NOW = datetime(
+    2026,
+    8,
+    10,
+    13,
+    0,
+    tzinfo=UTC,
+)
+
+
+def scope() -> InvestigationScope:
+    return InvestigationScope(
+        alert_name="PodRestartHigh",
+        alert_message="payment-api is restarting",
+        event_occurred_at=NOW,
+        resource="payment-api",
+        namespace="payment",
+        cluster="benchmark-lab",
+    )
+
+
+def pod_payload(
+    *,
+    containers=None,
+):
+    if containers is None:
+        containers = [
+            {
+                "name": "payment-api",
+                "ready": False,
+                "restartCount": 9,
+                "state": {
+                    "waiting": {
+                        "reason": "CrashLoopBackOff",
+                    }
+                },
+                "lastState": {
+                    "terminated": {
+                        "reason": "Error",
+                        "finishedAt": (
+                            "2026-08-10T12:59:30Z"
+                        ),
+                    }
+                },
+                "image": "payment-api:v2",
+                "imageID": "sha256:test",
+            }
+        ]
+
+    return {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "payment-api",
+            "namespace": "payment",
+            "uid": "pod-uid",
+            "resourceVersion": "123",
+        },
+        "spec": {
+            "nodeName": "worker-1",
+        },
+        "status": {
+            "phase": "Running",
+            "conditions": [],
+            "containerStatuses": containers,
+        },
+    }
+
+
+class FakeToolManager:
+    def __init__(
+        self,
+        result,
+    ):
+        self.result = result
+        self.calls = []
+
+    async def call(
+        self,
+        name,
+        context=None,
+        **kwargs,
+    ):
+        self.calls.append(
+            {
+                "name": name,
+                "context": context,
+                "kwargs": kwargs,
+            }
+        )
+
+        return self.result
+
+
+def valid_log_result(
+    *,
+    excerpt=(
+        "2026-08-10T12:59:30Z "
+        "panic: invalid configuration\n"
+        "password=[REDACTED]"
+    ),
+):
+    return {
+        "success": True,
+        "source": "kubernetes",
+        "mode": "read_only",
+        "production_signal": True,
+        "observed_at": NOW.isoformat(),
+        "action": "previous_logs",
+        "resource": "pod",
+        "target": "payment-api",
+        "namespace": "payment",
+        "cluster": "benchmark-lab",
+        "data": {
+            "container_name": "payment-api",
+            "previous": True,
+            "line_count": 2,
+            "truncated": False,
+            "redaction_count": 1,
+            "excerpt": excerpt,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_previous_logs_probe_has_fixed_platform_owned_call():
+    result = valid_log_result()
+    tools = FakeToolManager(
+        result
+    )
+    context = SimpleNamespace(
+        tools=tools,
+        trace=None,
+    )
+
+    evidence = await (
+        ReadOnlyInvestigationProbeExecutor()
+        .collect(
+            context,
+            scope(),
+            InvestigationProbe.KUBERNETES_PREVIOUS_CONTAINER_LOGS,
+        )
+    )
+
+    assert tools.calls == [
+        {
+            "name": "kubernetes",
+            "context": context,
+            "kwargs": {
+                "action": "previous_logs",
+                "resource": "pod",
+                "target": "payment-api",
+                "namespace": "payment",
+                "cluster": "benchmark-lab",
+            },
+        }
+    ]
+
+    assert evidence.trusted is True
+    assert evidence.production_signal is True
+    assert evidence.source == "kubernetes"
+    assert (
+        evidence.facts["temporal_basis"]
+        == "previous_container"
+    )
+    assert (
+        evidence.facts["container_name"]
+        == "payment-api"
+    )
+    assert evidence.facts["previous"] is True
+    assert (
+        "panic: invalid configuration"
+        in evidence.facts["log_excerpt"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_investigation_boundary_redacts_forged_secret_again():
+    secret = "super-secret-value"
+    tools = FakeToolManager(
+        valid_log_result(
+            excerpt=(
+                "panic: startup failure\n"
+                f"password={secret}\n"
+                "token=abcdefghijk12345"
+            )
+        )
+    )
+
+    evidence = await (
+        ReadOnlyInvestigationProbeExecutor()
+        .collect(
+            SimpleNamespace(
+                tools=tools,
+                trace=None,
+            ),
+            scope(),
+            InvestigationProbe.KUBERNETES_PREVIOUS_CONTAINER_LOGS,
+        )
+    )
+
+    serialized = str(
+        evidence.model_dump(
+            mode="json"
+        )
+    )
+
+    assert secret not in serialized
+    assert "abcdefghijk12345" not in serialized
+    assert "[REDACTED]" in serialized
+    assert (
+        evidence.facts["redaction_count"]
+        >= 3
+    )
+
+
+@pytest.mark.asyncio
+async def test_logs_probe_rejects_non_previous_or_oversized_tool_contract():
+    invalid = valid_log_result()
+    invalid["data"] = dict(
+        invalid["data"]
+    )
+    invalid["data"]["previous"] = False
+
+    with pytest.raises(
+        InvestigationProbeResponseError,
+        match="previous-container",
+    ):
+        await (
+            ReadOnlyInvestigationProbeExecutor()
+            .collect(
+                SimpleNamespace(
+                    tools=FakeToolManager(
+                        invalid
+                    ),
+                    trace=None,
+                ),
+                scope(),
+                InvestigationProbe.KUBERNETES_PREVIOUS_CONTAINER_LOGS,
+            )
+        )
+
+    oversized = valid_log_result(
+        excerpt=(
+            "x" * 4001
+        )
+    )
+
+    with pytest.raises(
+        InvestigationProbeResponseError,
+        match="too large",
+    ):
+        await (
+            ReadOnlyInvestigationProbeExecutor()
+            .collect(
+                SimpleNamespace(
+                    tools=FakeToolManager(
+                        oversized
+                    ),
+                    trace=None,
+                ),
+                scope(),
+                InvestigationProbe.KUBERNETES_PREVIOUS_CONTAINER_LOGS,
+            )
+        )
+
+
+def test_previous_logs_have_distinct_temporal_basis():
+    policy = (
+        InvestigationEvidenceTimePolicy()
+    )
+
+    assert (
+        policy.temporal_basis(
+            scope=scope(),
+            probe=(
+                InvestigationProbe
+                .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+            ),
+        )
+        == "previous_container"
+    )
+
+    assert (
+        policy.query_time(
+            scope=scope(),
+            probe=(
+                InvestigationProbe
+                .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+            ),
+        )
+        is None
+    )
+
+
+def test_reasoner_exposes_symbolic_log_probe_without_raw_log_parameters():
+    current_scope = scope()
+
+    prompt = (
+        LLMInvestigationReasoner
+        ._build_prompt(
+            scope=current_scope,
+            state=InvestigationState(
+                scope=current_scope
+            ),
+        )
+    )
+
+    assert (
+        "kubernetes_previous_container_logs"
+        in prompt
+    )
+
+    assert "tailLines" not in prompt
+    assert "limitBytes" not in prompt
+    assert "previous=true" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_kubernetes_previous_logs_are_bounded_redacted_and_fixed():
+    seen = []
+
+    raw_password = (
+        "dont-print-this-password"
+    )
+
+    raw_token = (
+        "abcdefghijk123456789"
+    )
+
+    def handler(
+        request: httpx.Request,
+    ) -> httpx.Response:
+        seen.append(
+            str(
+                request.url
+            )
+        )
+
+        if (
+            request.url.path
+            == (
+                "/api/v1/namespaces/payment/"
+                "pods/payment-api"
+            )
+        ):
+            return httpx.Response(
+                200,
+                json=pod_payload(),
+            )
+
+        if (
+            request.url.path
+            == (
+                "/api/v1/namespaces/payment/"
+                "pods/payment-api/log"
+            )
+        ):
+            return httpx.Response(
+                200,
+                text=(
+                    "2026-08-10T12:59:30Z "
+                    "panic: invalid configuration MAX_CONNECTIONS\n"
+                    f"password={raw_password}\n"
+                    f"token={raw_token}\n"
+                    "Authorization: Bearer abcdefghijklmnop"
+                ),
+                headers={
+                    "content-type": (
+                        "text/plain; charset=utf-8"
+                    )
+                },
+            )
+
+        return httpx.Response(
+            404
+        )
+
+    transport = httpx.MockTransport(
+        handler
+    )
+
+    async with httpx.AsyncClient(
+        transport=transport
+    ) as client:
+        tool = KubernetesTool(
+            api_url="https://kubernetes.test",
+            bearer_token="test-token",
+            cluster_name="benchmark-lab",
+            allow_dry_run_fallback=False,
+            client=client,
+            clock=lambda: NOW,
+        )
+
+        result = await tool.execute(
+            action="previous_logs",
+            resource="pod",
+            target="payment-api",
+            namespace="payment",
+            # These untrusted extras are deliberately ignored.
+            container="attacker-selected",
+            tail_lines=999999,
+        )
+
+    assert len(
+        seen
+    ) == 2
+
+    parsed = urlparse(
+        seen[1]
+    )
+
+    params = parse_qs(
+        parsed.query
+    )
+
+    assert params == {
+        "container": [
+            "payment-api"
+        ],
+        "previous": [
+            "true"
+        ],
+        "tailLines": [
+            "80"
+        ],
+        "limitBytes": [
+            "16384"
+        ],
+        "timestamps": [
+            "true"
+        ],
+    }
+
+    assert (
+        result["source"]
+        == "kubernetes"
+    )
+    assert (
+        result["mode"]
+        == "read_only"
+    )
+    assert (
+        result["production_signal"]
+        is True
+    )
+
+    data = result["data"]
+
+    assert (
+        data["container_name"]
+        == "payment-api"
+    )
+    assert data["previous"] is True
+    assert (
+        "panic: invalid configuration"
+        in data["excerpt"]
+    )
+    assert raw_password not in str(
+        result
+    )
+    assert raw_token not in str(
+        result
+    )
+    assert (
+        "abcdefghijklmnop"
+        not in str(
+            result
+        )
+    )
+    assert "[REDACTED]" in (
+        data["excerpt"]
+    )
+    assert (
+        data["redaction_count"]
+        >= 3
+    )
+
+
+@pytest.mark.asyncio
+async def test_kubernetes_previous_logs_fail_closed_on_ambiguous_container():
+    containers = [
+        {
+            "name": "app",
+            "restartCount": 3,
+            "lastState": {
+                "terminated": {
+                    "reason": "Error"
+                }
+            },
+        },
+        {
+            "name": "sidecar",
+            "restartCount": 2,
+            "lastState": {
+                "terminated": {
+                    "reason": "Error"
+                }
+            },
+        },
+    ]
+
+    log_calls = 0
+
+    def handler(
+        request: httpx.Request,
+    ) -> httpx.Response:
+        nonlocal log_calls
+
+        if request.url.path.endswith(
+            "/log"
+        ):
+            log_calls += 1
+
+        return httpx.Response(
+            200,
+            json=pod_payload(
+                containers=containers
+            ),
+        )
+
+    transport = httpx.MockTransport(
+        handler
+    )
+
+    async with httpx.AsyncClient(
+        transport=transport
+    ) as client:
+        tool = KubernetesTool(
+            api_url="https://kubernetes.test",
+            bearer_token="test-token",
+            allow_dry_run_fallback=False,
+            client=client,
+            clock=lambda: NOW,
+        )
+
+        with pytest.raises(
+            KubernetesQueryError,
+            match="selection is ambiguous",
+        ):
+            await tool.execute(
+                action="previous_logs",
+                resource="pod",
+                target="payment-api",
+                namespace="payment",
+            )
+
+    assert log_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_real_tool_manager_path_returns_trusted_redacted_log_evidence():
+    raw_secret = (
+        "another-secret-value"
+    )
+
+    def handler(
+        request: httpx.Request,
+    ) -> httpx.Response:
+        if request.url.path.endswith(
+            "/log"
+        ):
+            return httpx.Response(
+                200,
+                text=(
+                    "panic: invalid configuration\n"
+                    f"client_secret={raw_secret}"
+                ),
+            )
+
+        return httpx.Response(
+            200,
+            json=pod_payload(),
+        )
+
+    transport = httpx.MockTransport(
+        handler
+    )
+
+    async with httpx.AsyncClient(
+        transport=transport
+    ) as client:
+        registry = ToolRegistry()
+        registry.register(
+            KubernetesTool(
+                api_url="https://kubernetes.test",
+                bearer_token="test-token",
+                cluster_name="benchmark-lab",
+                allow_dry_run_fallback=False,
+                client=client,
+                clock=lambda: NOW,
+            )
+        )
+
+        manager = ToolManager(
+            registry
+        )
+
+        context = SimpleNamespace(
+            tools=manager,
+            trace=None,
+        )
+
+        evidence = await (
+            ReadOnlyInvestigationProbeExecutor()
+            .collect(
+                context,
+                scope(),
+                (
+                    InvestigationProbe
+                    .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+                ),
+            )
+        )
+
+    serialized = str(
+        evidence.model_dump(
+            mode="json"
+        )
+    )
+
+    assert evidence.trusted is True
+    assert raw_secret not in serialized
+    assert (
+        "panic: invalid configuration"
+        in evidence.facts["log_excerpt"]
+    )

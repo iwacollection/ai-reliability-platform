@@ -6,6 +6,9 @@ from services.agent_runtime.app.evaluation.scenario.models import (
 def create_pod_oom_killed_scenario() -> ScenarioDefinition:
     """
     Pod OOMKilled incident scenario.
+
+    Resource scope is explicit so replayed remediation and verification use
+    the same namespace and cluster without falling back to a default scope.
     """
 
     return ScenarioDefinition(
@@ -33,6 +36,14 @@ def create_pod_oom_killed_scenario() -> ScenarioDefinition:
 
             "resource":
             "payment-api",
+
+
+            "namespace":
+            "payment",
+
+
+            "cluster":
+            "production-a",
 
         },
 

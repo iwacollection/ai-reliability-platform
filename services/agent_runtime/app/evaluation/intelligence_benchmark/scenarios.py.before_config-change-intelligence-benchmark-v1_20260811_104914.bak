@@ -1,0 +1,1518 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime
+
+from services.agent_runtime.app.evaluation.intelligence_benchmark.engine import (
+    BenchmarkScenario,
+)
+from services.agent_runtime.app.investigation.models import (
+    InvestigationProbe,
+    InvestigationStopReason,
+)
+
+
+def _all_probes(
+    *,
+    pod_state,
+    working_set,
+    memory_limit,
+    restart_count,
+):
+    return {
+        InvestigationProbe.KUBERNETES_POD_STATE: (
+            pod_state
+        ),
+        InvestigationProbe.PROMETHEUS_MEMORY_WORKING_SET: {
+            "value_sum": float(
+                working_set
+            ),
+        },
+        InvestigationProbe.PROMETHEUS_MEMORY_LIMIT: {
+            "value_sum": float(
+                memory_limit
+            ),
+        },
+        InvestigationProbe.PROMETHEUS_RESTART_COUNT: {
+            "value_sum": float(
+                restart_count
+            ),
+        },
+    }
+
+
+SCENARIOS = [
+    BenchmarkScenario(
+        key="oom_limit_pressure",
+        title=(
+            "Clear OOM with memory pressure near container limit"
+        ),
+        alert_name="PodOOMKilled",
+        alert_message=(
+            "payment-api restarted unexpectedly"
+        ),
+        evidence_by_probe=_all_probes(
+            pod_state={
+                "phase": "Running",
+                "ready": False,
+                "scheduled": True,
+                "oom_killed": True,
+                "max_restart_count": 7,
+                "state_reasons": (
+                    "CrashLoopBackOff"
+                ),
+                "last_termination_reasons": (
+                    "OOMKilled"
+                ),
+            },
+            working_set=530_000_000,
+            memory_limit=536_870_912,
+            restart_count=7,
+        ),
+        hidden_expected_stop_reason=(
+            InvestigationStopReason.SUFFICIENT_EVIDENCE
+        ),
+        hidden_required_probes=[
+            InvestigationProbe.KUBERNETES_POD_STATE,
+            InvestigationProbe.PROMETHEUS_MEMORY_LIMIT,
+        ],
+        hidden_preferred_first_probes=[
+            InvestigationProbe.KUBERNETES_POD_STATE,
+        ],
+        hidden_root_cause_keyword_groups=[
+            [
+                "memory",
+                "内存",
+            ],
+            [
+                "limit",
+                "限制",
+                "oom",
+            ],
+        ],
+        hidden_max_reasonable_tool_calls=4,
+    ),
+    BenchmarkScenario(
+        key="crashloop_not_memory",
+        title=(
+            "CrashLoop with normal memory should not be mislabeled as OOM"
+        ),
+        alert_name="PodRestartHigh",
+        alert_message=(
+            "payment-api restart count is increasing"
+        ),
+        evidence_by_probe={
+            **_all_probes(
+                pod_state={
+                    "phase": "Running",
+                    "ready": False,
+                    "scheduled": True,
+                    "oom_killed": False,
+                    "max_restart_count": 9,
+                    "state_reasons": (
+                        "CrashLoopBackOff"
+                    ),
+                    "last_termination_reasons": (
+                        "Error"
+                    ),
+                },
+                working_set=120_000_000,
+                memory_limit=536_870_912,
+                restart_count=9,
+            ),
+            (
+                InvestigationProbe
+                .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+            ): "unavailable",
+        },
+        hidden_expected_stop_reason=(
+            InvestigationStopReason.INSUFFICIENT_EVIDENCE
+        ),
+        hidden_required_probes=[
+            InvestigationProbe.KUBERNETES_POD_STATE,
+            InvestigationProbe.PROMETHEUS_MEMORY_WORKING_SET,
+        ],
+        hidden_preferred_first_probes=[
+            InvestigationProbe.KUBERNETES_POD_STATE,
+            InvestigationProbe.PROMETHEUS_RESTART_COUNT,
+        ],
+        hidden_missing_capability_keywords=[
+            "log",
+            "日志",
+            "stderr",
+            "stdout",
+            "container output",
+        ],
+        hidden_max_reasonable_tool_calls=4,
+    ),
+    BenchmarkScenario(
+        key="conflicting_oom_signal",
+        title=(
+            "Alert suggests OOM while bounded evidence does not confirm it"
+        ),
+        alert_name="PodOOMKilled",
+        alert_message=(
+            "OOM-related alert fired for payment-api"
+        ),
+        evidence_by_probe=_all_probes(
+            pod_state={
+                "phase": "Running",
+                "ready": True,
+                "scheduled": True,
+                "oom_killed": False,
+                "max_restart_count": 1,
+                "state_reasons": "",
+                "last_termination_reasons": (
+                    "Completed"
+                ),
+            },
+            working_set=470_000_000,
+            memory_limit=536_870_912,
+            restart_count=1,
+        ),
+        hidden_expected_stop_reason=(
+            InvestigationStopReason.INSUFFICIENT_EVIDENCE
+        ),
+        hidden_required_probes=[
+            InvestigationProbe.KUBERNETES_POD_STATE,
+            InvestigationProbe.PROMETHEUS_MEMORY_LIMIT,
+        ],
+        hidden_preferred_first_probes=[
+            InvestigationProbe.KUBERNETES_POD_STATE,
+        ],
+        hidden_max_reasonable_tool_calls=4,
+    ),
+    BenchmarkScenario(
+        key="crashloop_previous_log_rca",
+        title=(
+            "CrashLoop previous-container log provides causal startup evidence"
+        ),
+        alert_name="PodRestartHigh",
+        alert_message=(
+            "payment-api restart count is increasing"
+        ),
+        evidence_by_probe={
+            **_all_probes(
+                pod_state={
+                    "phase": "Running",
+                    "ready": False,
+                    "scheduled": True,
+                    "oom_killed": False,
+                    "max_restart_count": 9,
+                    "state_reasons": (
+                        "CrashLoopBackOff"
+                    ),
+                    "last_termination_reasons": (
+                        "Error"
+                    ),
+                },
+                working_set=120_000_000,
+                memory_limit=536_870_912,
+                restart_count=9,
+            ),
+            (
+                InvestigationProbe
+                .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+            ): {
+                "temporal_basis": (
+                    "previous_container"
+                ),
+                "container_name": (
+                    "payment-api"
+                ),
+                "previous": True,
+                "log_line_count": 2,
+                "tool_truncated": False,
+                "evidence_truncated": False,
+                "redaction_count": 1,
+                "log_excerpt": (
+                    "panic: invalid configuration: "
+                    "MAX_CONNECTIONS must be >= 1\n"
+                    "password=[REDACTED]"
+                ),
+            },
+        },
+        hidden_expected_stop_reason=(
+            InvestigationStopReason.SUFFICIENT_EVIDENCE
+        ),
+        hidden_required_probes=[
+            (
+                InvestigationProbe
+                .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+            ),
+        ],
+        hidden_preferred_first_probes=[
+            (
+                InvestigationProbe
+                .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+            ),
+            InvestigationProbe.KUBERNETES_POD_STATE,
+            InvestigationProbe.PROMETHEUS_RESTART_COUNT,
+        ],
+        hidden_root_cause_keyword_groups=[
+            [
+                "panic",
+            ],
+            [
+                "config",
+                "configuration",
+            ],
+        ],
+        hidden_max_reasonable_tool_calls=4,
+    ),
+    BenchmarkScenario(
+        key="memory_false_alarm",
+        title=(
+            "Healthy memory state should drive safe abstention"
+        ),
+        alert_name="PodMemoryHigh",
+        alert_message=(
+            "payment-api memory alert fired"
+        ),
+        evidence_by_probe=_all_probes(
+            pod_state={
+                "phase": "Running",
+                "ready": True,
+                "scheduled": True,
+                "oom_killed": False,
+                "max_restart_count": 0,
+                "state_reasons": "",
+                "last_termination_reasons": "",
+            },
+            working_set=220_000_000,
+            memory_limit=536_870_912,
+            restart_count=0,
+        ),
+        hidden_expected_stop_reason=(
+            InvestigationStopReason.INSUFFICIENT_EVIDENCE
+        ),
+        hidden_required_probes=[
+            InvestigationProbe.PROMETHEUS_MEMORY_WORKING_SET,
+            InvestigationProbe.PROMETHEUS_MEMORY_LIMIT,
+        ],
+        hidden_preferred_first_probes=[
+            InvestigationProbe.PROMETHEUS_MEMORY_WORKING_SET,
+            InvestigationProbe.PROMETHEUS_MEMORY_LIMIT,
+        ],
+        hidden_max_reasonable_tool_calls=3,
+    ),
+    BenchmarkScenario(
+        key="probe_backend_failure",
+        title=(
+            "Unavailable pod evidence must not produce fabricated RCA"
+        ),
+        alert_name="PodRestartHigh",
+        alert_message=(
+            "payment-api restarts are elevated"
+        ),
+        evidence_by_probe={
+            InvestigationProbe.KUBERNETES_POD_STATE: (
+                "unavailable"
+            ),
+            InvestigationProbe.PROMETHEUS_MEMORY_WORKING_SET: {
+                "value_sum": 150_000_000.0,
+            },
+            InvestigationProbe.PROMETHEUS_MEMORY_LIMIT: {
+                "value_sum": 536_870_912.0,
+            },
+            InvestigationProbe.PROMETHEUS_RESTART_COUNT: {
+                "value_sum": 6.0,
+            },
+        },
+        hidden_expected_stop_reason=(
+            InvestigationStopReason.INSUFFICIENT_EVIDENCE
+        ),
+        hidden_acceptable_stop_reasons=[
+            InvestigationStopReason.NO_SAFE_PROBE,
+        ],
+        hidden_required_probes=[
+            InvestigationProbe.KUBERNETES_POD_STATE,
+        ],
+        hidden_preferred_first_probes=[
+            (
+                InvestigationProbe
+                .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+            ),
+            InvestigationProbe.KUBERNETES_POD_STATE,
+            InvestigationProbe.PROMETHEUS_RESTART_COUNT,
+        ],
+        hidden_missing_capability_keywords=[
+            "log",
+            "日志",
+            "pod state",
+            "termination",
+        ],
+        hidden_max_reasonable_tool_calls=4,
+    ),
+    BenchmarkScenario(
+        key="oom_without_explanatory_metrics",
+        title=(
+            "OOM termination with non-explanatory sampled metrics should remain cautious"
+        ),
+        alert_name="PodOOMKilled",
+        alert_message=(
+            "payment-api was terminated and restarted"
+        ),
+        evidence_by_probe=_all_probes(
+            pod_state={
+                "phase": "Running",
+                "ready": True,
+                "scheduled": True,
+                "oom_killed": True,
+                "max_restart_count": 3,
+                "state_reasons": "",
+                "last_termination_reasons": (
+                    "OOMKilled"
+                ),
+            },
+            working_set=300_000_000,
+            memory_limit=1_073_741_824,
+            restart_count=3,
+        ),
+        hidden_expected_stop_reason=(
+            InvestigationStopReason.INSUFFICIENT_EVIDENCE
+        ),
+        hidden_required_probes=[
+            InvestigationProbe.KUBERNETES_POD_STATE,
+            InvestigationProbe.PROMETHEUS_MEMORY_WORKING_SET,
+            InvestigationProbe.PROMETHEUS_MEMORY_LIMIT,
+        ],
+        hidden_preferred_first_probes=[
+            InvestigationProbe.KUBERNETES_POD_STATE,
+        ],
+        hidden_missing_capability_keywords=[
+            "histor",
+            "历史",
+            "range",
+            "peak",
+            "time",
+            "日志",
+            "log",
+        ],
+        hidden_max_reasonable_tool_calls=4,
+    ),
+]
+
+
+
+CHANGE_EVENT_TIME = datetime(
+    2026,
+    8,
+    11,
+    0,
+    20,
+    tzinfo=UTC,
+)
+
+
+def _change_facts(
+    *,
+    revision_before,
+    revision_after,
+    image_before,
+    image_after,
+    rollout_started_at,
+    rollout_offset_seconds,
+    recent,
+    generation=9,
+    observed_generation=9,
+    replicas_desired=4,
+    replicas_updated=4,
+    replicas_ready=4,
+    replicas_available=4,
+    replicas_unavailable=0,
+    history_complete=True,
+):
+    return {
+        "temporal_basis": (
+            "workload_change_history"
+        ),
+        "owner_chain_verified": True,
+        "deployment_name": "payment-api",
+        "revision_before": revision_before,
+        "revision_after": revision_after,
+        "revision_changed": (
+            (
+                revision_before
+                != revision_after
+            )
+            if (
+                revision_before is not None
+                and revision_after is not None
+            )
+            else None
+        ),
+        "image_before": image_before,
+        "image_after": image_after,
+        "image_changed": (
+            (
+                image_before
+                != image_after
+            )
+            if (
+                image_before is not None
+                and image_after is not None
+            )
+            else None
+        ),
+        "rollout_started_at": (
+            rollout_started_at
+        ),
+        "rollout_offset_seconds": (
+            float(
+                rollout_offset_seconds
+            )
+        ),
+        "recent_rollout_before_incident": (
+            recent
+        ),
+        "generation": generation,
+        "observed_generation": (
+            observed_generation
+        ),
+        "replicas_desired": replicas_desired,
+        "replicas_updated": replicas_updated,
+        "replicas_ready": replicas_ready,
+        "replicas_available": (
+            replicas_available
+        ),
+        "replicas_unavailable": (
+            replicas_unavailable
+        ),
+        "history_complete": (
+            history_complete
+        ),
+    }
+
+
+CHANGE_SCENARIOS = [
+    BenchmarkScenario(
+        key="change_image_rollout_log_rca",
+        title=(
+            "Recent image rollout plus causal previous logs supports change RCA"
+        ),
+        alert_name="PodRestartHigh",
+        alert_message=(
+            "payment-api started restarting shortly after a rollout"
+        ),
+        event_occurred_at=(
+            CHANGE_EVENT_TIME
+        ),
+        evidence_by_probe={
+            **_all_probes(
+                pod_state={
+                    "phase": "Running",
+                    "ready": False,
+                    "scheduled": True,
+                    "oom_killed": False,
+                    "max_restart_count": 8,
+                    "state_reasons": (
+                        "CrashLoopBackOff"
+                    ),
+                    "last_termination_reasons": (
+                        "Error"
+                    ),
+                },
+                working_set=125_000_000,
+                memory_limit=536_870_912,
+                restart_count=8,
+            ),
+            (
+                InvestigationProbe
+                .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+            ): {
+                "temporal_basis": (
+                    "previous_container"
+                ),
+                "container_name": (
+                    "payment-api"
+                ),
+                "previous": True,
+                "log_line_count": 2,
+                "tool_truncated": False,
+                "evidence_truncated": False,
+                "redaction_count": 0,
+                "log_excerpt": (
+                    "panic: incompatible schema version after startup; "
+                    "payment-api:v7 expects schema v7 but runtime has v6"
+                ),
+            },
+            (
+                InvestigationProbe
+                .KUBERNETES_WORKLOAD_CHANGE
+            ): _change_facts(
+                revision_before=6,
+                revision_after=7,
+                image_before=(
+                    "app=payment-api:v6"
+                ),
+                image_after=(
+                    "app=payment-api:v7"
+                ),
+                rollout_started_at=(
+                    "2026-08-11T00:15:00+00:00"
+                ),
+                rollout_offset_seconds=300,
+                recent=True,
+                replicas_ready=2,
+                replicas_available=2,
+                replicas_unavailable=2,
+            ),
+        },
+        hidden_expected_stop_reason=(
+            InvestigationStopReason.SUFFICIENT_EVIDENCE
+        ),
+        hidden_required_probes=[
+            (
+                InvestigationProbe
+                .KUBERNETES_WORKLOAD_CHANGE
+            ),
+            (
+                InvestigationProbe
+                .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+            ),
+        ],
+        hidden_preferred_first_probes=[
+            (
+                InvestigationProbe
+                .KUBERNETES_WORKLOAD_CHANGE
+            ),
+            (
+                InvestigationProbe
+                .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+            ),
+            InvestigationProbe.KUBERNETES_POD_STATE,
+        ],
+        hidden_root_cause_keyword_groups=[
+            [
+                "image",
+                "rollout",
+                "deploy",
+                "revision",
+                "版本",
+                "发布",
+            ],
+            [
+                "schema",
+                "incompatible",
+                "panic",
+                "兼容",
+            ],
+        ],
+        hidden_max_reasonable_tool_calls=4,
+    ),
+    BenchmarkScenario(
+        key="recent_change_but_memory_pressure",
+        title=(
+            "Recent rollout is correlated but memory limit pressure is causal"
+        ),
+        alert_name="PodOOMKilled",
+        alert_message=(
+            "payment-api restarted after a recent deployment"
+        ),
+        event_occurred_at=(
+            CHANGE_EVENT_TIME
+        ),
+        evidence_by_probe={
+            **_all_probes(
+                pod_state={
+                    "phase": "Running",
+                    "ready": False,
+                    "scheduled": True,
+                    "oom_killed": True,
+                    "max_restart_count": 5,
+                    "state_reasons": (
+                        "CrashLoopBackOff"
+                    ),
+                    "last_termination_reasons": (
+                        "OOMKilled"
+                    ),
+                },
+                working_set=530_000_000,
+                memory_limit=536_870_912,
+                restart_count=5,
+            ),
+            (
+                InvestigationProbe
+                .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+            ): "unavailable",
+            (
+                InvestigationProbe
+                .KUBERNETES_WORKLOAD_CHANGE
+            ): _change_facts(
+                revision_before=10,
+                revision_after=11,
+                image_before=(
+                    "app=payment-api:v10"
+                ),
+                image_after=(
+                    "app=payment-api:v11"
+                ),
+                rollout_started_at=(
+                    "2026-08-11T00:17:00+00:00"
+                ),
+                rollout_offset_seconds=180,
+                recent=True,
+            ),
+        },
+        hidden_expected_stop_reason=(
+            InvestigationStopReason.SUFFICIENT_EVIDENCE
+        ),
+        hidden_required_probes=[
+            InvestigationProbe.KUBERNETES_POD_STATE,
+            InvestigationProbe.PROMETHEUS_MEMORY_WORKING_SET,
+            InvestigationProbe.PROMETHEUS_MEMORY_LIMIT,
+            (
+                InvestigationProbe
+                .KUBERNETES_WORKLOAD_CHANGE
+            ),
+        ],
+        hidden_preferred_first_probes=[
+            InvestigationProbe.KUBERNETES_POD_STATE,
+            (
+                InvestigationProbe
+                .KUBERNETES_WORKLOAD_CHANGE
+            ),
+            InvestigationProbe.PROMETHEUS_MEMORY_WORKING_SET,
+        ],
+        hidden_root_cause_keyword_groups=[
+            [
+                "memory",
+                "内存",
+            ],
+            [
+                "limit",
+                "oom",
+                "限制",
+            ],
+        ],
+        hidden_max_reasonable_tool_calls=5,
+    ),
+    BenchmarkScenario(
+        key="stale_rollout_crashloop_unknown",
+        title=(
+            "Old rollout must not explain a new CrashLoop without mechanism evidence"
+        ),
+        alert_name="PodRestartHigh",
+        alert_message=(
+            "payment-api began restarting today"
+        ),
+        event_occurred_at=(
+            CHANGE_EVENT_TIME
+        ),
+        evidence_by_probe={
+            **_all_probes(
+                pod_state={
+                    "phase": "Running",
+                    "ready": False,
+                    "scheduled": True,
+                    "oom_killed": False,
+                    "max_restart_count": 6,
+                    "state_reasons": (
+                        "CrashLoopBackOff"
+                    ),
+                    "last_termination_reasons": (
+                        "Error"
+                    ),
+                },
+                working_set=130_000_000,
+                memory_limit=536_870_912,
+                restart_count=6,
+            ),
+            (
+                InvestigationProbe
+                .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+            ): "unavailable",
+            (
+                InvestigationProbe
+                .KUBERNETES_WORKLOAD_CHANGE
+            ): _change_facts(
+                revision_before=4,
+                revision_after=5,
+                image_before=(
+                    "app=payment-api:v4"
+                ),
+                image_after=(
+                    "app=payment-api:v5"
+                ),
+                rollout_started_at=(
+                    "2026-08-08T00:20:00+00:00"
+                ),
+                rollout_offset_seconds=259200,
+                recent=False,
+            ),
+        },
+        hidden_expected_stop_reason=(
+            InvestigationStopReason.INSUFFICIENT_EVIDENCE
+        ),
+        hidden_required_probes=[
+            InvestigationProbe.KUBERNETES_POD_STATE,
+            (
+                InvestigationProbe
+                .KUBERNETES_WORKLOAD_CHANGE
+            ),
+            (
+                InvestigationProbe
+                .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+            ),
+        ],
+        hidden_preferred_first_probes=[
+            InvestigationProbe.KUBERNETES_POD_STATE,
+            (
+                InvestigationProbe
+                .KUBERNETES_WORKLOAD_CHANGE
+            ),
+            (
+                InvestigationProbe
+                .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+            ),
+        ],
+        hidden_missing_capability_keywords=[
+            "log",
+            "日志",
+            "mechanism",
+            "cause",
+            "原因",
+        ],
+        hidden_max_reasonable_tool_calls=5,
+    ),
+    BenchmarkScenario(
+        key="change_probe_backend_failure",
+        title=(
+            "Unavailable change backend must not produce invented rollout RCA"
+        ),
+        alert_name="PodRestartHigh",
+        alert_message=(
+            "payment-api restart spike may have followed a deployment"
+        ),
+        event_occurred_at=(
+            CHANGE_EVENT_TIME
+        ),
+        evidence_by_probe={
+            **_all_probes(
+                pod_state={
+                    "phase": "Running",
+                    "ready": False,
+                    "scheduled": True,
+                    "oom_killed": False,
+                    "max_restart_count": 4,
+                    "state_reasons": (
+                        "CrashLoopBackOff"
+                    ),
+                    "last_termination_reasons": (
+                        "Error"
+                    ),
+                },
+                working_set=140_000_000,
+                memory_limit=536_870_912,
+                restart_count=4,
+            ),
+            (
+                InvestigationProbe
+                .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+            ): "unavailable",
+            (
+                InvestigationProbe
+                .KUBERNETES_WORKLOAD_CHANGE
+            ): "unavailable",
+        },
+        hidden_expected_stop_reason=(
+            InvestigationStopReason.INSUFFICIENT_EVIDENCE
+        ),
+        hidden_acceptable_stop_reasons=[
+            InvestigationStopReason.NO_SAFE_PROBE,
+        ],
+        hidden_required_probes=[
+            (
+                InvestigationProbe
+                .KUBERNETES_WORKLOAD_CHANGE
+            ),
+        ],
+        hidden_preferred_first_probes=[
+            (
+                InvestigationProbe
+                .KUBERNETES_WORKLOAD_CHANGE
+            ),
+            (
+                InvestigationProbe
+                .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+            ),
+            InvestigationProbe.KUBERNETES_POD_STATE,
+        ],
+        hidden_missing_capability_keywords=[
+            "change",
+            "deployment",
+            "rollout",
+            "revision",
+            "变更",
+            "发布",
+        ],
+        hidden_max_reasonable_tool_calls=5,
+    ),
+    BenchmarkScenario(
+        key="recent_change_without_causal_mechanism",
+        title=(
+            "Recent image change plus failure symptom is not sufficient causal proof"
+        ),
+        alert_name="PodRestartHigh",
+        alert_message=(
+            "payment-api is CrashLooping shortly after a rollout"
+        ),
+        event_occurred_at=(
+            CHANGE_EVENT_TIME
+        ),
+        evidence_by_probe={
+            **_all_probes(
+                pod_state={
+                    "phase": "Running",
+                    "ready": False,
+                    "scheduled": True,
+                    "oom_killed": False,
+                    "max_restart_count": 3,
+                    "state_reasons": (
+                        "CrashLoopBackOff"
+                    ),
+                    "last_termination_reasons": (
+                        "Error"
+                    ),
+                },
+                working_set=145_000_000,
+                memory_limit=536_870_912,
+                restart_count=3,
+            ),
+            (
+                InvestigationProbe
+                .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+            ): "unavailable",
+            (
+                InvestigationProbe
+                .KUBERNETES_WORKLOAD_CHANGE
+            ): _change_facts(
+                revision_before=20,
+                revision_after=21,
+                image_before=(
+                    "app=payment-api:v20"
+                ),
+                image_after=(
+                    "app=payment-api:v21"
+                ),
+                rollout_started_at=(
+                    "2026-08-11T00:16:00+00:00"
+                ),
+                rollout_offset_seconds=240,
+                recent=True,
+                replicas_ready=3,
+                replicas_available=3,
+                replicas_unavailable=1,
+            ),
+        },
+        hidden_expected_stop_reason=(
+            InvestigationStopReason.INSUFFICIENT_EVIDENCE
+        ),
+        hidden_required_probes=[
+            (
+                InvestigationProbe
+                .KUBERNETES_WORKLOAD_CHANGE
+            ),
+            InvestigationProbe.KUBERNETES_POD_STATE,
+            (
+                InvestigationProbe
+                .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+            ),
+        ],
+        hidden_preferred_first_probes=[
+            (
+                InvestigationProbe
+                .KUBERNETES_WORKLOAD_CHANGE
+            ),
+            (
+                InvestigationProbe
+                .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+            ),
+            InvestigationProbe.KUBERNETES_POD_STATE,
+        ],
+        hidden_missing_capability_keywords=[
+            "log",
+            "日志",
+            "mechanism",
+            "cause",
+            "causal",
+            "原因",
+        ],
+        hidden_max_reasonable_tool_calls=5,
+    ),
+]
+
+
+CHANGE_SCENARIO_KEYS = tuple(
+    item.key
+    for item in CHANGE_SCENARIOS
+)
+
+
+def _change_rollout_event_facts(
+    *,
+    revision_before,
+    revision_after,
+    image_before,
+    image_after,
+    rollout_started_at,
+    rollout_offset_seconds,
+    recent,
+    rollout_condition_summary,
+    generation_observed,
+    rollout_complete,
+    rollout_failure_signal,
+    rollout_failure_reason,
+    events_status,
+    events_error_code,
+    recent_event_count,
+    recent_warning_count,
+    recent_event_reasons,
+    recent_event_summary,
+    replicas_ready=4,
+    replicas_available=4,
+    replicas_unavailable=0,
+):
+    """
+    Change #002 v2.1 synthetic evidence.
+
+    Keep the retained scalar fact count within the production EvidenceItem
+    max_length=32 contract.
+    """
+
+    return {
+        **_change_facts(
+            revision_before=revision_before,
+            revision_after=revision_after,
+            image_before=image_before,
+            image_after=image_after,
+            rollout_started_at=(
+                rollout_started_at
+            ),
+            rollout_offset_seconds=(
+                rollout_offset_seconds
+            ),
+            recent=recent,
+            replicas_ready=replicas_ready,
+            replicas_available=(
+                replicas_available
+            ),
+            replicas_unavailable=(
+                replicas_unavailable
+            ),
+        ),
+        "rollout_condition_summary": (
+            rollout_condition_summary
+        ),
+        "generation_observed": (
+            generation_observed
+        ),
+        "rollout_complete": (
+            rollout_complete
+        ),
+        "rollout_failure_signal": (
+            rollout_failure_signal
+        ),
+        "rollout_failure_reason": (
+            rollout_failure_reason
+        ),
+        "events_status": (
+            events_status
+        ),
+        "events_error_code": (
+            events_error_code
+        ),
+        "recent_event_count": (
+            recent_event_count
+        ),
+        "recent_warning_count": (
+            recent_warning_count
+        ),
+        "recent_event_reasons": (
+            recent_event_reasons
+        ),
+        "recent_event_summary": (
+            recent_event_summary
+        ),
+    }
+
+
+CHANGE_ROLLOUT_EVENT_SCENARIOS = [
+    BenchmarkScenario(
+        key="rollout_failure_events_log_rca",
+        title=(
+            "Failed rollout signals plus causal logs support change RCA"
+        ),
+        alert_name="PodRestartHigh",
+        alert_message=(
+            "payment-api began failing during the latest rollout"
+        ),
+        event_occurred_at=(
+            CHANGE_EVENT_TIME
+        ),
+        evidence_by_probe={
+            **_all_probes(
+                pod_state={
+                    "phase": "Running",
+                    "ready": False,
+                    "scheduled": True,
+                    "oom_killed": False,
+                    "max_restart_count": 7,
+                    "state_reasons": (
+                        "CrashLoopBackOff"
+                    ),
+                    "last_termination_reasons": (
+                        "Error"
+                    ),
+                },
+                working_set=118_000_000,
+                memory_limit=536_870_912,
+                restart_count=7,
+            ),
+            (
+                InvestigationProbe
+                .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+            ): {
+                "temporal_basis": (
+                    "previous_container"
+                ),
+                "container_name": (
+                    "payment-api"
+                ),
+                "previous": True,
+                "log_line_count": 2,
+                "tool_truncated": False,
+                "evidence_truncated": False,
+                "redaction_count": 0,
+                "log_excerpt": (
+                    "panic: incompatible schema version; "
+                    "payment-api:v31 cannot start against schema v30"
+                ),
+            },
+            (
+                InvestigationProbe
+                .KUBERNETES_WORKLOAD_CHANGE
+            ): _change_rollout_event_facts(
+                revision_before=30,
+                revision_after=31,
+                image_before=(
+                    "app=payment-api:v30"
+                ),
+                image_after=(
+                    "app=payment-api:v31"
+                ),
+                rollout_started_at=(
+                    "2026-08-11T00:15:00+00:00"
+                ),
+                rollout_offset_seconds=300,
+                recent=True,
+                rollout_condition_summary=(
+                    "Progressing=False:ProgressDeadlineExceeded;"
+                    "Available=False:MinimumReplicasUnavailable;"
+                    "ReplicaFailure=True:FailedCreate"
+                ),
+                generation_observed=True,
+                rollout_complete=False,
+                rollout_failure_signal=True,
+                rollout_failure_reason=(
+                    "ProgressDeadlineExceeded;FailedCreate"
+                ),
+                events_status="complete",
+                events_error_code=None,
+                recent_event_count=3,
+                recent_warning_count=2,
+                recent_event_reasons=(
+                    "BackOff;FailedCreate;ScalingReplicaSet"
+                ),
+                recent_event_summary=(
+                    "2026-08-11T00:19:00+00:00 "
+                    "Pod/payment-api Warning BackOff: "
+                    "Back-off restarting failed container | "
+                    "2026-08-11T00:18:00+00:00 "
+                    "ReplicaSet/payment-api-31 Warning FailedCreate"
+                ),
+                replicas_ready=2,
+                replicas_available=2,
+                replicas_unavailable=2,
+            ),
+        },
+        hidden_expected_stop_reason=(
+            InvestigationStopReason.SUFFICIENT_EVIDENCE
+        ),
+        hidden_required_probes=[
+            (
+                InvestigationProbe
+                .KUBERNETES_WORKLOAD_CHANGE
+            ),
+            (
+                InvestigationProbe
+                .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+            ),
+        ],
+        hidden_preferred_first_probes=[
+            (
+                InvestigationProbe
+                .KUBERNETES_WORKLOAD_CHANGE
+            ),
+            (
+                InvestigationProbe
+                .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+            ),
+            InvestigationProbe.KUBERNETES_POD_STATE,
+        ],
+        hidden_root_cause_keyword_groups=[
+            [
+                "rollout",
+                "image",
+                "deploy",
+                "revision",
+                "发布",
+                "版本",
+            ],
+            [
+                "schema",
+                "incompatible",
+                "panic",
+                "兼容",
+            ],
+        ],
+        hidden_max_reasonable_tool_calls=4,
+    ),
+    BenchmarkScenario(
+        key="normal_rollout_events_dependency_rca",
+        title=(
+            "Healthy rollout events must not distract from dependency failure"
+        ),
+        alert_name="PodRestartHigh",
+        alert_message=(
+            "payment-api is restarting after a deployment"
+        ),
+        event_occurred_at=(
+            CHANGE_EVENT_TIME
+        ),
+        evidence_by_probe={
+            **_all_probes(
+                pod_state={
+                    "phase": "Running",
+                    "ready": False,
+                    "scheduled": True,
+                    "oom_killed": False,
+                    "max_restart_count": 5,
+                    "state_reasons": (
+                        "CrashLoopBackOff"
+                    ),
+                    "last_termination_reasons": (
+                        "Error"
+                    ),
+                },
+                working_set=132_000_000,
+                memory_limit=536_870_912,
+                restart_count=5,
+            ),
+            (
+                InvestigationProbe
+                .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+            ): {
+                "temporal_basis": (
+                    "previous_container"
+                ),
+                "container_name": (
+                    "payment-api"
+                ),
+                "previous": True,
+                "log_line_count": 2,
+                "tool_truncated": False,
+                "evidence_truncated": False,
+                "redaction_count": 0,
+                "log_excerpt": (
+                    "startup failed: connection refused to orders-db:5432; "
+                    "dependency unavailable"
+                ),
+            },
+            (
+                InvestigationProbe
+                .KUBERNETES_WORKLOAD_CHANGE
+            ): _change_rollout_event_facts(
+                revision_before=40,
+                revision_after=41,
+                image_before=(
+                    "app=payment-api:v40"
+                ),
+                image_after=(
+                    "app=payment-api:v41"
+                ),
+                rollout_started_at=(
+                    "2026-08-11T00:14:00+00:00"
+                ),
+                rollout_offset_seconds=360,
+                recent=True,
+                rollout_condition_summary=(
+                    "Progressing=True:NewReplicaSetAvailable;"
+                    "Available=True:MinimumReplicasAvailable;"
+                    "ReplicaFailure=False:-"
+                ),
+                generation_observed=True,
+                rollout_complete=True,
+                rollout_failure_signal=False,
+                rollout_failure_reason=None,
+                events_status="complete",
+                events_error_code=None,
+                recent_event_count=2,
+                recent_warning_count=0,
+                recent_event_reasons=(
+                    "ScalingReplicaSet;NewReplicaSetAvailable"
+                ),
+                recent_event_summary=(
+                    "2026-08-11T00:14:30+00:00 "
+                    "Deployment/payment-api Normal ScalingReplicaSet | "
+                    "2026-08-11T00:16:00+00:00 "
+                    "Deployment/payment-api Normal NewReplicaSetAvailable"
+                ),
+            ),
+        },
+        hidden_expected_stop_reason=(
+            InvestigationStopReason.SUFFICIENT_EVIDENCE
+        ),
+        hidden_required_probes=[
+            (
+                InvestigationProbe
+                .KUBERNETES_WORKLOAD_CHANGE
+            ),
+            (
+                InvestigationProbe
+                .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+            ),
+        ],
+        hidden_preferred_first_probes=[
+            (
+                InvestigationProbe
+                .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+            ),
+            (
+                InvestigationProbe
+                .KUBERNETES_WORKLOAD_CHANGE
+            ),
+            InvestigationProbe.KUBERNETES_POD_STATE,
+        ],
+        hidden_root_cause_keyword_groups=[
+            [
+                "dependency",
+                "orders-db",
+                "database",
+                "db",
+                "依赖",
+                "数据库",
+            ],
+            [
+                "connection refused",
+                "unavailable",
+                "连接",
+                "不可用",
+            ],
+        ],
+        hidden_max_reasonable_tool_calls=4,
+    ),
+    BenchmarkScenario(
+        key="event_rbac_unavailable_core_change_rca",
+        title=(
+            "Event RBAC loss must not erase core rollout and log evidence"
+        ),
+        alert_name="PodRestartHigh",
+        alert_message=(
+            "payment-api failed during a recent image rollout"
+        ),
+        event_occurred_at=(
+            CHANGE_EVENT_TIME
+        ),
+        evidence_by_probe={
+            **_all_probes(
+                pod_state={
+                    "phase": "Running",
+                    "ready": False,
+                    "scheduled": True,
+                    "oom_killed": False,
+                    "max_restart_count": 6,
+                    "state_reasons": (
+                        "CrashLoopBackOff"
+                    ),
+                    "last_termination_reasons": (
+                        "Error"
+                    ),
+                },
+                working_set=121_000_000,
+                memory_limit=536_870_912,
+                restart_count=6,
+            ),
+            (
+                InvestigationProbe
+                .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+            ): {
+                "temporal_basis": (
+                    "previous_container"
+                ),
+                "container_name": (
+                    "payment-api"
+                ),
+                "previous": True,
+                "log_line_count": 2,
+                "tool_truncated": False,
+                "evidence_truncated": False,
+                "redaction_count": 0,
+                "log_excerpt": (
+                    "panic: required configuration key FEATURE_SCHEMA_V42 "
+                    "is missing after image v42 startup"
+                ),
+            },
+            (
+                InvestigationProbe
+                .KUBERNETES_WORKLOAD_CHANGE
+            ): _change_rollout_event_facts(
+                revision_before=41,
+                revision_after=42,
+                image_before=(
+                    "app=payment-api:v41"
+                ),
+                image_after=(
+                    "app=payment-api:v42"
+                ),
+                rollout_started_at=(
+                    "2026-08-11T00:16:00+00:00"
+                ),
+                rollout_offset_seconds=240,
+                recent=True,
+                rollout_condition_summary=(
+                    "Progressing=False:ProgressDeadlineExceeded;"
+                    "Available=False:MinimumReplicasUnavailable;"
+                    "ReplicaFailure=Unknown:-"
+                ),
+                generation_observed=True,
+                rollout_complete=False,
+                rollout_failure_signal=True,
+                rollout_failure_reason=(
+                    "ProgressDeadlineExceeded"
+                ),
+                events_status="unavailable",
+                events_error_code=(
+                    "authorization_denied"
+                ),
+                recent_event_count=0,
+                recent_warning_count=0,
+                recent_event_reasons=None,
+                recent_event_summary=None,
+                replicas_ready=2,
+                replicas_available=2,
+                replicas_unavailable=2,
+            ),
+        },
+        hidden_expected_stop_reason=(
+            InvestigationStopReason.SUFFICIENT_EVIDENCE
+        ),
+        hidden_required_probes=[
+            (
+                InvestigationProbe
+                .KUBERNETES_WORKLOAD_CHANGE
+            ),
+            (
+                InvestigationProbe
+                .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+            ),
+        ],
+        hidden_preferred_first_probes=[
+            (
+                InvestigationProbe
+                .KUBERNETES_WORKLOAD_CHANGE
+            ),
+            (
+                InvestigationProbe
+                .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+            ),
+            InvestigationProbe.KUBERNETES_POD_STATE,
+        ],
+        hidden_root_cause_keyword_groups=[
+            [
+                "image",
+                "rollout",
+                "deploy",
+                "revision",
+                "发布",
+                "版本",
+            ],
+            [
+                "configuration",
+                "config",
+                "missing",
+                "panic",
+                "配置",
+                "缺失",
+            ],
+        ],
+        hidden_max_reasonable_tool_calls=4,
+    ),
+]
+
+
+CHANGE_ROLLOUT_EVENT_SCENARIO_KEYS = tuple(
+    item.key
+    for item in CHANGE_ROLLOUT_EVENT_SCENARIOS
+)
+
+
+SMOKE_SCENARIO_KEYS = (
+    "oom_limit_pressure",
+    "crashloop_not_memory",
+    "conflicting_oom_signal",
+)
+
+
+def scenarios_for_mode(
+    mode: str,
+) -> list[
+    BenchmarkScenario
+]:
+    if mode == "smoke":
+        keys = set(
+            SMOKE_SCENARIO_KEYS
+        )
+
+        return [
+            item
+            for item in SCENARIOS
+            if item.key in keys
+        ]
+
+    if mode == "full":
+        return list(
+            SCENARIOS
+        )
+
+    raise ValueError(
+        "Benchmark mode must be smoke or full"
+    )
+
+
+def scenario_by_key(
+    key: str,
+) -> BenchmarkScenario:
+    for item in (
+        *SCENARIOS,
+        *CHANGE_SCENARIOS,
+        *CHANGE_ROLLOUT_EVENT_SCENARIOS,
+    ):
+        if item.key == key:
+            return item
+
+    raise KeyError(
+        key
+    )
+
+
+__all__ = [
+    "CHANGE_ROLLOUT_EVENT_SCENARIOS",
+    "CHANGE_ROLLOUT_EVENT_SCENARIO_KEYS",
+    "CHANGE_SCENARIOS",
+    "CHANGE_SCENARIO_KEYS",
+    "SCENARIOS",
+    "SMOKE_SCENARIO_KEYS",
+    "scenario_by_key",
+    "scenarios_for_mode",
+]

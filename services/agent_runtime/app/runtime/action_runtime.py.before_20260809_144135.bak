@@ -1,0 +1,1813 @@
+from services.agent_runtime.app.action.execution_models import (
+    ActionExecutionRecord,
+    ActionExecutionStatus,
+)
+
+from services.agent_runtime.app.action.execution_service import (
+    ActionExecutionService,
+)
+
+from services.agent_runtime.app.action.execution_store import (
+    ActionExecutionConflictError,
+)
+
+from services.agent_runtime.app.action.mock_executor import (
+    MockExecutor,
+)
+
+from services.agent_runtime.app.action.kubernetes_production_executor import (
+    KubernetesProductionExecutor,
+    KubernetesProductionExecutorAuthorizationError,
+    KubernetesProductionExecutorBindingError,
+    KubernetesProductionExecutorConfigurationError,
+    KubernetesProductionExecutorConflictError,
+    KubernetesProductionExecutorError,
+    KubernetesProductionExecutorPolicyError,
+    KubernetesProductionExecutorResponseError,
+    KubernetesProductionOutcomeIndeterminateError,
+)
+
+from services.agent_runtime.app.action.models import (
+    ActionPlan,
+)
+
+from services.agent_runtime.app.action.preflight_artifact_models import (
+    PreflightArtifactRecord,
+)
+
+from services.agent_runtime.app.action.preflight_artifact_service import (
+    PreflightArtifactService,
+)
+
+from services.agent_runtime.app.action.production_action_guard import (
+    ProductionActionBindingError,
+    ProductionActionClockError,
+    ProductionActionContractExpiredError,
+    ProductionActionExpiryGuard,
+    ProductionActionGuardError,
+)
+from services.agent_runtime.app.action.production_pilot import (
+    KubernetesProductionPilotBlockedError,
+    KubernetesProductionPilotControl,
+)
+from services.agent_runtime.app.action.production_pilot_budget_service import (
+    ProductionPilotBudgetService,
+)
+from services.agent_runtime.app.action.production_pilot_budget_store import (
+    ProductionPilotBudgetConflictError,
+)
+
+from services.agent_runtime.app.action.planner import (
+    ActionPlanner,
+)
+
+from services.agent_runtime.app.approval.models import (
+    ApprovalStatus,
+)
+
+from services.agent_runtime.app.approval.service import (
+    ApprovalService,
+)
+
+from services.agent_runtime.app.incident.enums import (
+    IncidentStatus,
+)
+
+from services.agent_runtime.app.incident.state import (
+    IncidentState,
+)
+
+from services.agent_runtime.app.incident.store import (
+    IncidentConflictError,
+    IncidentStore,
+)
+
+from services.agent_runtime.app.model.result import (
+    AgentResult,
+)
+
+from services.agent_runtime.app.policy.engine import (
+    PolicyEngine,
+)
+
+
+class ActionRuntime:
+    """
+    Handle HealingAgent results and action execution.
+
+    Approved resume calls can use a durable ActionExecutionService claim.
+    Only the caller that creates a claim may invoke the executor. Every
+    replay returns the persisted state without launching the action again.
+
+    Direct execute() and ActionRuntime instances without an injected
+    ActionExecutionService retain their legacy behavior during the staged
+    migration. Once the service is injected, resume() fails closed unless an
+    operator ID and a dedicated execution idempotency key are supplied.
+    """
+
+    def __init__(
+        self,
+        approval_service: ApprovalService | None = None,
+        incident_store: IncidentStore | None = None,
+        action_execution_service: (
+            ActionExecutionService | None
+        ) = None,
+        production_action_guard: (
+            ProductionActionExpiryGuard | None
+        ) = None,
+        kubernetes_production_executor: (
+            KubernetesProductionExecutor | None
+        ) = None,
+        preflight_artifact_service: (
+            PreflightArtifactService | None
+        ) = None,
+        production_pilot_control: (
+            KubernetesProductionPilotControl | None
+        ) = None,
+        production_pilot_budget_service: (
+            ProductionPilotBudgetService | None
+        ) = None,
+    ) -> None:
+        if (
+            production_action_guard is not None
+            and not isinstance(
+                production_action_guard,
+                ProductionActionExpiryGuard,
+            )
+        ):
+            raise TypeError(
+                "ActionRuntime Production Action guard is invalid"
+            )
+
+        if (
+            kubernetes_production_executor is not None
+            and not isinstance(
+                kubernetes_production_executor,
+                KubernetesProductionExecutor,
+            )
+        ):
+            raise TypeError(
+                "ActionRuntime Kubernetes production executor is invalid"
+            )
+
+        if (
+            preflight_artifact_service is not None
+            and not isinstance(
+                preflight_artifact_service,
+                PreflightArtifactService,
+            )
+        ):
+            raise TypeError(
+                "ActionRuntime Preflight Artifact service is invalid"
+            )
+
+        if (
+            production_pilot_control is not None
+            and not isinstance(
+                production_pilot_control,
+                KubernetesProductionPilotControl,
+            )
+        ):
+            raise TypeError(
+                "ActionRuntime Production Pilot control is invalid"
+            )
+
+        if (
+            production_pilot_budget_service is not None
+            and not isinstance(
+                production_pilot_budget_service,
+                ProductionPilotBudgetService,
+            )
+        ):
+            raise TypeError(
+                "ActionRuntime Production Pilot budget service is invalid"
+            )
+
+        if (
+            (kubernetes_production_executor is None)
+            != (preflight_artifact_service is None)
+        ):
+            raise TypeError(
+                "ActionRuntime production execution components must be shared"
+            )
+
+        if (
+            kubernetes_production_executor is not None
+            and (
+                production_pilot_control is None
+                or production_pilot_budget_service is None
+            )
+        ):
+            raise TypeError(
+                "ActionRuntime production execution requires shared Pilot controls"
+            )
+
+        if kubernetes_production_executor is not None:
+            if (
+                kubernetes_production_executor.pilot_control
+                is not production_pilot_control
+                or kubernetes_production_executor.pilot_budget_service
+                is not production_pilot_budget_service
+            ):
+                raise TypeError(
+                    "ActionRuntime production Pilot controls must be shared"
+                )
+
+        self.planner = ActionPlanner()
+
+        self.policy = PolicyEngine()
+
+        self.approval = (
+            approval_service
+            or ApprovalService()
+        )
+
+        self.incident_store = (
+            incident_store
+        )
+
+        self.action_execution_service = (
+            action_execution_service
+        )
+
+        self.production_action_guard = (
+            production_action_guard
+        )
+
+        self.production_pilot_control = (
+            production_pilot_control
+        )
+        self.production_pilot_budget_service = (
+            production_pilot_budget_service
+        )
+
+        # Keep the attributes absent when the real-write feature gate is
+        # disabled. Existing mock-only runtime behavior remains compatible,
+        # while prepared production approvals are explicitly blocked below.
+        if kubernetes_production_executor is not None:
+            self.kubernetes_production_executor = (
+                kubernetes_production_executor
+            )
+            self.preflight_artifact_service = (
+                preflight_artifact_service
+            )
+
+        self.executor = MockExecutor()
+
+    async def execute(
+        self,
+        healing_result: dict,
+        incident: IncidentState | None = None,
+        *,
+        namespace: str | None = None,
+        cluster: str | None = None,
+    ):
+        """
+        Convert a HealingAgent result into an ActionPlan.
+
+        When approval is required, the ApprovalRequest is linked
+        to the current Incident.
+        """
+
+        plan = self.planner.create_plan(
+            AgentResult(
+                **healing_result
+            )
+        )
+
+        self._apply_trusted_scope(
+            plan=plan,
+            namespace=namespace,
+            cluster=cluster,
+        )
+
+        decision = self.policy.evaluate(
+            plan
+        )
+
+        if decision.require_human:
+            await self._update_incident(
+                incident=incident,
+                status=(
+                    IncidentStatus.CONFIRMED
+                ),
+                reason=(
+                    "Remediation action is waiting "
+                    "for human approval"
+                ),
+            )
+
+            approval = (
+                await self.approval.create_approval(
+                    action=plan,
+                    reason=decision.reason,
+                    incident_id=(
+                        incident.id
+                        if incident is not None
+                        else None
+                    ),
+                )
+            )
+
+            return plan, {
+                "success": False,
+                "status": "pending_approval",
+                "approval_id": approval.id,
+                "incident_id": (
+                    str(approval.incident_id)
+                    if approval.incident_id is not None
+                    else None
+                ),
+                "action": plan.type.value,
+                "target": plan.target,
+                "reason": decision.reason,
+                "approval": approval.model_dump(
+                    mode="json"
+                ),
+            }
+
+        if not decision.approved:
+            await self._update_incident(
+                incident=incident,
+                status=(
+                    IncidentStatus.CONFIRMED
+                ),
+                reason=(
+                    "Remediation action was blocked "
+                    f"by policy: {decision.reason}"
+                ),
+            )
+
+            return plan, {
+                "success": False,
+                "status": "blocked",
+                "incident_id": (
+                    str(incident.id)
+                    if incident is not None
+                    else None
+                ),
+                "policy_decision": (
+                    decision.model_dump(
+                        mode="json"
+                    )
+                ),
+            }
+
+        result = await self._execute_action(
+            plan=plan,
+            incident=incident,
+        )
+
+        return plan, result
+
+    async def resume(
+        self,
+        approval_id: str,
+        incident: IncidentState | None = None,
+        *,
+        operator_id: str | None = None,
+        idempotency_key: str | None = None,
+    ):
+        """
+        Resume action execution after human approval.
+
+        With ActionExecutionService injected, operator_id and the execution
+        idempotency_key are mandatory. The claim is persisted before any
+        Incident transition or executor call.
+
+        Without ActionExecutionService, calls that omit both identity fields
+        retain the legacy behavior temporarily. Supplying execution identity
+        without a configured service fails closed.
+        """
+
+        approval = await self.approval.get(
+            approval_id
+        )
+
+        if approval is None:
+            return {
+                "success": False,
+                "status": "approval_not_found",
+            }
+
+        if (
+            approval.status
+            != ApprovalStatus.APPROVED
+        ):
+            await self._update_incident(
+                incident=incident,
+                status=(
+                    IncidentStatus.CONFIRMED
+                ),
+                reason=(
+                    "Remediation action is still "
+                    "waiting for approval"
+                ),
+            )
+
+            return {
+                "success": False,
+                "status": "approval_not_approved",
+                "current_status": approval.status.value,
+                "incident_id": (
+                    str(approval.incident_id)
+                    if approval.incident_id is not None
+                    else None
+                ),
+            }
+
+        if (
+            approval.incident_id is not None
+            and incident is None
+        ):
+            if self.incident_store is None:
+                return {
+                    "success": False,
+                    "status": "incident_context_required",
+                    "incident_id": str(
+                        approval.incident_id
+                    ),
+                }
+
+            incident = (
+                await self.incident_store.get(
+                    str(
+                        approval.incident_id
+                    )
+                )
+            )
+
+            if incident is None:
+                return {
+                    "success": False,
+                    "status": "incident_not_found",
+                    "incident_id": str(
+                        approval.incident_id
+                    ),
+                }
+
+        if (
+            approval.incident_id is not None
+            and incident is not None
+            and approval.incident_id
+            != incident.id
+        ):
+            return {
+                "success": False,
+                "status": "incident_mismatch",
+                "approval_incident_id": str(
+                    approval.incident_id
+                ),
+                "provided_incident_id": str(
+                    incident.id
+                ),
+            }
+
+        if self.action_execution_service is None:
+            if (
+                operator_id is not None
+                or idempotency_key is not None
+            ):
+                return {
+                    "success": False,
+                    "status": (
+                        "action_execution_not_configured"
+                    ),
+                    "approval_id": approval.id,
+                    "incident_id": (
+                        str(approval.incident_id)
+                        if approval.incident_id is not None
+                        else None
+                    ),
+                }
+
+            guard_failure = (
+                await self._production_guard_failure(
+                    approval
+                )
+            )
+            if guard_failure is not None:
+                return guard_failure
+
+            return await self._execute_action(
+                plan=approval.action,
+                incident=incident,
+            )
+
+        if (
+            operator_id is None
+            or idempotency_key is None
+        ):
+            return {
+                "success": False,
+                "status": "execution_identity_required",
+                "approval_id": approval.id,
+                "incident_id": (
+                    str(approval.incident_id)
+                    if approval.incident_id is not None
+                    else None
+                ),
+                "required_fields": [
+                    "operator_id",
+                    "idempotency_key",
+                ],
+            }
+
+        existing_execution = (
+            await self.action_execution_service
+            .get_by_approval(
+                approval.id
+            )
+        )
+
+        production_record = None
+
+        if existing_execution is None:
+            guard_failure = (
+                await self._production_guard_failure(
+                    approval
+                )
+            )
+            if guard_failure is not None:
+                # A concurrent caller may have claimed the same execution
+                # while the guard was evaluated. In that case claim() below
+                # resolves the exact replay or rejects a conflicting key.
+                existing_execution = (
+                    await self.action_execution_service
+                    .get_by_approval(
+                        approval.id
+                    )
+                )
+                if existing_execution is None:
+                    return guard_failure
+
+            if existing_execution is None:
+                (
+                    production_record,
+                    readiness_failure,
+                ) = await self._production_execution_readiness(
+                    approval,
+                    operator_id=operator_id,
+                )
+                if readiness_failure is not None:
+                    # Preserve a concurrent exact replay if another caller
+                    # claimed while readiness was evaluated.
+                    existing_execution = (
+                        await self.action_execution_service
+                        .get_by_approval(
+                            approval.id
+                        )
+                    )
+                    if existing_execution is None:
+                        return readiness_failure
+
+        try:
+            claim = (
+                await self.action_execution_service.claim(
+                    approval_id=approval.id,
+                    incident_id=approval.incident_id,
+                    operator_id=operator_id,
+                    idempotency_key=idempotency_key,
+                    action=approval.action,
+                    metadata=(
+                        self._execution_claim_metadata(
+                            approval
+                        )
+                    ),
+                )
+            )
+
+        except ActionExecutionConflictError as exc:
+            return {
+                "success": False,
+                "status": "execution_conflict",
+                "approval_id": approval.id,
+                "incident_id": (
+                    str(approval.incident_id)
+                    if approval.incident_id is not None
+                    else None
+                ),
+                "reason": str(exc),
+            }
+
+        except ValueError as exc:
+            return {
+                "success": False,
+                "status": "invalid_execution_identity",
+                "approval_id": approval.id,
+                "incident_id": (
+                    str(approval.incident_id)
+                    if approval.incident_id is not None
+                    else None
+                ),
+                "reason": str(exc),
+            }
+
+        if not claim.created:
+            return self._build_execution_replay_result(
+                execution=claim.execution,
+                incident=incident,
+            )
+
+        guard_failure = (
+            await self._production_guard_failure(
+                approval
+            )
+        )
+        if guard_failure is not None:
+            guard_failure[
+                "blocked_before_executor"
+            ] = True
+
+            blocked = (
+                await self.action_execution_service.fail(
+                    str(
+                        claim.execution.id
+                    ),
+                    guard_failure,
+                    error_type=(
+                        guard_failure.get(
+                            "error_type"
+                        )
+                    ),
+                    error_message=(
+                        guard_failure.get(
+                            "reason"
+                        )
+                    ),
+                )
+            )
+
+            return self._decorate_execution_result(
+                result=guard_failure,
+                execution=blocked,
+                incident=incident,
+                idempotent_replay=False,
+            )
+
+        (
+            production_record,
+            readiness_failure,
+        ) = await self._production_execution_readiness(
+            approval,
+            operator_id=operator_id,
+        )
+        if readiness_failure is not None:
+            readiness_failure[
+                "blocked_before_executor"
+            ] = True
+            blocked = (
+                await self.action_execution_service.fail(
+                    str(claim.execution.id),
+                    readiness_failure,
+                    error_type=(
+                        readiness_failure.get(
+                            "error_type"
+                        )
+                    ),
+                    error_message=(
+                        readiness_failure.get(
+                            "reason"
+                        )
+                    ),
+                )
+            )
+            return self._decorate_execution_result(
+                result=readiness_failure,
+                execution=blocked,
+                incident=incident,
+                idempotent_replay=False,
+            )
+
+        budget_failure = await self._reserve_production_pilot_budget(
+            execution=claim.execution,
+            preflight_record=production_record,
+            approval=approval,
+        )
+        if budget_failure is not None:
+            blocked = (
+                await self.action_execution_service.fail(
+                    str(claim.execution.id),
+                    budget_failure,
+                    error_type=(
+                        budget_failure.get(
+                            "error_type"
+                        )
+                    ),
+                    error_message=(
+                        budget_failure.get(
+                            "reason"
+                        )
+                    ),
+                )
+            )
+            return self._decorate_execution_result(
+                result=budget_failure,
+                execution=blocked,
+                incident=incident,
+                idempotent_replay=False,
+            )
+
+        return await self._execute_claimed_action(
+            execution=claim.execution,
+            incident=incident,
+            preflight_record=production_record,
+        )
+
+    async def _reserve_production_pilot_budget(
+        self,
+        *,
+        execution: ActionExecutionRecord,
+        preflight_record: PreflightArtifactRecord | None,
+        approval,
+    ) -> dict | None:
+        if preflight_record is None:
+            return None
+        control = self.production_pilot_control
+        service = self.production_pilot_budget_service
+        pilot_id = (
+            control.config.pilot_id
+            if control is not None
+            else None
+        )
+        if service is None or pilot_id is None:
+            return self._production_readiness_failure(
+                approval=approval,
+                status="production_pilot_budget_unavailable",
+                reason=(
+                    "Production pilot write budget is unavailable"
+                ),
+                error_type=(
+                    "ProductionPilotBudgetConflictError"
+                ),
+                retryable_after_enable=False,
+            )
+        try:
+            reservation = await service.reserve(
+                pilot_id=pilot_id,
+                execution=execution,
+                preflight_record=preflight_record,
+            )
+        except (
+            ProductionPilotBudgetConflictError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            return self._production_readiness_failure(
+                approval=approval,
+                status="production_pilot_budget_exhausted",
+                reason=(
+                    "Production pilot write budget is already reserved or consumed"
+                ),
+                error_type=type(exc).__name__,
+                retryable_after_enable=False,
+            )
+        if not reservation.created:
+            return self._production_readiness_failure(
+                approval=approval,
+                status="production_pilot_budget_replay_blocked",
+                reason=(
+                    "Production pilot write budget reservation cannot relaunch execution"
+                ),
+                error_type=(
+                    "ProductionPilotBudgetConflictError"
+                ),
+                retryable_after_enable=False,
+            )
+        return None
+
+    async def _production_execution_readiness(
+        self,
+        approval,
+        *,
+        operator_id: str,
+    ) -> tuple[
+        PreflightArtifactRecord | None,
+        dict | None,
+    ]:
+        """Resolve one trusted Artifact or fail closed before execution."""
+
+        if not self._claims_production_preflight(
+            approval
+        ):
+            return None, None
+
+        executor = getattr(
+            self,
+            "kubernetes_production_executor",
+            None,
+        )
+        artifact_service = getattr(
+            self,
+            "preflight_artifact_service",
+            None,
+        )
+
+        if executor is None or artifact_service is None:
+            return None, self._production_readiness_failure(
+                approval=approval,
+                status="production_execution_disabled",
+                reason=(
+                    "Kubernetes production execution is disabled"
+                ),
+                error_type=(
+                    "KubernetesProductionExecutorConfigurationError"
+                ),
+                retryable_after_enable=True,
+            )
+
+        pilot_control = getattr(
+            self,
+            "production_pilot_control",
+            None,
+        )
+        if pilot_control is None:
+            return None, self._production_readiness_failure(
+                approval=approval,
+                status="production_pilot_unavailable",
+                reason=(
+                    "Kubernetes production pilot control is unavailable"
+                ),
+                error_type=(
+                    "KubernetesProductionPilotBlockedError"
+                ),
+                retryable_after_enable=False,
+            )
+
+        try:
+            pilot_control.require_execution(
+                operator_id=operator_id,
+                production_executor_configured=True,
+            )
+        except KubernetesProductionPilotBlockedError as exc:
+            return None, self._production_readiness_failure(
+                approval=approval,
+                status="production_pilot_blocked",
+                reason=str(exc),
+                error_type=type(exc).__name__,
+                retryable_after_enable=False,
+            )
+
+        try:
+            record = (
+                await artifact_service.get_by_approval_id(
+                    approval.id
+                )
+            )
+        except Exception as exc:
+            return None, self._production_readiness_failure(
+                approval=approval,
+                status="production_artifact_unavailable",
+                reason=(
+                    "Production Preflight Artifact is unavailable"
+                ),
+                error_type=type(exc).__name__,
+                retryable_after_enable=False,
+            )
+
+        if record is None:
+            return None, self._production_readiness_failure(
+                approval=approval,
+                status="production_artifact_missing",
+                reason=(
+                    "Production Preflight Artifact was not found"
+                ),
+                error_type="ProductionActionBindingError",
+                retryable_after_enable=False,
+            )
+
+        return record, None
+
+    @staticmethod
+    def _claims_production_preflight(
+        approval,
+    ) -> bool:
+        metadata = approval.metadata
+        return (
+            metadata.get("source")
+            == "production_action_preparation"
+            or any(
+                key in metadata
+                for key in (
+                    "preflight_artifact_id",
+                    "preflight_idempotency_key",
+                    "safety_contract_id",
+                    "safety_patch_sha256",
+                )
+            )
+        )
+
+    @classmethod
+    def _execution_claim_metadata(
+        cls,
+        approval,
+    ) -> dict:
+        """
+        Persist bounded provenance for later execution audit.
+
+        The values come only from the already persisted Approval and remain
+        deterministic across restarts and feature-gate changes. Raw patches,
+        Kubernetes object identities, resource versions, and credentials are
+        deliberately excluded.
+        """
+
+        metadata = {
+            "source": "action_runtime.resume",
+        }
+
+        if not cls._claims_production_preflight(
+            approval
+        ):
+            return metadata
+
+        metadata[
+            "execution_mode"
+        ] = "kubernetes_production"
+
+        approval_metadata = (
+            approval.metadata
+            if isinstance(
+                approval.metadata,
+                dict,
+            )
+            else {}
+        )
+        action_metadata = (
+            approval.action.metadata
+            if isinstance(
+                approval.action.metadata,
+                dict,
+            )
+            else {}
+        )
+
+        for key, maximum_length in (
+            (
+                "preflight_artifact_id",
+                128,
+            ),
+            (
+                "safety_contract_id",
+                128,
+            ),
+            (
+                "safety_patch_sha256",
+                64,
+            ),
+        ):
+            value = cls._bounded_audit_text(
+                approval_metadata.get(
+                    key
+                ),
+                maximum_length=maximum_length,
+            )
+            if value is not None:
+                metadata[key] = value
+
+        policy_version = cls._bounded_audit_text(
+            action_metadata.get(
+                "safety_policy_version"
+            ),
+            maximum_length=64,
+        )
+        if policy_version is not None:
+            metadata[
+                "safety_policy_version"
+            ] = policy_version
+
+        return metadata
+
+    @staticmethod
+    def _bounded_audit_text(
+        value,
+        *,
+        maximum_length: int,
+    ) -> str | None:
+        if not isinstance(
+            value,
+            str,
+        ):
+            return None
+
+        normalized = value.strip()
+        if (
+            not normalized
+            or normalized != value
+            or len(normalized) > maximum_length
+        ):
+            return None
+
+        return normalized
+
+    @staticmethod
+    def _production_readiness_failure(
+        *,
+        approval,
+        status: str,
+        reason: str,
+        error_type: str,
+        retryable_after_enable: bool,
+    ) -> dict:
+        return {
+            "success": False,
+            "status": status,
+            "approval_id": approval.id,
+            "incident_id": (
+                str(approval.incident_id)
+                if approval.incident_id is not None
+                else None
+            ),
+            "reason": reason,
+            "error_type": error_type,
+            "action": approval.action.type.value,
+            "target": approval.action.target,
+            "executor_called": False,
+            "real_write_attempted": False,
+            "retryable_after_enable": retryable_after_enable,
+            "automatic_replay_allowed": False,
+        }
+
+    async def _production_guard_failure(
+        self,
+        approval,
+    ) -> dict | None:
+        """Return a bounded failure without leaking Artifact internals."""
+
+        if self.production_action_guard is None:
+            return None
+
+        try:
+            await self.production_action_guard.require_resume(
+                approval
+            )
+            return None
+
+        except ProductionActionGuardError as exc:
+            if isinstance(
+                exc,
+                ProductionActionContractExpiredError,
+            ):
+                status = (
+                    "preflight_contract_expired"
+                )
+            elif isinstance(
+                exc,
+                ProductionActionClockError,
+            ):
+                status = "preflight_clock_invalid"
+            elif isinstance(
+                exc,
+                ProductionActionBindingError,
+            ):
+                status = "preflight_binding_invalid"
+            else:
+                status = "preflight_guard_rejected"
+
+            return {
+                "success": False,
+                "status": status,
+                "approval_id": approval.id,
+                "incident_id": (
+                    str(approval.incident_id)
+                    if approval.incident_id is not None
+                    else None
+                ),
+                "reason": str(exc),
+                "error_type": type(exc).__name__,
+                "action": approval.action.type.value,
+                "target": approval.action.target,
+                "requires_new_preflight": True,
+                "automatic_replay_allowed": False,
+                "executor_called": False,
+            }
+
+        except Exception as exc:
+            return {
+                "success": False,
+                "status": "preflight_guard_unavailable",
+                "approval_id": approval.id,
+                "incident_id": (
+                    str(approval.incident_id)
+                    if approval.incident_id is not None
+                    else None
+                ),
+                "reason": (
+                    "Production Action safety guard is unavailable"
+                ),
+                "error_type": type(exc).__name__,
+                "action": approval.action.type.value,
+                "target": approval.action.target,
+                "requires_new_preflight": True,
+                "automatic_replay_allowed": False,
+                "executor_called": False,
+            }
+
+    async def _execute_claimed_action(
+        self,
+        execution: ActionExecutionRecord,
+        incident: IncidentState | None,
+        preflight_record: (
+            PreflightArtifactRecord | None
+        ) = None,
+    ) -> dict:
+        """
+        Invoke the executor only for a newly persisted execution claim.
+        """
+
+        if self.action_execution_service is None:
+            raise RuntimeError(
+                "ActionExecutionService is required"
+            )
+
+        execution_id = str(
+            execution.id
+        )
+
+        try:
+            await self._update_incident(
+                incident=incident,
+                status=IncidentStatus.HEALING,
+                reason=(
+                    "Executing claimed remediation action: "
+                    f"{execution.action.type.value}"
+                ),
+            )
+
+        except Exception as exc:
+            failure_result = {
+                "success": False,
+                "status": "incident_transition_failed",
+                "action": execution.action.type.value,
+                "target": execution.action.target,
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            }
+
+            completed = (
+                await self.action_execution_service.fail(
+                    execution_id,
+                    failure_result,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+            )
+
+            return self._decorate_execution_result(
+                result=failure_result,
+                execution=completed,
+                incident=incident,
+                idempotent_replay=False,
+            )
+
+        try:
+            if preflight_record is not None:
+                production_executor = getattr(
+                    self,
+                    "kubernetes_production_executor",
+                    None,
+                )
+                if production_executor is None:
+                    raise KubernetesProductionExecutorConfigurationError(
+                        "Kubernetes production execution is disabled"
+                    )
+                executor_result = (
+                    await production_executor.execute_claimed(
+                        execution,
+                        preflight_record,
+                    )
+                )
+            else:
+                executor_result = await self.executor.execute(
+                    execution.action
+                )
+
+        except KubernetesProductionOutcomeIndeterminateError as exc:
+            reason = (
+                "Kubernetes production write outcome is indeterminate; "
+                "manual reconciliation is required"
+            )
+            frozen = (
+                await self.action_execution_service.mark_indeterminate(
+                    execution_id,
+                    reason,
+                )
+            )
+            await self._update_incident(
+                incident=incident,
+                status=IncidentStatus.HEALING,
+                reason=(
+                    "Kubernetes production action outcome is "
+                    "indeterminate; reconciliation is required"
+                ),
+            )
+            result = {
+                "success": False,
+                "status": "execution_indeterminate",
+                "action": execution.action.type.value,
+                "target": execution.action.target,
+                "error_type": type(exc).__name__,
+                "requires_reconciliation": True,
+                "real_write_attempted": True,
+            }
+            return self._decorate_execution_result(
+                result=result,
+                execution=frozen,
+                incident=incident,
+                idempotent_replay=False,
+            )
+
+        except KubernetesProductionExecutorError as exc:
+            failure_result = (
+                self._production_executor_failure(
+                    execution=execution,
+                    error=exc,
+                )
+            )
+            completed = (
+                await self.action_execution_service.fail(
+                    execution_id,
+                    failure_result,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+            )
+            await self._update_incident(
+                incident=incident,
+                status=IncidentStatus.FAILED,
+                reason=(
+                    "Kubernetes production action was rejected "
+                    "before a confirmed external write"
+                ),
+            )
+            return self._decorate_execution_result(
+                result=failure_result,
+                execution=completed,
+                incident=incident,
+                idempotent_replay=False,
+            )
+
+        except Exception as exc:
+            reason = (
+                "Remediation executor raised "
+                f"{type(exc).__name__}: {exc}; "
+                "external outcome requires reconciliation"
+            )
+
+            frozen = (
+                await self.action_execution_service.mark_indeterminate(
+                    execution_id,
+                    reason,
+                )
+            )
+
+            await self._update_incident(
+                incident=incident,
+                status=IncidentStatus.HEALING,
+                reason=(
+                    "Remediation action outcome is "
+                    "indeterminate; reconciliation is required"
+                ),
+            )
+
+            result = {
+                "success": False,
+                "status": "execution_indeterminate",
+                "action": execution.action.type.value,
+                "target": execution.action.target,
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+                "requires_reconciliation": True,
+            }
+
+            return self._decorate_execution_result(
+                result=result,
+                execution=frozen,
+                incident=incident,
+                idempotent_replay=False,
+            )
+
+        if not isinstance(
+            executor_result,
+            dict,
+        ):
+            frozen = (
+                await self.action_execution_service.mark_indeterminate(
+                    execution_id,
+                    (
+                        "Executor returned a non-dictionary result; "
+                        "external outcome requires reconciliation"
+                    ),
+                )
+            )
+
+            await self._update_incident(
+                incident=incident,
+                status=IncidentStatus.HEALING,
+                reason=(
+                    "Remediation action outcome is "
+                    "indeterminate; reconciliation is required"
+                ),
+            )
+
+            result = {
+                "success": False,
+                "status": "execution_indeterminate",
+                "action": execution.action.type.value,
+                "target": execution.action.target,
+                "error_type": "InvalidExecutorResult",
+                "requires_reconciliation": True,
+            }
+
+            return self._decorate_execution_result(
+                result=result,
+                execution=frozen,
+                incident=incident,
+                idempotent_replay=False,
+            )
+
+        try:
+            completed = (
+                await self.action_execution_service.complete(
+                    execution_id,
+                    executor_result,
+                )
+            )
+
+        except Exception as exc:
+            await self._update_incident(
+                incident=incident,
+                status=IncidentStatus.HEALING,
+                reason=(
+                    "Remediation executor returned, but the "
+                    "execution outcome could not be persisted; "
+                    "reconciliation is required"
+                ),
+            )
+
+            return {
+                "success": False,
+                "status": "execution_persistence_failed",
+                "approval_id": execution.approval_id,
+                "execution_id": execution_id,
+                "execution_status": (
+                    ActionExecutionStatus.RUNNING.value
+                ),
+                "action": execution.action.type.value,
+                "target": execution.action.target,
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+                "requires_reconciliation": True,
+                "automatic_replay_allowed": False,
+                "incident_id": (
+                    str(incident.id)
+                    if incident is not None
+                    else None
+                ),
+                "incident_status": (
+                    incident.status.value
+                    if incident is not None
+                    else None
+                ),
+            }
+
+        if (
+            completed.status
+            == ActionExecutionStatus.SUCCEEDED
+        ):
+            await self._update_incident(
+                incident=incident,
+                status=IncidentStatus.HEALING,
+                reason=(
+                    "Remediation action executed; "
+                    "awaiting verification"
+                ),
+            )
+
+        elif (
+            completed.status
+            == ActionExecutionStatus.FAILED
+        ):
+            await self._update_incident(
+                incident=incident,
+                status=IncidentStatus.FAILED,
+                reason=(
+                    "Remediation action failed: "
+                    f"{executor_result.get('message', 'unknown error')}"
+                ),
+            )
+
+        else:
+            await self._update_incident(
+                incident=incident,
+                status=IncidentStatus.HEALING,
+                reason=(
+                    "Remediation action outcome is "
+                    "indeterminate; reconciliation is required"
+                ),
+            )
+
+        result = dict(
+            executor_result
+        )
+
+        if (
+            completed.status
+            == ActionExecutionStatus.INDETERMINATE
+        ):
+            result["success"] = False
+            result["status"] = (
+                "execution_indeterminate"
+            )
+            result["requires_reconciliation"] = True
+
+        return self._decorate_execution_result(
+            result=result,
+            execution=completed,
+            incident=incident,
+            idempotent_replay=False,
+        )
+
+    @staticmethod
+    def _production_executor_failure(
+        *,
+        execution: ActionExecutionRecord,
+        error: KubernetesProductionExecutorError,
+    ) -> dict:
+        if isinstance(
+            error,
+            KubernetesProductionExecutorConflictError,
+        ):
+            status = "production_precondition_changed"
+            requires_new_preflight = True
+        elif isinstance(
+            error,
+            KubernetesProductionExecutorBindingError,
+        ):
+            status = "production_binding_invalid"
+            requires_new_preflight = True
+        elif isinstance(
+            error,
+            KubernetesProductionExecutorPolicyError,
+        ):
+            status = "production_policy_rejected"
+            requires_new_preflight = True
+        elif isinstance(
+            error,
+            KubernetesProductionExecutorAuthorizationError,
+        ):
+            status = "production_authorization_failed"
+            requires_new_preflight = False
+        elif isinstance(
+            error,
+            KubernetesProductionExecutorConfigurationError,
+        ):
+            status = "production_execution_unavailable"
+            requires_new_preflight = False
+        elif isinstance(
+            error,
+            KubernetesProductionExecutorResponseError,
+        ):
+            status = "production_safety_request_failed"
+            requires_new_preflight = True
+        else:
+            status = "production_execution_rejected"
+            requires_new_preflight = True
+
+        return {
+            "success": False,
+            "status": status,
+            "action": execution.action.type.value,
+            "target": execution.action.target,
+            "reason": str(error),
+            "error_type": type(error).__name__,
+            "requires_new_preflight": requires_new_preflight,
+            "requires_reconciliation": False,
+            "real_write_attempted": False,
+            "automatic_replay_allowed": False,
+        }
+
+    def _build_execution_replay_result(
+        self,
+        execution: ActionExecutionRecord,
+        incident: IncidentState | None,
+    ) -> dict:
+        if (
+            execution.status
+            == ActionExecutionStatus.RUNNING
+        ):
+            result = {
+                "success": False,
+                "status": "execution_in_progress",
+                "requires_reconciliation": True,
+            }
+
+        elif (
+            execution.status
+            == ActionExecutionStatus.INDETERMINATE
+        ):
+            result = {
+                "success": False,
+                "status": "execution_indeterminate",
+                "requires_reconciliation": True,
+                "reason": execution.error_message,
+            }
+
+        else:
+            result = dict(
+                execution.result
+            )
+
+            if (
+                execution.status
+                == ActionExecutionStatus.SUCCEEDED
+            ):
+                result["success"] = True
+
+            else:
+                result["success"] = False
+                result.setdefault(
+                    "status",
+                    "execution_failed",
+                )
+
+        return self._decorate_execution_result(
+            result=result,
+            execution=execution,
+            incident=incident,
+            idempotent_replay=True,
+        )
+
+    @staticmethod
+    def _decorate_execution_result(
+        *,
+        result: dict,
+        execution: ActionExecutionRecord,
+        incident: IncidentState | None,
+        idempotent_replay: bool,
+    ) -> dict:
+        decorated = dict(
+            result
+        )
+
+        decorated.update(
+            {
+                "approval_id": execution.approval_id,
+                "execution_id": str(execution.id),
+                "execution_status": execution.status.value,
+                "idempotency_key": execution.idempotency_key,
+                "idempotent_replay": idempotent_replay,
+                "automatic_replay_allowed": False,
+                "action": execution.action.type.value,
+                "target": execution.action.target,
+                "incident_id": (
+                    str(execution.incident_id)
+                    if execution.incident_id is not None
+                    else None
+                ),
+                "incident_status": (
+                    incident.status.value
+                    if incident is not None
+                    else None
+                ),
+            }
+        )
+
+        return decorated
+
+    def _apply_trusted_scope(
+        self,
+        *,
+        plan: ActionPlan,
+        namespace: str | None,
+        cluster: str | None,
+    ) -> None:
+        """
+        Attach caller-supplied resource scope to the persisted ActionPlan.
+
+        Scope is never inferred from HealingAgent output or free-form action
+        metadata. Explicit arguments are normalized before policy evaluation
+        and before a possible ApprovalRequest is written to SQLite.
+        """
+
+        plan.namespace = self._normalize_scope_value(
+            namespace
+        )
+        plan.cluster = self._normalize_scope_value(
+            cluster
+        )
+
+    @staticmethod
+    def _normalize_scope_value(
+        value: str | None,
+    ) -> str | None:
+        if value is None:
+            return None
+
+        normalized = str(
+            value
+        ).strip()
+
+        return normalized or None
+
+    async def _execute_action(
+        self,
+        plan: ActionPlan,
+        incident: IncidentState | None,
+    ) -> dict:
+        """
+        Execute one legacy remediation action.
+
+        Successful execution remains HEALING until a separate
+        Verification step confirms service recovery.
+        """
+
+        await self._update_incident(
+            incident=incident,
+            status=IncidentStatus.HEALING,
+            reason=(
+                "Executing remediation action: "
+                f"{plan.type.value}"
+            ),
+        )
+
+        try:
+            result = await self.executor.execute(
+                plan
+            )
+
+        except Exception as exc:
+            await self._update_incident(
+                incident=incident,
+                status=(
+                    IncidentStatus.FAILED
+                ),
+                reason=(
+                    "Remediation executor raised "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            )
+
+            return {
+                "success": False,
+                "status": "execution_failed",
+                "action": plan.type.value,
+                "target": plan.target,
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+                "incident_id": (
+                    str(incident.id)
+                    if incident is not None
+                    else None
+                ),
+            }
+
+        if result.get("success") is True:
+            await self._update_incident(
+                incident=incident,
+                status=(
+                    IncidentStatus.HEALING
+                ),
+                reason=(
+                    "Remediation action executed; "
+                    "awaiting verification"
+                ),
+            )
+
+        else:
+            await self._update_incident(
+                incident=incident,
+                status=(
+                    IncidentStatus.FAILED
+                ),
+                reason=(
+                    "Remediation action failed: "
+                    f"{result.get('message', 'unknown error')}"
+                ),
+            )
+
+        if incident is not None:
+            result["incident_id"] = str(
+                incident.id
+            )
+            result["incident_status"] = (
+                incident.status.value
+            )
+
+        return result
+
+    async def _update_incident(
+        self,
+        incident: IncidentState | None,
+        status: IncidentStatus,
+        reason: str,
+    ) -> IncidentState | None:
+        """
+        Persist one Action lifecycle transition.
+
+        The caller's Incident object is updated only after the
+        database operation succeeds.
+        """
+
+        if incident is None:
+            return None
+
+        if self.incident_store is None:
+            incident.update(
+                status=status,
+                reason=reason,
+            )
+
+            return incident
+
+        stored_incident = (
+            await self.incident_store.get(
+                str(
+                    incident.id
+                )
+            )
+        )
+
+        if stored_incident is None:
+            try:
+                stored_incident = (
+                    await self.incident_store.save(
+                        incident
+                    )
+                )
+
+            except IncidentConflictError:
+                stored_incident = (
+                    await self.incident_store.get(
+                        str(
+                            incident.id
+                        )
+                    )
+
+                )
+
+                if stored_incident is None:
+                    raise
+
+        candidate = (
+            stored_incident.model_copy(
+                deep=True
+            )
+        )
+
+        candidate.update(
+            status=status,
+            reason=reason,
+        )
+
+        try:
+            persisted_incident = (
+                await self.incident_store.update(
+                    candidate,
+                    expected_status=(
+                        stored_incident.status
+                    ),
+                )
+            )
+
+        except IncidentConflictError:
+            current_incident = (
+                await self.incident_store.get(
+                    str(
+                        incident.id
+                    )
+                )
+            )
+
+            if current_incident is None:
+                raise
+
+            if (
+                current_incident.status
+                != status
+            ):
+                raise
+
+            persisted_incident = (
+                current_incident
+            )
+
+        self._copy_incident_state(
+            target=incident,
+            source=persisted_incident,
+        )
+
+        return incident
+
+    @staticmethod
+    def _copy_incident_state(
+        target: IncidentState,
+        source: IncidentState,
+    ) -> None:
+        """
+        Synchronize the caller's object without replacing its identity.
+        """
+
+        target.status = source.status
+        target.created_at = source.created_at
+        target.updated_at = source.updated_at
+        target.reason = source.reason

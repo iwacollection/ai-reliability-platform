@@ -1,0 +1,468 @@
+from datetime import timedelta
+from pathlib import Path
+
+import pytest
+
+from common.config.settings import (
+    KUBERNETES_PRODUCTION_WRITE_ACKNOWLEDGEMENT,
+    KubernetesPreflightConfig,
+    KubernetesPreflightTargetConfig,
+    KubernetesProductionExecutionConfig,
+)
+from services.agent_runtime.app.action.execution_service import (
+    ActionExecutionService,
+)
+from services.agent_runtime.app.action.execution_store import (
+    ActionExecutionStore,
+)
+from services.agent_runtime.app.action.kubernetes_production_executor import (
+    KubernetesProductionExecutor,
+    KubernetesProductionExecutorPolicy,
+)
+from services.agent_runtime.app.approval.models import (
+    ApprovalStatus,
+)
+from services.agent_runtime.app.action.production_pilot import (
+    KUBERNETES_PRODUCTION_KILL_SWITCH_DISENGAGED,
+    KUBERNETES_PRODUCTION_RUNBOOK_ACKNOWLEDGEMENT,
+    KubernetesProductionPilotConfig,
+    KubernetesProductionPilotControl,
+)
+from services.agent_runtime.app.runtime.action_runtime import (
+    ActionRuntime,
+)
+from services.agent_runtime.tests.production_action_expiry_support import (
+    APPROVAL_ID,
+    MutableClock,
+    NOW,
+    generic_action,
+    isolated_services,
+    persist_prepared_workflow,
+    workload_scope,
+)
+
+
+class RecordingExecutor:
+    def __init__(
+        self,
+    ) -> None:
+        self.calls = []
+
+    async def execute(
+        self,
+        action,
+    ):
+        self.calls.append(
+            action.model_copy(
+                deep=True
+            )
+        )
+        return {
+            "success": True,
+            "message": (
+                "Mock bounded remediation completed"
+            ),
+            "action": action.type.value,
+            "target": action.target,
+        }
+
+
+class RecordingProductionExecutor(
+    KubernetesProductionExecutor
+):
+    def __init__(
+        self,
+        pilot_control,
+    ) -> None:
+        super().__init__(
+            api_url="https://kubernetes.test",
+            cluster_name="production-a",
+            policy=KubernetesProductionExecutorPolicy(
+                enabled=True,
+                allowed_targets=(
+                    workload_scope(),
+                ),
+            ),
+            bearer_token=(
+                "production-writer-token-0001"
+            ),
+            pilot_control=pilot_control,
+        )
+        self.calls = []
+
+    async def execute_claimed(
+        self,
+        execution,
+        record,
+    ):
+        self.calls.append(
+            (
+                execution.model_copy(
+                    deep=True
+                ),
+                record,
+            )
+        )
+        return {
+            "success": True,
+            "mode": "kubernetes_production",
+            "message": (
+                "Bounded production remediation completed"
+            ),
+            "action": execution.action.type.value,
+            "target": execution.action.target,
+        }
+
+
+def ready_pilot_control(
+    clock,
+) -> KubernetesProductionPilotControl:
+    return KubernetesProductionPilotControl(
+        config=KubernetesProductionPilotConfig(
+            enabled=True,
+            pilot_id="oom-expiry-test",
+            change_ticket="CHG-4001",
+            runbook_version="oom-runbook-v1",
+            runbook_acknowledgement=(
+                KUBERNETES_PRODUCTION_RUNBOOK_ACKNOWLEDGEMENT
+            ),
+            kill_switch_file="pilot-switch",
+            authorized_operator_ids=(
+                "executor-runtime-test",
+            ),
+            starts_at=NOW,
+            expires_at=(
+                NOW + timedelta(hours=1)
+            ),
+        ),
+        preflight_config=KubernetesPreflightConfig(
+            enabled=True,
+            api_url="https://kubernetes.test",
+            cluster_name="production-a",
+            bearer_token_env="K8S_PREFLIGHT_TOKEN",
+            allowed_targets=(
+                KubernetesPreflightTargetConfig(
+                    cluster="production-a",
+                    namespace="payment",
+                    deployment="payment-api",
+                    container="payment-api",
+                ),
+            ),
+        ),
+        execution_config=(
+            KubernetesProductionExecutionConfig(
+                enabled=True,
+                write_acknowledgement=(
+                    KUBERNETES_PRODUCTION_WRITE_ACKNOWLEDGEMENT
+                ),
+                bearer_token_env=(
+                    "K8S_PRODUCTION_EXECUTION_TOKEN"
+                ),
+            )
+        ),
+        clock=clock,
+        switch_reader=(
+            lambda _: (
+                KUBERNETES_PRODUCTION_KILL_SWITCH_DISENGAGED
+            )
+        ),
+    )
+
+
+async def runtime_state(
+    tmp_path: Path,
+):
+    clock = MutableClock(
+        NOW
+        + timedelta(minutes=1)
+    )
+    (
+        artifact_service,
+        guard,
+        approval_service,
+        incident_store,
+    ) = isolated_services(
+        tmp_path,
+        clock,
+    )
+    _, approval, incident = (
+        await persist_prepared_workflow(
+            artifact_service=artifact_service,
+            approval_service=approval_service,
+            incident_store=incident_store,
+        )
+    )
+    approved = await approval_service.approve(
+        approval.id,
+        operator_id="approver-runtime-test",
+        idempotency_key="approve-runtime-0001",
+        reason="Approved before expiry",
+        metadata={
+            "source": "test",
+        },
+    )
+    execution_service = ActionExecutionService(
+        ActionExecutionStore(
+            tmp_path
+            / "action_executions.db"
+        )
+    )
+    pilot_control = ready_pilot_control(
+        clock
+    )
+    executor = RecordingProductionExecutor(
+        pilot_control
+    )
+    runtime = ActionRuntime(
+        approval_service=approval_service,
+        incident_store=incident_store,
+        action_execution_service=(
+            execution_service
+        ),
+        production_action_guard=guard,
+        kubernetes_production_executor=executor,
+        preflight_artifact_service=(
+            artifact_service
+        ),
+        production_pilot_control=(
+            pilot_control
+        ),
+    )
+    return (
+        clock,
+        approval_service,
+        incident_store,
+        execution_service,
+        runtime,
+        executor,
+        approved,
+        incident,
+    )
+
+
+@pytest.mark.asyncio
+async def test_expired_resume_creates_no_claim_and_calls_no_executor(
+    tmp_path: Path,
+):
+    (
+        clock,
+        _,
+        incident_store,
+        execution_service,
+        runtime,
+        executor,
+        _,
+        incident,
+    ) = await runtime_state(
+        tmp_path
+    )
+    incident_before = await incident_store.get(
+        str(incident.id)
+    )
+    clock.set(
+        NOW
+        + timedelta(minutes=11)
+    )
+
+    result = await runtime.resume(
+        APPROVAL_ID,
+        incident=incident,
+        operator_id="executor-runtime-test",
+        idempotency_key="execute-runtime-0001",
+    )
+
+    assert result[
+        "status"
+    ] == "preflight_contract_expired"
+    assert result[
+        "requires_new_preflight"
+    ] is True
+    assert result[
+        "executor_called"
+    ] is False
+    assert executor.calls == []
+    assert await execution_service.get_by_approval(
+        APPROVAL_ID
+    ) is None
+    assert await incident_store.get(
+        str(incident.id)
+    ) == incident_before
+
+
+@pytest.mark.asyncio
+async def test_exact_resume_replay_survives_later_expiry(
+    tmp_path: Path,
+):
+    (
+        clock,
+        _,
+        _,
+        execution_service,
+        runtime,
+        executor,
+        _,
+        incident,
+    ) = await runtime_state(
+        tmp_path
+    )
+    arguments = {
+        "incident": incident,
+        "operator_id": "executor-runtime-test",
+        "idempotency_key": "execute-runtime-0001",
+    }
+
+    first = await runtime.resume(
+        APPROVAL_ID,
+        **arguments,
+    )
+    clock.set(
+        NOW
+        + timedelta(minutes=11)
+    )
+    replay = await runtime.resume(
+        APPROVAL_ID,
+        **arguments,
+    )
+
+    assert first[
+        "execution_status"
+    ] == "succeeded"
+    assert first[
+        "idempotent_replay"
+    ] is False
+    assert replay[
+        "execution_status"
+    ] == "succeeded"
+    assert replay[
+        "idempotent_replay"
+    ] is True
+    assert len(executor.calls) == 1
+    assert await execution_service.get_by_approval(
+        APPROVAL_ID
+    ) is not None
+
+
+@pytest.mark.asyncio
+async def test_expiry_between_claim_and_executor_is_durably_blocked(
+    tmp_path: Path,
+):
+    (
+        clock,
+        _,
+        _,
+        execution_service,
+        runtime,
+        executor,
+        _,
+        incident,
+    ) = await runtime_state(
+        tmp_path
+    )
+    clock.set_sequence(
+        NOW
+        + timedelta(minutes=9, seconds=59),
+        NOW
+        + timedelta(minutes=11),
+    )
+    arguments = {
+        "incident": incident,
+        "operator_id": "executor-runtime-test",
+        "idempotency_key": "execute-runtime-race-0001",
+    }
+
+    first = await runtime.resume(
+        APPROVAL_ID,
+        **arguments,
+    )
+    replay = await runtime.resume(
+        APPROVAL_ID,
+        **arguments,
+    )
+
+    assert first[
+        "status"
+    ] == "preflight_contract_expired"
+    assert first[
+        "execution_status"
+    ] == "failed"
+    assert first[
+        "blocked_before_executor"
+    ] is True
+    assert first[
+        "idempotent_replay"
+    ] is False
+    assert replay[
+        "status"
+    ] == "preflight_contract_expired"
+    assert replay[
+        "execution_status"
+    ] == "failed"
+    assert replay[
+        "idempotent_replay"
+    ] is True
+    assert executor.calls == []
+
+    persisted = (
+        await execution_service.get_by_approval(
+            APPROVAL_ID
+        )
+    )
+    assert persisted is not None
+    assert persisted.status.value == "failed"
+
+
+@pytest.mark.asyncio
+async def test_generic_approved_action_keeps_legacy_execution_behavior(
+    tmp_path: Path,
+):
+    clock = MutableClock(
+        NOW
+        + timedelta(minutes=30)
+    )
+    (
+        _,
+        guard,
+        approval_service,
+        incident_store,
+    ) = isolated_services(
+        tmp_path,
+        clock,
+    )
+    generic = await approval_service.create_approval(
+        action=generic_action(),
+        reason="Legacy compatible Approval",
+    )
+    approved = await approval_service.approve(
+        generic.id
+    )
+    assert approved.status == (
+        ApprovalStatus.APPROVED
+    )
+
+    execution_service = ActionExecutionService(
+        ActionExecutionStore(
+            tmp_path
+            / "action_executions.db"
+        )
+    )
+    runtime = ActionRuntime(
+        approval_service=approval_service,
+        incident_store=incident_store,
+        action_execution_service=(
+            execution_service
+        ),
+        production_action_guard=guard,
+    )
+    executor = RecordingExecutor()
+    runtime.executor = executor
+
+    result = await runtime.resume(
+        approved.id,
+        operator_id="executor-runtime-test",
+        idempotency_key="legacy-execute-0001",
+    )
+
+    assert result[
+        "execution_status"
+    ] == "succeeded"
+    assert len(executor.calls) == 1

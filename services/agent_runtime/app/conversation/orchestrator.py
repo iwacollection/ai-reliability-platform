@@ -1,0 +1,459 @@
+from __future__ import annotations
+
+from services.agent_runtime.app.conversation.classifier import (
+    DeterministicConversationIntentClassifier,
+)
+from services.agent_runtime.app.conversation.models import (
+    ConversationIncidentContext,
+    ConversationIntent,
+    ConversationReplyMode,
+    ConversationReplyPlan,
+    ConversationReplySection,
+    ConversationTurnRequest,
+)
+from services.agent_runtime.app.conversation.provider import (
+    BaseConversationIncidentContextProvider,
+)
+from services.agent_runtime.app.conversation.store import (
+    InMemoryConversationSessionStore,
+    SQLiteConversationSessionStore,
+)
+
+
+class ConversationOrchestrator:
+    """
+    Channel-neutral ChatOps core.
+
+    v1 binds a conversation to an Incident, classifies intent, reads a stable
+    Incident projection, and returns a structured reply plan.
+
+    It has no direct Action/Approval/Verification write authority.
+    """
+
+    _WRITE_INTENTS = {
+        ConversationIntent.APPROVE,
+        ConversationIntent.REJECT,
+        ConversationIntent.REMEDIATE,
+    }
+
+    def __init__(
+        self,
+        *,
+        provider: BaseConversationIncidentContextProvider,
+        sessions: (
+            InMemoryConversationSessionStore
+            | SQLiteConversationSessionStore
+            | None
+        ) = None,
+        classifier: (
+            DeterministicConversationIntentClassifier
+            | None
+        ) = None,
+    ) -> None:
+        if not isinstance(
+            provider,
+            BaseConversationIncidentContextProvider,
+        ):
+            raise TypeError(
+                "Conversation context provider is invalid"
+            )
+
+        self.provider = provider
+        self.sessions = (
+            sessions
+            or InMemoryConversationSessionStore()
+        )
+        self.classifier = (
+            classifier
+            or DeterministicConversationIntentClassifier()
+        )
+
+    async def handle(
+        self,
+        request: ConversationTurnRequest,
+    ) -> ConversationReplyPlan:
+        if not isinstance(
+            request,
+            ConversationTurnRequest,
+        ):
+            raise TypeError(
+                "Conversation request is invalid"
+            )
+
+        intent = self.classifier.classify(
+            request.text
+        )
+
+        current = await self.sessions.get(
+            request.conversation_id
+        )
+
+        incident_id = (
+            request.incident_id
+            or (
+                current.incident_id
+                if current is not None
+                else None
+            )
+        )
+
+        await self.sessions.update(
+            conversation_id=request.conversation_id,
+            incident_id=incident_id,
+            intent=intent,
+        )
+
+        if intent == ConversationIntent.HELP:
+            return self._help(
+                request,
+                incident_id,
+            )
+
+        if incident_id is None:
+            return ConversationReplyPlan(
+                conversation_id=request.conversation_id,
+                incident_id=None,
+                intent=intent,
+                mode=ConversationReplyMode.NEEDS_INCIDENT,
+                sections=(
+                    ConversationReplySection(
+                        key="incident_binding",
+                        title="需要 Incident",
+                        lines=(
+                            "请先绑定一个 Incident，再继续查询或操作。",
+                        ),
+                    ),
+                ),
+                suggested_actions=(
+                    "bind_incident",
+                    "help",
+                ),
+            )
+
+        context = await self.provider.get(
+            incident_id
+        )
+
+        if context is None:
+            return ConversationReplyPlan(
+                conversation_id=request.conversation_id,
+                incident_id=incident_id,
+                intent=intent,
+                mode=(
+                    ConversationReplyMode
+                    .INCIDENT_NOT_FOUND
+                ),
+                sections=(
+                    ConversationReplySection(
+                        key="incident",
+                        title="Incident 不存在",
+                        lines=(
+                            f"未找到 Incident {incident_id}。",
+                        ),
+                    ),
+                ),
+                suggested_actions=("bind_incident",),
+            )
+
+        if intent in self._WRITE_INTENTS:
+            return self._write_intent(
+                request=request,
+                context=context,
+                intent=intent,
+            )
+
+        if intent == ConversationIntent.STATUS:
+            return self._status(request, context)
+
+        if intent == ConversationIntent.RCA:
+            return self._rca(request, context)
+
+        if intent == ConversationIntent.EVIDENCE:
+            return self._evidence(request, context)
+
+        if intent == ConversationIntent.NEXT_STEP:
+            return self._next_step(request, context)
+
+        if intent == ConversationIntent.VERIFICATION:
+            return self._verification(request, context)
+
+        return self._unknown(request, context)
+
+    @staticmethod
+    def _base(
+        request,
+        context,
+        *,
+        intent,
+        sections,
+        suggested_actions=(),
+    ):
+        return ConversationReplyPlan(
+            conversation_id=request.conversation_id,
+            incident_id=context.incident_id,
+            intent=intent,
+            mode=ConversationReplyMode.READ_ONLY,
+            sections=tuple(sections),
+            suggested_actions=tuple(suggested_actions),
+        )
+
+    def _status(self, request, context):
+        lines = [f"状态: {context.status}"]
+
+        if context.title:
+            lines.append(f"事件: {context.title}")
+
+        if context.approval_status:
+            lines.append(
+                f"审批: {context.approval_status}"
+            )
+
+        if context.action_execution_status:
+            lines.append(
+                "执行: "
+                + context.action_execution_status
+            )
+
+        if context.verification_status:
+            lines.append(
+                f"验证: {context.verification_status}"
+            )
+
+        return self._base(
+            request,
+            context,
+            intent=ConversationIntent.STATUS,
+            sections=(
+                ConversationReplySection(
+                    key="status",
+                    title="Incident 状态",
+                    lines=tuple(lines),
+                ),
+            ),
+            suggested_actions=(
+                "show_rca",
+                "show_evidence",
+                "what_next",
+            ),
+        )
+
+    def _rca(self, request, context):
+        if context.root_cause:
+            confidence = (
+                f"{context.root_cause_confidence:.0%}"
+                if context.root_cause_confidence is not None
+                else "unknown"
+            )
+            lines = (
+                f"根因: {context.root_cause}",
+                f"置信度: {confidence}",
+            )
+        elif context.hypotheses:
+            best = max(
+                context.hypotheses,
+                key=lambda item: item.confidence,
+            )
+            lines = (
+                "当前尚无最终根因。",
+                f"最高假设: {best.cause}",
+                f"假设置信度: {best.confidence:.0%}",
+            )
+        else:
+            lines = (
+                "当前还没有足够证据形成 RCA。",
+            )
+
+        return self._base(
+            request,
+            context,
+            intent=ConversationIntent.RCA,
+            sections=(
+                ConversationReplySection(
+                    key="rca",
+                    title="根因分析",
+                    lines=lines,
+                ),
+            ),
+            suggested_actions=(
+                "show_evidence",
+                "what_next",
+            ),
+        )
+
+    def _evidence(self, request, context):
+        if not context.evidence:
+            lines = ("当前还没有可展示的证据。",)
+        else:
+            lines = tuple(
+                (
+                    ("✓ " if item.trusted else "△ ")
+                    + item.summary
+                    + f" [{item.source}]"
+                )
+                for item in context.evidence
+            )
+
+        return self._base(
+            request,
+            context,
+            intent=ConversationIntent.EVIDENCE,
+            sections=(
+                ConversationReplySection(
+                    key="evidence",
+                    title="证据",
+                    lines=lines,
+                ),
+            ),
+            suggested_actions=(
+                "show_rca",
+                "what_next",
+            ),
+        )
+
+    def _next_step(self, request, context):
+        lines = []
+
+        if context.recommended_action:
+            lines.append(
+                f"建议: {context.recommended_action}"
+            )
+
+            if context.action_risk:
+                lines.append(
+                    f"风险: {context.action_risk}"
+                )
+
+            if context.approval_status:
+                lines.append(
+                    f"审批状态: {context.approval_status}"
+                )
+        elif context.root_cause:
+            lines.append(
+                "根因已经形成，但当前没有可执行修复建议。"
+            )
+        else:
+            lines.append(
+                "继续收集证据并缩小根因假设。"
+            )
+
+        return self._base(
+            request,
+            context,
+            intent=ConversationIntent.NEXT_STEP,
+            sections=(
+                ConversationReplySection(
+                    key="next_step",
+                    title="下一步",
+                    lines=tuple(lines),
+                ),
+            ),
+            suggested_actions=(
+                (
+                    "request_remediation"
+                    if context.recommended_action
+                    else "show_evidence"
+                ),
+            ),
+        )
+
+    def _verification(self, request, context):
+        lines = (
+            (
+                f"验证状态: {context.verification_status}"
+                if context.verification_status
+                else "当前还没有 Verification 结果。"
+            ),
+        )
+
+        return self._base(
+            request,
+            context,
+            intent=ConversationIntent.VERIFICATION,
+            sections=(
+                ConversationReplySection(
+                    key="verification",
+                    title="恢复验证",
+                    lines=lines,
+                ),
+            ),
+            suggested_actions=("show_status",),
+        )
+
+    @staticmethod
+    def _write_intent(
+        *,
+        request,
+        context,
+        intent,
+    ):
+        operation = {
+            ConversationIntent.APPROVE: "approval.approve",
+            ConversationIntent.REJECT: "approval.reject",
+            ConversationIntent.REMEDIATE: "action.resume",
+        }[intent]
+
+        return ConversationReplyPlan(
+            conversation_id=request.conversation_id,
+            incident_id=context.incident_id,
+            intent=intent,
+            mode=(
+                ConversationReplyMode
+                .WRITE_ACTION_REQUIRED
+            ),
+            sections=(
+                ConversationReplySection(
+                    key="write_boundary",
+                    title="需要认证写操作",
+                    lines=(
+                        "Conversation Orchestrator v1 不直接执行写操作。",
+                        "该意图必须通过现有认证、RBAC、Approval/Action 边界继续。",
+                    ),
+                ),
+            ),
+            suggested_actions=(
+                "open_authenticated_write_flow",
+                "show_status",
+            ),
+            write_operation=operation,
+        )
+
+    @staticmethod
+    def _help(request, incident_id):
+        return ConversationReplyPlan(
+            conversation_id=request.conversation_id,
+            incident_id=incident_id,
+            intent=ConversationIntent.HELP,
+            mode=ConversationReplyMode.READ_ONLY,
+            sections=(
+                ConversationReplySection(
+                    key="help",
+                    title="可以这样问",
+                    lines=(
+                        "现在状态怎么样？",
+                        "根因是什么？",
+                        "有哪些证据？",
+                        "下一步怎么办？",
+                        "验证结果怎么样？",
+                        "帮我修一下。",
+                        "批准执行。",
+                    ),
+                ),
+            ),
+        )
+
+    def _unknown(self, request, context):
+        return self._base(
+            request,
+            context,
+            intent=ConversationIntent.UNKNOWN,
+            sections=(
+                ConversationReplySection(
+                    key="unknown",
+                    title="我还不能确定你的意图",
+                    lines=(
+                        "可以询问状态、根因、证据、下一步或验证结果。",
+                    ),
+                ),
+            ),
+            suggested_actions=("help",),
+        )

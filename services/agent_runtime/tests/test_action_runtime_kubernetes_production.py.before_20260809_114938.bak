@@ -1,0 +1,413 @@
+from datetime import timedelta
+from pathlib import Path
+
+import pytest
+
+from services.agent_runtime.app.action.execution_service import (
+    ActionExecutionService,
+)
+from services.agent_runtime.app.action.execution_store import (
+    ActionExecutionStore,
+)
+from services.agent_runtime.app.action.kubernetes_production_executor import (
+    KubernetesProductionExecutor,
+    KubernetesProductionExecutorConflictError,
+    KubernetesProductionExecutorPolicy,
+    KubernetesProductionOutcomeIndeterminateError,
+)
+from services.agent_runtime.app.action.models import (
+    ActionPlan,
+)
+from services.agent_runtime.app.incident.enums import (
+    IncidentStatus,
+)
+from services.agent_runtime.app.runtime.action_runtime import (
+    ActionRuntime,
+)
+from services.agent_runtime.tests.production_action_expiry_support import (
+    APPROVAL_ID,
+    MutableClock,
+    NOW,
+    generic_action,
+    isolated_services,
+    persist_prepared_workflow,
+    workload_scope,
+)
+
+
+class StubProductionExecutor(
+    KubernetesProductionExecutor
+):
+    def __init__(
+        self,
+        outcome,
+    ) -> None:
+        super().__init__(
+            api_url="https://kubernetes.test",
+            cluster_name="production-a",
+            policy=KubernetesProductionExecutorPolicy(
+                enabled=True,
+                allowed_targets=(
+                    workload_scope(),
+                ),
+            ),
+            bearer_token=(
+                "production-writer-token-0001"
+            ),
+        )
+        self.outcome = outcome
+        self.calls = []
+
+    async def execute_claimed(
+        self,
+        execution,
+        record,
+    ):
+        self.calls.append(
+            (
+                execution.model_copy(
+                    deep=True
+                ),
+                record,
+            )
+        )
+        if isinstance(
+            self.outcome,
+            Exception,
+        ):
+            raise self.outcome
+        return dict(
+            self.outcome
+        )
+
+
+class RecordingMockExecutor:
+    def __init__(self) -> None:
+        self.calls: list[ActionPlan] = []
+
+    async def execute(
+        self,
+        action: ActionPlan,
+    ) -> dict:
+        self.calls.append(
+            action.model_copy(
+                deep=True
+            )
+        )
+        return {
+            "success": True,
+            "mode": "mock",
+            "action": action.type.value,
+            "target": action.target,
+        }
+
+
+async def production_runtime(
+    tmp_path: Path,
+    *,
+    outcome=None,
+    enabled: bool = True,
+):
+    clock = MutableClock(
+        NOW
+        + timedelta(minutes=1)
+    )
+    (
+        artifact_service,
+        guard,
+        approval_service,
+        incident_store,
+    ) = isolated_services(
+        tmp_path,
+        clock,
+    )
+    _, approval, incident = (
+        await persist_prepared_workflow(
+            artifact_service=artifact_service,
+            approval_service=approval_service,
+            incident_store=incident_store,
+        )
+    )
+    await approval_service.approve(
+        approval.id,
+        operator_id="approver-production-test",
+        idempotency_key="approve-production-0001",
+        reason="Approve bounded production remediation",
+    )
+    execution_service = ActionExecutionService(
+        ActionExecutionStore(
+            tmp_path
+            / "action_executions.db"
+        )
+    )
+    production_executor = (
+        StubProductionExecutor(
+            outcome
+            or {
+                "success": True,
+                "mode": "kubernetes_production",
+                "action": "increase_memory_limit",
+                "target": "payment-api",
+                "message": (
+                    "Kubernetes acknowledged bounded update"
+                ),
+            }
+        )
+        if enabled
+        else None
+    )
+    runtime = ActionRuntime(
+        approval_service=approval_service,
+        incident_store=incident_store,
+        action_execution_service=execution_service,
+        production_action_guard=guard,
+        kubernetes_production_executor=(
+            production_executor
+        ),
+        preflight_artifact_service=(
+            artifact_service
+            if enabled
+            else None
+        ),
+    )
+    mock_executor = RecordingMockExecutor()
+    runtime.executor = mock_executor
+    return (
+        runtime,
+        production_executor,
+        mock_executor,
+        execution_service,
+        approval_service,
+        incident_store,
+        incident,
+    )
+
+
+def resume_arguments(
+    incident,
+) -> dict:
+    return {
+        "incident": incident,
+        "operator_id": "executor-production-test",
+        "idempotency_key": "execute-production-0001",
+    }
+
+
+def test_production_execution_components_must_be_shared():
+    executor = StubProductionExecutor(
+        {
+            "success": True,
+        }
+    )
+    with pytest.raises(
+        TypeError,
+        match="components must be shared",
+    ):
+        ActionRuntime(
+            kubernetes_production_executor=executor,
+        )
+
+
+@pytest.mark.asyncio
+async def test_disabled_production_gate_blocks_before_claim_and_mock(
+    tmp_path: Path,
+):
+    (
+        runtime,
+        production_executor,
+        mock_executor,
+        execution_service,
+        _,
+        _,
+        incident,
+    ) = await production_runtime(
+        tmp_path,
+        enabled=False,
+    )
+
+    result = await runtime.resume(
+        APPROVAL_ID,
+        **resume_arguments(incident),
+    )
+
+    assert result["status"] == "production_execution_disabled"
+    assert result["retryable_after_enable"] is True
+    assert result["executor_called"] is False
+    assert result["real_write_attempted"] is False
+    assert production_executor is None
+    assert mock_executor.calls == []
+    assert await execution_service.get_by_approval(APPROVAL_ID) is None
+
+
+@pytest.mark.asyncio
+async def test_production_success_is_persisted_and_exact_replay_calls_once(
+    tmp_path: Path,
+):
+    (
+        runtime,
+        production_executor,
+        mock_executor,
+        execution_service,
+        _,
+        _,
+        incident,
+    ) = await production_runtime(tmp_path)
+    arguments = resume_arguments(incident)
+
+    first = await runtime.resume(APPROVAL_ID, **arguments)
+    replay = await runtime.resume(APPROVAL_ID, **arguments)
+
+    assert first["success"] is True
+    assert first["execution_status"] == "succeeded"
+    assert first["idempotent_replay"] is False
+    assert replay["execution_status"] == "succeeded"
+    assert replay["idempotent_replay"] is True
+    assert len(production_executor.calls) == 1
+    assert mock_executor.calls == []
+    persisted = await execution_service.get_by_approval(APPROVAL_ID)
+    assert persisted is not None
+    assert persisted.status.value == "succeeded"
+    assert incident.status == IncidentStatus.HEALING
+
+
+@pytest.mark.asyncio
+async def test_persisted_success_replays_after_feature_gate_is_disabled(
+    tmp_path: Path,
+):
+    (
+        runtime,
+        production_executor,
+        _,
+        execution_service,
+        approval_service,
+        incident_store,
+        incident,
+    ) = await production_runtime(tmp_path)
+    arguments = resume_arguments(incident)
+    first = await runtime.resume(APPROVAL_ID, **arguments)
+
+    restarted_disabled = ActionRuntime(
+        approval_service=approval_service,
+        incident_store=incident_store,
+        action_execution_service=execution_service,
+        production_action_guard=(
+            runtime.production_action_guard
+        ),
+    )
+    replay = await restarted_disabled.resume(
+        APPROVAL_ID,
+        **arguments,
+    )
+
+    assert first["execution_status"] == "succeeded"
+    assert replay["execution_status"] == "succeeded"
+    assert replay["idempotent_replay"] is True
+    assert len(production_executor.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_production_write_is_indeterminate_and_never_replayed(
+    tmp_path: Path,
+):
+    error = KubernetesProductionOutcomeIndeterminateError(
+        "write acknowledgement was unavailable"
+    )
+    (
+        runtime,
+        production_executor,
+        mock_executor,
+        execution_service,
+        _,
+        _,
+        incident,
+    ) = await production_runtime(
+        tmp_path,
+        outcome=error,
+    )
+    arguments = resume_arguments(incident)
+
+    first = await runtime.resume(APPROVAL_ID, **arguments)
+    replay = await runtime.resume(APPROVAL_ID, **arguments)
+
+    assert first["status"] == "execution_indeterminate"
+    assert first["execution_status"] == "indeterminate"
+    assert first["real_write_attempted"] is True
+    assert first["requires_reconciliation"] is True
+    assert replay["execution_status"] == "indeterminate"
+    assert replay["idempotent_replay"] is True
+    assert len(production_executor.calls) == 1
+    assert mock_executor.calls == []
+    persisted = await execution_service.get_by_approval(APPROVAL_ID)
+    assert persisted is not None
+    assert persisted.status.value == "indeterminate"
+
+
+@pytest.mark.asyncio
+async def test_definite_prewrite_conflict_is_failed_not_indeterminate(
+    tmp_path: Path,
+):
+    error = KubernetesProductionExecutorConflictError(
+        "Deployment resourceVersion changed after preflight"
+    )
+    (
+        runtime,
+        production_executor,
+        mock_executor,
+        execution_service,
+        _,
+        _,
+        incident,
+    ) = await production_runtime(
+        tmp_path,
+        outcome=error,
+    )
+    arguments = resume_arguments(incident)
+
+    first = await runtime.resume(APPROVAL_ID, **arguments)
+    replay = await runtime.resume(APPROVAL_ID, **arguments)
+
+    assert first["status"] == "production_precondition_changed"
+    assert first["execution_status"] == "failed"
+    assert first["requires_new_preflight"] is True
+    assert first["requires_reconciliation"] is False
+    assert first["real_write_attempted"] is False
+    assert replay["execution_status"] == "failed"
+    assert replay["idempotent_replay"] is True
+    assert len(production_executor.calls) == 1
+    assert mock_executor.calls == []
+    persisted = await execution_service.get_by_approval(APPROVAL_ID)
+    assert persisted is not None
+    assert persisted.status.value == "failed"
+
+
+@pytest.mark.asyncio
+async def test_generic_approval_still_uses_mock_executor(
+    tmp_path: Path,
+):
+    (
+        runtime,
+        production_executor,
+        mock_executor,
+        _,
+        approval_service,
+        _,
+        _,
+    ) = await production_runtime(tmp_path)
+    approval = await approval_service.create_approval(
+        action=generic_action(),
+        reason="Legacy compatible action",
+    )
+    await approval_service.approve(
+        approval.id
+    )
+
+    result = await runtime.resume(
+        approval.id,
+        operator_id="executor-generic-test",
+        idempotency_key="execute-generic-0001",
+    )
+
+    assert result["success"] is True
+    assert result["mode"] == "mock"
+    assert len(mock_executor.calls) == 1
+    assert production_executor.calls == []

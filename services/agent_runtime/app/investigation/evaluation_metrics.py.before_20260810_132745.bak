@@ -1,0 +1,764 @@
+from collections.abc import Iterable, Mapping
+from math import isfinite
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+
+class InvestigationEvaluationMetrics(
+    BaseModel
+):
+    """
+    Aggregate evaluation-only metrics for RCA vs Investigation Shadow.
+
+    These metrics have no runtime, remediation, Healing, Approval or Action
+    authority.
+
+    Rates are None when their denominator is zero so "no observations" is
+    never silently represented as a successful 0% or 100% result.
+    """
+
+    schema_version: str = "v1"
+
+    total_samples: int = 0
+
+    valid_snapshot_count: int = 0
+
+    invalid_snapshot_count: int = 0
+
+    comparable_count: int = 0
+
+    matched_count: int = 0
+
+    mismatched_count: int = 0
+
+    rca_available_count: int = 0
+
+    investigation_conclusion_count: int = 0
+
+    rca_unavailable_count: int = 0
+
+    investigation_no_conclusion_count: int = 0
+
+    investigation_orchestration_failed_count: int = 0
+
+    comparison_failed_count: int = 0
+
+    other_unavailable_count: int = 0
+
+    confidence_comparable_count: int = 0
+
+    investigation_higher_confidence_count: int = 0
+
+    equal_confidence_count: int = 0
+
+    investigation_lower_confidence_count: int = 0
+
+    comparison_coverage: float | None = None
+
+    agreement_rate: float | None = None
+
+    mismatch_rate: float | None = None
+
+    investigation_conclusion_rate: float | None = None
+
+    rca_availability_rate: float | None = None
+
+    orchestration_failure_rate: float | None = None
+
+    confidence_uplift_rate: float | None = None
+
+    mean_confidence_delta: float | None = None
+
+    mean_absolute_confidence_delta: float | None = None
+
+    mean_investigation_evidence_count: float | None = None
+
+    mean_trusted_evidence_count: float | None = None
+
+    mean_conclusion_evidence_count: float | None = None
+
+    trusted_evidence_ratio: float | None = None
+
+    status_counts: dict[str, int] = Field(
+        default_factory=dict
+    )
+
+
+def aggregate_rca_comparisons(
+    samples: Iterable[Any],
+) -> InvestigationEvaluationMetrics:
+    """
+    Aggregate deterministic RCA/Investigation comparison snapshots.
+
+    Input snapshots are expected to be produced by
+    build_rca_investigation_comparison().
+
+    Invalid or malformed snapshots are counted rather than silently skipped,
+    because dropping malformed samples would artificially improve evaluation
+    coverage.
+
+    No root-cause text or raw evidence is retained in the aggregate.
+    """
+
+    sample_list = list(
+        samples
+    )
+
+    total_samples = len(
+        sample_list
+    )
+
+    valid_snapshot_count = 0
+    invalid_snapshot_count = 0
+
+    comparable_count = 0
+    matched_count = 0
+    mismatched_count = 0
+
+    rca_available_count = 0
+    investigation_conclusion_count = 0
+
+    rca_unavailable_count = 0
+    investigation_no_conclusion_count = 0
+    investigation_orchestration_failed_count = 0
+    comparison_failed_count = 0
+    other_unavailable_count = 0
+
+    confidence_deltas: list[float] = []
+
+    investigation_higher_confidence_count = 0
+    equal_confidence_count = 0
+    investigation_lower_confidence_count = 0
+
+    investigation_evidence_counts: list[int] = []
+    trusted_evidence_counts: list[int] = []
+    conclusion_evidence_counts: list[int] = []
+
+    total_investigation_evidence = 0
+    total_trusted_evidence = 0
+
+    status_counts: dict[str, int] = {}
+
+    for sample in sample_list:
+
+        if not _valid_snapshot(
+            sample
+        ):
+            invalid_snapshot_count += 1
+            continue
+
+        valid_snapshot_count += 1
+
+        status = sample.get(
+            "comparison_status"
+        )
+
+        status_counts[
+            status
+        ] = (
+            status_counts.get(
+                status,
+                0,
+            )
+            + 1
+        )
+
+        rca = sample.get(
+            "rca"
+        )
+
+        investigation = sample.get(
+            "investigation"
+        )
+
+        rca_available = (
+            isinstance(
+                rca,
+                Mapping,
+            )
+            and rca.get(
+                "available"
+            )
+            is True
+        )
+
+        investigation_available = (
+            isinstance(
+                investigation,
+                Mapping,
+            )
+            and investigation.get(
+                "available"
+            )
+            is True
+        )
+
+        if rca_available:
+            rca_available_count += 1
+
+        if investigation_available:
+            investigation_conclusion_count += 1
+
+            evidence_count = _non_negative_int(
+                investigation.get(
+                    "evidence_count"
+                )
+            )
+
+            trusted_count = _non_negative_int(
+                investigation.get(
+                    "trusted_evidence_count"
+                )
+            )
+
+            conclusion_count = _non_negative_int(
+                investigation.get(
+                    "conclusion_evidence_count"
+                )
+            )
+
+            if evidence_count is not None:
+                investigation_evidence_counts.append(
+                    evidence_count
+                )
+
+                total_investigation_evidence += (
+                    evidence_count
+                )
+
+            if trusted_count is not None:
+                trusted_evidence_counts.append(
+                    trusted_count
+                )
+
+                total_trusted_evidence += (
+                    trusted_count
+                )
+
+            if conclusion_count is not None:
+                conclusion_evidence_counts.append(
+                    conclusion_count
+                )
+
+        if status == "matched":
+            matched_count += 1
+            comparable_count += 1
+
+        elif status == "mismatched":
+            mismatched_count += 1
+            comparable_count += 1
+
+        elif status == "rca_unavailable":
+            rca_unavailable_count += 1
+
+        elif status == "investigation_no_conclusion":
+            investigation_no_conclusion_count += 1
+
+        elif (
+            status
+            == "investigation_orchestration_failed"
+        ):
+            investigation_orchestration_failed_count += 1
+
+        elif status == "comparison_failed":
+            comparison_failed_count += 1
+
+        else:
+            other_unavailable_count += 1
+
+        comparison = sample.get(
+            "comparison"
+        )
+
+        if not isinstance(
+            comparison,
+            Mapping,
+        ):
+            continue
+
+        confidence_delta = _finite_float(
+            comparison.get(
+                "confidence_delta"
+            )
+        )
+
+        if confidence_delta is None:
+            continue
+
+        confidence_deltas.append(
+            confidence_delta
+        )
+
+        if confidence_delta > 0:
+            investigation_higher_confidence_count += 1
+
+        elif confidence_delta < 0:
+            investigation_lower_confidence_count += 1
+
+        else:
+            equal_confidence_count += 1
+
+    confidence_comparable_count = len(
+        confidence_deltas
+    )
+
+    return InvestigationEvaluationMetrics(
+
+        total_samples=total_samples,
+
+        valid_snapshot_count=(
+            valid_snapshot_count
+        ),
+
+        invalid_snapshot_count=(
+            invalid_snapshot_count
+        ),
+
+        comparable_count=comparable_count,
+
+        matched_count=matched_count,
+
+        mismatched_count=mismatched_count,
+
+        rca_available_count=(
+            rca_available_count
+        ),
+
+        investigation_conclusion_count=(
+            investigation_conclusion_count
+        ),
+
+        rca_unavailable_count=(
+            rca_unavailable_count
+        ),
+
+        investigation_no_conclusion_count=(
+            investigation_no_conclusion_count
+        ),
+
+        investigation_orchestration_failed_count=(
+            investigation_orchestration_failed_count
+        ),
+
+        comparison_failed_count=(
+            comparison_failed_count
+        ),
+
+        other_unavailable_count=(
+            other_unavailable_count
+        ),
+
+        confidence_comparable_count=(
+            confidence_comparable_count
+        ),
+
+        investigation_higher_confidence_count=(
+            investigation_higher_confidence_count
+        ),
+
+        equal_confidence_count=(
+            equal_confidence_count
+        ),
+
+        investigation_lower_confidence_count=(
+            investigation_lower_confidence_count
+        ),
+
+        comparison_coverage=_rate(
+            comparable_count,
+            total_samples,
+        ),
+
+        agreement_rate=_rate(
+            matched_count,
+            comparable_count,
+        ),
+
+        mismatch_rate=_rate(
+            mismatched_count,
+            comparable_count,
+        ),
+
+        investigation_conclusion_rate=_rate(
+            investigation_conclusion_count,
+            valid_snapshot_count,
+        ),
+
+        rca_availability_rate=_rate(
+            rca_available_count,
+            valid_snapshot_count,
+        ),
+
+        orchestration_failure_rate=_rate(
+            investigation_orchestration_failed_count,
+            valid_snapshot_count,
+        ),
+
+        confidence_uplift_rate=_rate(
+            investigation_higher_confidence_count,
+            confidence_comparable_count,
+        ),
+
+        mean_confidence_delta=_mean(
+            confidence_deltas
+        ),
+
+        mean_absolute_confidence_delta=_mean(
+            [
+                abs(
+                    value
+                )
+                for value
+                in confidence_deltas
+            ]
+        ),
+
+        mean_investigation_evidence_count=_mean(
+            investigation_evidence_counts
+        ),
+
+        mean_trusted_evidence_count=_mean(
+            trusted_evidence_counts
+        ),
+
+        mean_conclusion_evidence_count=_mean(
+            conclusion_evidence_counts
+        ),
+
+        trusted_evidence_ratio=_rate(
+            total_trusted_evidence,
+            total_investigation_evidence,
+        ),
+
+        status_counts=dict(
+            sorted(
+                status_counts.items()
+            )
+        ),
+    )
+
+
+def _valid_snapshot(
+    value: Any,
+) -> bool:
+    """
+    Validate the stable v1 evaluation envelope and its structural invariants.
+
+    The Aggregator must not allow malformed or contradictory comparison
+    snapshots to inflate coverage, agreement or evidence-quality metrics.
+
+    This remains an evaluation-only validation boundary. It performs no
+    remediation or runtime decision.
+    """
+
+    if not isinstance(
+        value,
+        Mapping,
+    ):
+        return False
+
+    if (
+        value.get(
+            "schema_version"
+        )
+        != "v1"
+    ):
+        return False
+
+    if (
+        value.get(
+            "shadow_mode"
+        )
+        is not True
+    ):
+        return False
+
+    if (
+        value.get(
+            "read_only"
+        )
+        is not True
+    ):
+        return False
+
+    if (
+        value.get(
+            "decision_influence"
+        )
+        is not False
+    ):
+        return False
+
+    available = value.get(
+        "available"
+    )
+
+    if not isinstance(
+        available,
+        bool,
+    ):
+        return False
+
+    status = value.get(
+        "comparison_status"
+    )
+
+    if status not in {
+        "matched",
+        "mismatched",
+        "rca_unavailable",
+        "investigation_no_conclusion",
+        "investigation_orchestration_failed",
+        "comparison_failed",
+    }:
+        return False
+
+    # comparison_failed is the intentionally minimal fail-safe Runtime
+    # envelope. It may not contain the normal nested summaries.
+    if status == "comparison_failed":
+        return available is False
+
+    rca = value.get(
+        "rca"
+    )
+
+    investigation = value.get(
+        "investigation"
+    )
+
+    comparison = value.get(
+        "comparison"
+    )
+
+    if not isinstance(
+        rca,
+        Mapping,
+    ):
+        return False
+
+    if not isinstance(
+        investigation,
+        Mapping,
+    ):
+        return False
+
+    if not isinstance(
+        comparison,
+        Mapping,
+    ):
+        return False
+
+    rca_available = rca.get(
+        "available"
+    )
+
+    investigation_available = (
+        investigation.get(
+            "available"
+        )
+    )
+
+    if not isinstance(
+        rca_available,
+        bool,
+    ):
+        return False
+
+    if not isinstance(
+        investigation_available,
+        bool,
+    ):
+        return False
+
+    if investigation_available:
+        evidence_count = _non_negative_int(
+            investigation.get(
+                "evidence_count"
+            )
+        )
+
+        trusted_count = _non_negative_int(
+            investigation.get(
+                "trusted_evidence_count"
+            )
+        )
+
+        conclusion_count = _non_negative_int(
+            investigation.get(
+                "conclusion_evidence_count"
+            )
+        )
+
+        if (
+            evidence_count is None
+            or trusted_count is None
+            or conclusion_count is None
+        ):
+            return False
+
+        # Conclusion Evidence Trust Closure guarantees conclusion evidence
+        # is trusted; trusted evidence must itself be part of total evidence.
+        if not (
+            0
+            <= conclusion_count
+            <= trusted_count
+            <= evidence_count
+        ):
+            return False
+
+    if status in {
+        "matched",
+        "mismatched",
+    }:
+        if available is not True:
+            return False
+
+        if (
+            rca_available is not True
+            or investigation_available
+            is not True
+        ):
+            return False
+
+        exact_match = comparison.get(
+            "exact_match"
+        )
+
+        normalized_match = comparison.get(
+            "normalized_text_match"
+        )
+
+        if not isinstance(
+            exact_match,
+            bool,
+        ):
+            return False
+
+        if not isinstance(
+            normalized_match,
+            bool,
+        ):
+            return False
+
+        if (
+            status == "matched"
+            and normalized_match is not True
+        ):
+            return False
+
+        if (
+            status == "mismatched"
+            and normalized_match is not False
+        ):
+            return False
+
+        return True
+
+    if available is not False:
+        return False
+
+    if (
+        status == "rca_unavailable"
+        and rca_available is not False
+    ):
+        return False
+
+    if (
+        status == "investigation_no_conclusion"
+        and investigation_available
+        is not False
+    ):
+        return False
+
+    return True
+
+def _non_negative_int(
+    value: Any,
+) -> int | None:
+    if (
+        isinstance(
+            value,
+            bool,
+        )
+        or not isinstance(
+            value,
+            int,
+        )
+        or value < 0
+    ):
+        return None
+
+    return value
+
+
+def _finite_float(
+    value: Any,
+) -> float | None:
+    if isinstance(
+        value,
+        bool,
+    ):
+        return None
+
+    try:
+        parsed = float(
+            value
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+    if not isfinite(
+        parsed
+    ):
+        return None
+
+    if (
+        parsed < -1.0
+        or parsed > 1.0
+    ):
+        return None
+
+    return parsed
+
+
+def _rate(
+    numerator: int,
+    denominator: int,
+) -> float | None:
+    if denominator <= 0:
+        return None
+
+    return round(
+        numerator
+        / denominator,
+        6,
+    )
+
+
+def _mean(
+    values: list[
+        int | float
+    ],
+) -> float | None:
+    if not values:
+        return None
+
+    return round(
+        sum(
+            values
+        )
+        / len(
+            values
+        ),
+        6,
+    )
+
+
+__all__ = [
+    "InvestigationEvaluationMetrics",
+    "aggregate_rca_comparisons",
+]

@@ -1,0 +1,153 @@
+from dataclasses import dataclass
+
+from services.agent_runtime.app.llm.gateway.models import (
+    LLMInvocationContext,
+)
+
+
+
+@dataclass
+class LLMRoute:
+    """
+    Result of LLM routing decision.
+    """
+
+
+    provider: str
+
+
+    model: str | None = None
+
+
+
+class LLMRouter:
+    """
+    Decide which LLM provider should handle request.
+
+    Responsibilities:
+
+    - Provider selection
+    - Model selection
+
+    NOT responsible for:
+    - Calling LLM
+    - Retry
+    - Fallback execution
+
+    """
+
+
+    def __init__(
+        self,
+    ) -> None:
+
+
+        #
+        # Default routing policy.
+        #
+        # This will move to config later.
+        #
+
+        self.agent_routes = {
+
+
+            "noise": {
+
+                "provider": "openai",
+
+                "model": None,
+
+            },
+
+
+            "diagnosis": {
+
+                "provider": "openai",
+
+                "model": None,
+
+            },
+
+
+            "rca": {
+
+                "provider": "openai",
+
+                "model": None,
+
+            },
+
+
+            "healing": {
+
+                "provider": "openai",
+
+                "model": None,
+
+            },
+
+
+        }
+
+
+
+    def route(
+        self,
+        context: LLMInvocationContext,
+    ) -> LLMRoute:
+        """
+        Select provider according to context.
+        """
+
+
+        #
+        # Explicit override
+        #
+
+        if context.preferred_provider:
+
+
+            return LLMRoute(
+
+                provider=context.preferred_provider,
+
+                model=context.preferred_model,
+
+            )
+
+
+
+        #
+        # Agent based routing
+        #
+
+        route = self.agent_routes.get(
+            context.agent,
+        )
+
+
+
+        if route:
+
+
+            return LLMRoute(
+
+                provider=route["provider"],
+
+                model=route["model"],
+
+            )
+
+
+
+        #
+        # Default fallback
+        #
+
+        return LLMRoute(
+
+            provider="openai",
+
+            model=None,
+
+        )

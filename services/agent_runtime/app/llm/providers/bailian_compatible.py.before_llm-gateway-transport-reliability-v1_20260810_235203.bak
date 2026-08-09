@@ -1,0 +1,230 @@
+import os
+from typing import Any
+from urllib.parse import urlparse
+
+import httpx
+
+from services.agent_runtime.app.llm.base import (
+    BaseLLMProvider,
+)
+from services.agent_runtime.app.llm.models import (
+    ChatRequest,
+    ChatResponse,
+)
+
+
+class BailianCompatibleProvider(
+    BaseLLMProvider
+):
+    """
+    Alibaba Cloud Model Studio (Bailian) OpenAI-compatible provider.
+
+    Configuration:
+    - BAILIAN_BASE_URL
+    - DASHSCOPE_API_KEY
+    - BAILIAN_MODEL
+
+    BAILIAN_BASE_URL must already include /compatible-mode/v1.
+    Configuration is validated only when chat() is invoked so registry
+    construction never breaks the safe default mock development path.
+    """
+
+    @property
+    def name(
+        self,
+    ) -> str:
+        return "bailian"
+
+    def __init__(
+        self,
+    ) -> None:
+        self.base_url = os.getenv(
+            "BAILIAN_BASE_URL",
+            "",
+        ).strip().rstrip("/")
+
+        self.api_key = os.getenv(
+            "DASHSCOPE_API_KEY",
+            "",
+        ).strip()
+
+        self.model = os.getenv(
+            "BAILIAN_MODEL",
+            "",
+        ).strip()
+
+    def validate_configuration(
+        self,
+    ) -> None:
+        if not self.base_url:
+            raise RuntimeError(
+                "BAILIAN_BASE_URL is not configured"
+            )
+
+        parsed = urlparse(
+            self.base_url
+        )
+
+        if (
+            parsed.scheme != "https"
+            or not parsed.netloc
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise RuntimeError(
+                "BAILIAN_BASE_URL must be a clean HTTPS URL"
+            )
+
+        if not (
+            parsed.path.rstrip("/")
+            .endswith(
+                "/compatible-mode/v1"
+            )
+        ):
+            raise RuntimeError(
+                "BAILIAN_BASE_URL must end with /compatible-mode/v1"
+            )
+
+        if not self.api_key:
+            raise RuntimeError(
+                "DASHSCOPE_API_KEY is not configured"
+            )
+
+        if not self.model:
+            raise RuntimeError(
+                "BAILIAN_MODEL is not configured"
+            )
+
+    async def chat(
+        self,
+        request: ChatRequest,
+    ) -> ChatResponse:
+        self.validate_configuration()
+
+        messages: list[
+            dict[str, Any]
+        ] = []
+
+        if request.system_prompt:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": request.system_prompt,
+                }
+            )
+
+        messages.append(
+            {
+                "role": "user",
+                "content": request.user_prompt,
+            }
+        )
+
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": request.temperature,
+        }
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": (
+                f"Bearer {self.api_key}"
+            ),
+        }
+
+        async with httpx.AsyncClient(
+            timeout=30,
+        ) as client:
+            response = await client.post(
+                f"{self.base_url}/chat/completions",
+                json=payload,
+                headers=headers,
+            )
+
+            response.raise_for_status()
+            data = response.json()
+
+        choices = data.get(
+            "choices"
+        )
+
+        if (
+            not isinstance(
+                choices,
+                list,
+            )
+            or not choices
+            or not isinstance(
+                choices[0],
+                dict,
+            )
+        ):
+            raise RuntimeError(
+                "Bailian response choices are invalid"
+            )
+
+        message = choices[0].get(
+            "message"
+        )
+
+        if not isinstance(
+            message,
+            dict,
+        ):
+            raise RuntimeError(
+                "Bailian response message is invalid"
+            )
+
+        content = message.get(
+            "content"
+        )
+
+        if (
+            not isinstance(
+                content,
+                str,
+            )
+            or not content.strip()
+        ):
+            raise RuntimeError(
+                "Bailian response content is invalid"
+            )
+
+        usage = data.get(
+            "usage",
+            {},
+        )
+
+        if not isinstance(
+            usage,
+            dict,
+        ):
+            usage = {}
+
+        return ChatResponse(
+            content=content,
+            model=data.get(
+                "model",
+                self.model,
+            ),
+            prompt_tokens=usage.get(
+                "prompt_tokens",
+                0,
+            ),
+            completion_tokens=usage.get(
+                "completion_tokens",
+                0,
+            ),
+            total_tokens=usage.get(
+                "total_tokens",
+                0,
+            ),
+        )
+
+
+__all__ = [
+    "BailianCompatibleProvider",
+]

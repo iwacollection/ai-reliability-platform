@@ -1,4 +1,8 @@
-import asyncio
+import json
+
+import pytest
+
+from datetime import UTC, datetime
 
 from common.domain.event import (
     Header,
@@ -6,7 +10,6 @@ from common.domain.event import (
     Signal,
     StandardEvent,
 )
-
 from common.domain.event.enums import (
     EventSource,
     ResourceKind,
@@ -14,75 +17,103 @@ from common.domain.event.enums import (
     SignalType,
 )
 
-from datetime import UTC, datetime
-
 from services.agent_runtime.app.agents.noise.agent import (
     NoiseAgent,
 )
-
-from services.agent_runtime.app.llm.client import (
-    LLMClient,
+from services.agent_runtime.app.llm.gateway.models import (
+    LLMGatewayRequest,
+    LLMGatewayResponse,
 )
-
-from services.agent_runtime.app.llm.provider_factory import (
-    create_llm_provider,
-)
-
 from services.agent_runtime.app.model.context import (
     AgentContext,
 )
 
 
-def test_noise_agent():
+class MockNoiseGateway:
+    """
+    Lightweight LLM Gateway used by the NoiseAgent unit test.
 
-    async def run():
+    This mock keeps the same chat contract as LLMGateway without invoking
+    provider routing, fallback, rate limiting, or an external model.
+    """
 
-        provider = create_llm_provider()
+    def __init__(self) -> None:
+        self.last_request: (
+            LLMGatewayRequest | None
+        ) = None
 
-        client = LLMClient(
-            provider,
+    async def chat(
+        self,
+        request: LLMGatewayRequest,
+    ) -> LLMGatewayResponse:
+        self.last_request = request
+
+        content = json.dumps(
+            {
+                "noise": False,
+                "confidence": 0.95,
+                "reason": (
+                    "Critical production alert."
+                ),
+            }
         )
 
-        agent = NoiseAgent(
-            client,
+        return LLMGatewayResponse(
+            content=content,
+            provider="mock",
+            model="mock-model",
+            fallback_used=False,
         )
 
-        event = StandardEvent(
-            header=Header(
-                source=EventSource.ALERTMANAGER,
-                occurred_at=datetime.now(UTC),
-            ),
-            signal=Signal(
-                type=SignalType.ALERT,
-                name="PodHighCPU",
-                severity=Severity.CRITICAL,
-                message="CPU > 90%",
-            ),
-            resources=[
-                Resource(
-                    kind=ResourceKind.POD,
-                    name="payment-api",
-                )
-            ],
-        )
 
-        context = AgentContext(
-            event=event,
-        )
+@pytest.mark.asyncio
+async def test_noise_agent():
+    gateway = MockNoiseGateway()
 
-        result = await agent.run(
-            context,
-        )
+    agent = NoiseAgent(
+        gateway,
+    )
 
-        print()
+    event = StandardEvent(
+        header=Header(
+            source=EventSource.ALERTMANAGER,
+            occurred_at=datetime.now(UTC),
+        ),
+        signal=Signal(
+            type=SignalType.ALERT,
+            name="PodHighCPU",
+            severity=Severity.CRITICAL,
+            message="CPU > 90%",
+        ),
+        resources=[
+            Resource(
+                kind=ResourceKind.POD,
+                name="payment-api",
+            )
+        ],
+    )
 
-        print(
-            result.model_dump()
-        )
+    context = AgentContext(
+        event=event,
+    )
 
-        assert result.success is True
+    result = await agent.run(
+        context,
+    )
 
-        assert result.agent == "noise"
+    assert result.success is True
+    assert result.agent == "noise"
 
+    assert gateway.last_request is not None
 
-    asyncio.run(run())
+    assert gateway.last_request.context.agent == (
+        "noise"
+    )
+
+    assert "PodHighCPU" in (
+        gateway.last_request.prompt
+    )
+
+    assert gateway.last_request.context.require_json is (
+        True
+    )

@@ -1,0 +1,121 @@
+from functools import lru_cache
+from pathlib import Path
+
+import yaml
+
+from pydantic import (
+    BaseModel,
+    Field,
+)
+
+
+
+class AppConfig(BaseModel):
+    """
+    Application configuration.
+    """
+
+    name: str
+
+    version: str
+
+
+
+class RateLimitConfig(BaseModel):
+    """
+    LLM gateway rate limit configuration.
+    """
+
+    enabled: bool = True
+
+    requests_per_minute: int = 60
+
+
+
+class LLMGatewayConfig(BaseModel):
+    """
+    LLM Gateway reliability configuration.
+
+    Controls:
+
+    - fallback
+    - retry
+    - timeout
+    - rate limit
+
+    """
+
+    fallback_enabled: bool = True
+
+    retry_attempts: int = 3
+
+    request_timeout: int = 30
+
+    rate_limit: RateLimitConfig = Field(
+        default_factory=RateLimitConfig
+    )
+
+
+
+class LLMConfig(BaseModel):
+    """
+    LLM configuration.
+    """
+
+    provider: str
+
+    temperature: float
+
+    timeout: int
+
+    gateway: LLMGatewayConfig = Field(
+        default_factory=LLMGatewayConfig
+    )
+
+
+
+class RuntimeConfig(BaseModel):
+    """
+    Agent runtime configuration.
+    """
+
+    pipeline: str
+
+    max_workers: int
+
+
+
+class Settings(BaseModel):
+    """
+    Root application settings.
+    """
+
+    app: AppConfig
+
+    llm: LLMConfig
+
+    runtime: RuntimeConfig
+
+
+
+@lru_cache
+def get_settings() -> Settings:
+    """
+    Load settings from configs/app.yaml.
+    """
+
+    root = Path(__file__).resolve().parents[5]
+
+    config_path = (
+        root
+        / "configs"
+        / "app.yaml"
+    )
+
+    data = yaml.safe_load(
+        config_path.read_text(
+            encoding="utf-8",
+        )
+    )
+
+    return Settings.model_validate(data)

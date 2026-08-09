@@ -14,6 +14,10 @@ from services.agent_runtime.app.llm.providers.openai_compatible import (
 
 
 
+from services.agent_runtime.app.llm.providers.bailian_compatible import (
+    BailianCompatibleProvider,
+)
+
 def create_llm_registry() -> LLMProviderRegistry:
     """
     Create default LLM provider registry.
@@ -34,5 +38,9 @@ def create_llm_registry() -> LLMProviderRegistry:
     )
 
 
+
+    registry.register(
+        BailianCompatibleProvider(),
+    )
 
     return registry

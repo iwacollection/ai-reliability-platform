@@ -1,0 +1,370 @@
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from services.agent_runtime.app.investigation.llm_gateway_adapter import (
+    BaseInvestigationLLM,
+    InvestigationLLMExecutionError,
+    InvestigationLLMUnavailableError,
+)
+from services.agent_runtime.app.investigation.models import (
+    EvidenceItem,
+    IncidentHypothesis,
+    InvestigationDecision,
+    InvestigationProbe,
+    InvestigationScope,
+    InvestigationState,
+)
+from services.agent_runtime.app.investigation.reasoner import (
+    InvestigationReasonerExecutionRetryError,
+    InvestigationReasonerRepairValidationError,
+    LLMInvestigationReasoner,
+)
+
+
+class SequenceInvestigationLLM(
+    BaseInvestigationLLM
+):
+    def __init__(
+        self,
+        values,
+    ) -> None:
+        self.values = list(
+            values
+        )
+        self.calls = []
+
+    async def complete(
+        self,
+        *,
+        system_prompt: str,
+        prompt: str,
+    ) -> str:
+        self.calls.append(
+            {
+                "system_prompt": system_prompt,
+                "prompt": prompt,
+            }
+        )
+
+        value = self.values.pop(
+            0
+        )
+
+        if isinstance(
+            value,
+            BaseException,
+        ):
+            raise value
+
+        return value
+
+
+def scope() -> InvestigationScope:
+    return InvestigationScope(
+        alert_name="PodRestartHigh",
+        alert_message="payment-api restarts are increasing",
+        resource="payment-api",
+        namespace="payment",
+        cluster="benchmark-lab",
+    )
+
+
+def valid_probe_decision(
+    probe: str,
+) -> str:
+    return json.dumps(
+        {
+            "hypotheses": [
+                {
+                    "hypothesis_id": "h1",
+                    "cause": "unresolved restart cause",
+                    "confidence": 0.4,
+                    "supporting_evidence_ids": [],
+                    "conflicting_evidence_ids": [],
+                    "missing_evidence": [
+                        "root-cause evidence"
+                    ],
+                    "optional_evidence": [],
+                }
+            ],
+            "rationale_summary": (
+                "select the next unattempted discriminative probe"
+            ),
+            "stop": False,
+            "stop_reason": None,
+            "next_probe": probe,
+            "conclusion": None,
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_transient_execution_error_retries_once_same_request():
+    llm = SequenceInvestigationLLM(
+        [
+            InvestigationLLMExecutionError(
+                "sanitized execution failure"
+            ),
+            valid_probe_decision(
+                "kubernetes_pod_state"
+            ),
+        ]
+    )
+
+    reasoner = LLMInvestigationReasoner(
+        llm
+    )
+
+    current = InvestigationState(
+        scope=scope()
+    )
+
+    decision = await reasoner.decide(
+        current.scope,
+        current,
+    )
+
+    assert (
+        decision.next_probe
+        == InvestigationProbe.KUBERNETES_POD_STATE
+    )
+
+    assert len(
+        llm.calls
+    ) == 2
+
+    assert (
+        llm.calls[0]["system_prompt"]
+        == llm.calls[1]["system_prompt"]
+    )
+
+    assert (
+        llm.calls[0]["prompt"]
+        == llm.calls[1]["prompt"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_two_execution_errors_fail_closed_with_precise_code():
+    llm = SequenceInvestigationLLM(
+        [
+            InvestigationLLMExecutionError(
+                "first"
+            ),
+            InvestigationLLMExecutionError(
+                "second"
+            ),
+        ]
+    )
+
+    reasoner = LLMInvestigationReasoner(
+        llm
+    )
+
+    current = InvestigationState(
+        scope=scope()
+    )
+
+    with pytest.raises(
+        InvestigationReasonerExecutionRetryError,
+    ):
+        await reasoner.decide(
+            current.scope,
+            current,
+        )
+
+    assert len(
+        llm.calls
+    ) == 2
+
+
+@pytest.mark.asyncio
+async def test_unavailable_error_is_not_retried():
+    llm = SequenceInvestigationLLM(
+        [
+            InvestigationLLMUnavailableError(
+                "unavailable"
+            ),
+        ]
+    )
+
+    reasoner = LLMInvestigationReasoner(
+        llm
+    )
+
+    current = InvestigationState(
+        scope=scope()
+    )
+
+    with pytest.raises(
+        InvestigationLLMUnavailableError,
+    ):
+        await reasoner.decide(
+            current.scope,
+            current,
+        )
+
+    assert len(
+        llm.calls
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_duplicate_probe_decision_gets_one_contract_repair():
+    llm = SequenceInvestigationLLM(
+        [
+            valid_probe_decision(
+                "kubernetes_previous_container_logs"
+            ),
+            valid_probe_decision(
+                "kubernetes_pod_state"
+            ),
+        ]
+    )
+
+    reasoner = LLMInvestigationReasoner(
+        llm
+    )
+
+    current = InvestigationState(
+        scope=scope(),
+        attempted_probes=[
+            InvestigationProbe.KUBERNETES_PREVIOUS_CONTAINER_LOGS
+        ],
+    )
+
+    decision = await reasoner.decide(
+        current.scope,
+        current,
+    )
+
+    assert (
+        decision.next_probe
+        == InvestigationProbe.KUBERNETES_POD_STATE
+    )
+
+    assert len(
+        llm.calls
+    ) == 2
+
+    assert (
+        "kubernetes_previous_container_logs"
+        in llm.calls[1]["prompt"]
+    )
+
+    assert (
+        '"allowed_probes": ["kubernetes_pod_state"'
+        in llm.calls[1]["prompt"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_duplicate_probe_after_repair_still_fails_closed():
+    duplicate = valid_probe_decision(
+        "kubernetes_previous_container_logs"
+    )
+
+    llm = SequenceInvestigationLLM(
+        [
+            duplicate,
+            duplicate,
+        ]
+    )
+
+    reasoner = LLMInvestigationReasoner(
+        llm
+    )
+
+    current = InvestigationState(
+        scope=scope(),
+        attempted_probes=[
+            InvestigationProbe.KUBERNETES_PREVIOUS_CONTAINER_LOGS
+        ],
+    )
+
+    with pytest.raises(
+        InvestigationReasonerRepairValidationError,
+    ):
+        await reasoner.decide(
+            current.scope,
+            current,
+        )
+
+    assert len(
+        llm.calls
+    ) == 2
+
+
+def test_prompt_allowed_probes_excludes_attempted_failed_probe():
+    current = InvestigationState(
+        scope=scope(),
+        attempted_probes=[
+            InvestigationProbe.KUBERNETES_PREVIOUS_CONTAINER_LOGS
+        ],
+        evidence=[
+            EvidenceItem(
+                evidence_id="failed-log",
+                probe=(
+                    InvestigationProbe
+                    .KUBERNETES_PREVIOUS_CONTAINER_LOGS
+                ),
+                source="kubernetes",
+                success=False,
+                trusted=False,
+                production_signal=False,
+                reliability=0.0,
+                observed_at=__import__("datetime").datetime.now(
+                    __import__("datetime").UTC
+                ),
+                facts={},
+                error_code="RuntimeError",
+            )
+        ],
+    )
+
+    prompt = (
+        LLMInvestigationReasoner
+        ._build_prompt(
+            scope=current.scope,
+            state=current,
+        )
+    )
+
+    parts = prompt.rsplit(
+        "State:\n",
+        1,
+    )
+
+    assert len(
+        parts
+    ) == 2
+
+    state_json = parts[
+        1
+    ]
+
+    payload = json.loads(
+        state_json
+    )
+
+    assert (
+        "kubernetes_previous_container_logs"
+        not in payload[
+            "allowed_probes"
+        ]
+    )
+
+    assert (
+        "kubernetes_previous_container_logs"
+        in payload[
+            "failed_probes"
+        ]
+    )
+
+    assert (
+        "A failed probe is still an attempted probe"
+        in prompt
+    )

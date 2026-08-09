@@ -1,0 +1,357 @@
+from datetime import UTC, datetime
+from enum import Enum
+from typing import Annotated, Literal
+from uuid import uuid4
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    model_validator,
+)
+
+
+ShortText = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=256,
+    ),
+]
+
+LongText = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=2000,
+    ),
+]
+
+EvidenceScalar = bool | int | float | str | None
+
+
+class InvestigationProbe(str, Enum):
+    """
+    Closed set of read-only probes selectable by a reasoner.
+
+    The reasoner selects only a symbolic probe. It never supplies a tool
+    name, Kubernetes verb, resource target, URL, credential or PromQL.
+    """
+
+    KUBERNETES_POD_STATE = "kubernetes_pod_state"
+    PROMETHEUS_MEMORY_WORKING_SET = (
+        "prometheus_memory_working_set"
+    )
+    PROMETHEUS_MEMORY_LIMIT = "prometheus_memory_limit"
+    PROMETHEUS_RESTART_COUNT = "prometheus_restart_count"
+
+
+class InvestigationStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    CONCLUDED = "concluded"
+    EXHAUSTED = "exhausted"
+    FAILED = "failed"
+
+
+class InvestigationStopReason(str, Enum):
+    SUFFICIENT_EVIDENCE = "sufficient_evidence"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+    MAX_ITERATIONS = "max_iterations"
+    MAX_TOOL_CALLS = "max_tool_calls"
+    TIMEOUT = "timeout"
+    DUPLICATE_PROBE = "duplicate_probe"
+    NO_SAFE_PROBE = "no_safe_probe"
+    REASONER_ERROR = "reasoner_error"
+    INVALID_SCOPE = "invalid_scope"
+
+
+class InvestigationLimits(BaseModel):
+    """
+    Hard execution limits for one read-only investigation.
+    """
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+    )
+
+    max_iterations: int = Field(
+        default=6,
+        ge=1,
+        le=10,
+    )
+    max_tool_calls: int = Field(
+        default=10,
+        ge=1,
+        le=20,
+    )
+    timeout_seconds: float = Field(
+        default=30.0,
+        ge=1.0,
+        le=60.0,
+    )
+
+
+class InvestigationScope(BaseModel):
+    """
+    Trusted scope derived from StandardEvent, never from LLM output.
+    """
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+    )
+
+    alert_name: ShortText
+    alert_message: str = Field(
+        default="",
+        max_length=2000,
+    )
+    event_occurred_at: datetime | None = None
+    resource: ShortText
+    namespace: ShortText = "default"
+    cluster: ShortText | None = None
+
+
+class EvidenceItem(BaseModel):
+    """
+    Bounded evidence retained by the Shadow loop.
+
+    Raw Kubernetes or Prometheus payloads are not stored here. facts accepts
+    scalar values only, which prevents nested responses from becoming an
+    unbounded or sensitive reasoning transcript.
+    """
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+    )
+
+    evidence_id: str = Field(
+        default_factory=lambda: str(uuid4()),
+        min_length=1,
+        max_length=64,
+    )
+    probe: InvestigationProbe
+    source: ShortText
+    success: bool
+    trusted: bool
+    production_signal: bool
+    reliability: float = Field(
+        ge=0.0,
+        le=1.0,
+    )
+    observed_at: datetime
+    facts: dict[str, EvidenceScalar] = Field(
+        default_factory=dict,
+        max_length=32,
+    )
+    error_code: ShortText | None = None
+
+    @model_validator(mode="after")
+    def validate_trust_boundary(self):
+        if self.trusted and (
+            not self.success
+            or not self.production_signal
+        ):
+            raise ValueError(
+                "trusted evidence requires a successful production signal"
+            )
+
+        if not self.success and self.error_code is None:
+            raise ValueError(
+                "failed evidence requires an error code"
+            )
+
+        return self
+
+
+class IncidentHypothesis(BaseModel):
+    """
+    One current incident explanation maintained by the reasoner.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+
+    hypothesis_id: ShortText
+    cause: LongText
+    confidence: float = Field(
+        ge=0.0,
+        le=1.0,
+    )
+    supporting_evidence_ids: list[ShortText] = Field(
+        default_factory=list,
+        max_length=32,
+    )
+    conflicting_evidence_ids: list[ShortText] = Field(
+        default_factory=list,
+        max_length=32,
+    )
+    missing_evidence: list[ShortText] = Field(
+        default_factory=list,
+        max_length=16,
+    )
+
+
+class InvestigationConclusion(BaseModel):
+    """
+    Structured diagnosis output. It contains no remediation authorization.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+
+    root_cause: LongText
+    confidence: float = Field(
+        ge=0.0,
+        le=1.0,
+    )
+    evidence_ids: list[ShortText] = Field(
+        min_length=1,
+        max_length=32,
+    )
+    remaining_uncertainties: list[ShortText] = Field(
+        default_factory=list,
+        max_length=16,
+    )
+
+
+class InvestigationDecision(BaseModel):
+    """
+    One bounded reasoner decision.
+
+    A non-terminal decision must select exactly one symbolic read-only probe.
+    A terminal decision cannot select a probe. Sufficient-evidence stops must
+    include a structured conclusion.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+
+    hypotheses: list[IncidentHypothesis] = Field(
+        min_length=1,
+        max_length=8,
+    )
+    rationale_summary: LongText
+    stop: bool = False
+    stop_reason: InvestigationStopReason | None = None
+    next_probe: InvestigationProbe | None = None
+    conclusion: InvestigationConclusion | None = None
+
+    @model_validator(mode="after")
+    def validate_decision_shape(self):
+        if self.stop:
+            if self.next_probe is not None:
+                raise ValueError(
+                    "terminal decision cannot select a probe"
+                )
+            if self.stop_reason is None:
+                raise ValueError(
+                    "terminal decision requires a stop reason"
+                )
+            if self.stop_reason not in {
+                InvestigationStopReason.SUFFICIENT_EVIDENCE,
+                InvestigationStopReason.INSUFFICIENT_EVIDENCE,
+                InvestigationStopReason.NO_SAFE_PROBE,
+            }:
+                raise ValueError(
+                    "reasoner cannot select an internal stop reason"
+                )
+            if (
+                self.stop_reason
+                == InvestigationStopReason.SUFFICIENT_EVIDENCE
+                and self.conclusion is None
+            ):
+                raise ValueError(
+                    "sufficient evidence requires a conclusion"
+                )
+            if (
+                self.stop_reason
+                != InvestigationStopReason.SUFFICIENT_EVIDENCE
+                and self.conclusion is not None
+            ):
+                raise ValueError(
+                    "insufficient evidence cannot include a conclusion"
+                )
+        else:
+            if self.next_probe is None:
+                raise ValueError(
+                    "continuing decision requires a probe"
+                )
+            if self.stop_reason is not None:
+                raise ValueError(
+                    "continuing decision cannot have a stop reason"
+                )
+            if self.conclusion is not None:
+                raise ValueError(
+                    "continuing decision cannot have a conclusion"
+                )
+
+        return self
+
+
+class InvestigationState(BaseModel):
+    """
+    Complete bounded state of one Shadow investigation.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+
+    investigation_id: str = Field(
+        default_factory=lambda: str(uuid4()),
+        min_length=1,
+        max_length=64,
+    )
+    shadow_mode: Literal[True] = True
+    read_only: Literal[True] = True
+    status: InvestigationStatus = InvestigationStatus.PENDING
+    scope: InvestigationScope
+    limits: InvestigationLimits = Field(
+        default_factory=InvestigationLimits
+    )
+    started_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC)
+    )
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC)
+    )
+    iteration_count: int = Field(
+        default=0,
+        ge=0,
+        le=10,
+    )
+    tool_call_count: int = Field(
+        default=0,
+        ge=0,
+        le=20,
+    )
+    hypotheses: list[IncidentHypothesis] = Field(
+        default_factory=list,
+        max_length=8,
+    )
+    evidence: list[EvidenceItem] = Field(
+        default_factory=list,
+        max_length=20,
+    )
+    attempted_probes: list[InvestigationProbe] = Field(
+        default_factory=list,
+        max_length=20,
+    )
+    decision_summaries: list[LongText] = Field(
+        default_factory=list,
+        max_length=10,
+    )
+    stop_reason: InvestigationStopReason | None = None
+    failure_code: ShortText | None = None
+    epistemic_guard_code: ShortText | None = None
+    conclusion: InvestigationConclusion | None = None

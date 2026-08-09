@@ -1,0 +1,391 @@
+from __future__ import annotations
+
+from typing import Any
+from uuid import UUID
+
+from services.agent_runtime.app.action.execution_models import (
+    ActionExecutionRecord,
+    ActionExecutionStatus,
+)
+from services.agent_runtime.app.action.execution_store import (
+    ActionExecutionClaimResult,
+    ActionExecutionConflictError,
+    ActionExecutionStore,
+)
+from services.agent_runtime.app.action.models import (
+    ActionPlan,
+)
+
+
+class ActionExecutionService:
+    """
+    Coordinate durable, fail-closed action execution lifecycle changes.
+
+    The service does not call an external executor. It provides the protocol
+    that ActionRuntime must follow around that call:
+
+    1. claim() persists the only automatic launch permission;
+    2. only claim.created=True may invoke the executor;
+    3. complete(), succeed(), fail(), or mark_indeterminate() persists the
+       outcome using compare-and-set protection;
+    4. every replay returns the persisted record or raises a conflict.
+
+    INDETERMINATE is intentionally not converted to FAILED. An unknown
+    external outcome requires explicit reconciliation and must never trigger
+    an automatic retry.
+    """
+
+    def __init__(
+        self,
+        store: ActionExecutionStore | None = None,
+    ) -> None:
+        self.store = (
+            store
+            or ActionExecutionStore()
+        )
+
+    async def claim(
+        self,
+        *,
+        approval_id: str,
+        operator_id: str,
+        idempotency_key: str,
+        action: ActionPlan,
+        incident_id: UUID | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> ActionExecutionClaimResult:
+        execution = ActionExecutionRecord(
+            approval_id=approval_id,
+            incident_id=incident_id,
+            operator_id=operator_id,
+            idempotency_key=idempotency_key,
+            action=action,
+            metadata=dict(metadata or {}),
+        )
+
+        return await self.store.claim(
+            execution
+        )
+
+    async def get(
+        self,
+        execution_id: str,
+    ) -> ActionExecutionRecord | None:
+        return await self.store.get(
+            execution_id
+        )
+
+    async def get_by_approval(
+        self,
+        approval_id: str,
+    ) -> ActionExecutionRecord | None:
+        return await self.store.get_by_approval(
+            approval_id
+        )
+
+    async def get_by_idempotency_key(
+        self,
+        idempotency_key: str,
+    ) -> ActionExecutionRecord | None:
+        return (
+            await self.store.get_by_idempotency_key(
+                idempotency_key
+            )
+        )
+
+    async def list_by_incident(
+        self,
+        incident_id: UUID | str,
+    ) -> list[ActionExecutionRecord]:
+        """
+        Return every Action Execution linked to one Incident.
+
+        Filtering and stable chronological ordering remain owned by the
+        indexed ActionExecutionStore query. This method is strictly read-only.
+        """
+
+        return await self.store.list_by_incident(
+            incident_id
+        )
+
+    async def complete(
+        self,
+        execution_id: str,
+        result: dict[str, Any],
+        *,
+        error_type: str | None = None,
+        error_message: str | None = None,
+    ) -> ActionExecutionRecord:
+        """
+        Persist an executor result without guessing an ambiguous outcome.
+
+        Only the literal booleans True and False are accepted as definite
+        outcomes. Missing, string, integer, or null success values freeze the
+        execution as INDETERMINATE.
+        """
+
+        if not isinstance(result, dict):
+            raise TypeError(
+                "Action executor result must be a dictionary"
+            )
+
+        success = result.get(
+            "success"
+        )
+
+        if success is True:
+            return await self.succeed(
+                execution_id,
+                result,
+            )
+
+        if success is False:
+            return await self.fail(
+                execution_id,
+                result,
+                error_type=(
+                    error_type
+                    or self._optional_string(
+                        result.get("error_type")
+                    )
+                ),
+                error_message=(
+                    error_message
+                    or self._optional_string(
+                        result.get("error_message")
+                    )
+                ),
+            )
+
+        return await self.mark_indeterminate(
+            execution_id,
+            reason=(
+                "Executor result did not contain the literal "
+                "boolean success outcome"
+            ),
+        )
+
+    async def succeed(
+        self,
+        execution_id: str,
+        result: dict[str, Any],
+    ) -> ActionExecutionRecord:
+        normalized_result = dict(result)
+
+        if normalized_result.get("success") is not True:
+            raise ValueError(
+                "Successful execution requires result.success=true"
+            )
+
+        current = await self._get_required(
+            execution_id
+        )
+
+        if (
+            current.status
+            == ActionExecutionStatus.SUCCEEDED
+        ):
+            if current.result == normalized_result:
+                return current
+
+            raise ActionExecutionConflictError(
+                "Action execution already succeeded with a "
+                "different result"
+            )
+
+        self._require_running(
+            current
+        )
+
+        updated = current.model_copy(
+            deep=True
+        )
+        updated.succeed(
+            normalized_result
+        )
+
+        return await self._persist_outcome(
+            updated,
+            expected_status=(
+                ActionExecutionStatus.RUNNING
+            ),
+        )
+
+    async def fail(
+        self,
+        execution_id: str,
+        result: dict[str, Any] | None = None,
+        *,
+        error_type: str | None = None,
+        error_message: str | None = None,
+    ) -> ActionExecutionRecord:
+        normalized_result = dict(
+            result or {}
+        )
+
+        if normalized_result.get("success") is True:
+            raise ValueError(
+                "Failed execution cannot have result.success=true"
+            )
+
+        current = await self._get_required(
+            execution_id
+        )
+
+        if (
+            current.status
+            == ActionExecutionStatus.FAILED
+        ):
+            if (
+                current.result == normalized_result
+                and current.error_type == error_type
+                and current.error_message == error_message
+            ):
+                return current
+
+            raise ActionExecutionConflictError(
+                "Action execution already failed with a "
+                "different result"
+            )
+
+        self._require_running(
+            current
+        )
+
+        updated = current.model_copy(
+            deep=True
+        )
+        updated.fail(
+            normalized_result,
+            error_type=error_type,
+            error_message=error_message,
+        )
+
+        return await self._persist_outcome(
+            updated,
+            expected_status=(
+                ActionExecutionStatus.RUNNING
+            ),
+        )
+
+    async def mark_indeterminate(
+        self,
+        execution_id: str,
+        reason: str,
+    ) -> ActionExecutionRecord:
+        return await self.store.mark_indeterminate(
+            execution_id,
+            reason,
+        )
+
+    async def list_by_status(
+        self,
+        status: ActionExecutionStatus,
+    ) -> list[ActionExecutionRecord]:
+        return await self.store.list_by_status(
+            status
+        )
+
+    async def list_all(
+        self,
+    ) -> list[ActionExecutionRecord]:
+        return await self.store.list_all()
+
+    async def _get_required(
+        self,
+        execution_id: str,
+    ) -> ActionExecutionRecord:
+        execution = await self.store.get(
+            execution_id
+        )
+
+        if execution is None:
+            raise ValueError(
+                "Action execution not found: "
+                f"{execution_id}"
+            )
+
+        return execution
+
+    async def _persist_outcome(
+        self,
+        updated: ActionExecutionRecord,
+        *,
+        expected_status: ActionExecutionStatus,
+    ) -> ActionExecutionRecord:
+        try:
+            return await self.store.update(
+                updated,
+                expected_status=expected_status,
+            )
+
+        except ActionExecutionConflictError:
+            current = await self.store.get(
+                str(updated.id)
+            )
+
+            if (
+                current is not None
+                and self._same_outcome(
+                    current,
+                    updated,
+                )
+            ):
+                return current
+
+            raise
+
+    @staticmethod
+    def _require_running(
+        execution: ActionExecutionRecord,
+    ) -> None:
+        if (
+            execution.status
+            != ActionExecutionStatus.RUNNING
+        ):
+            raise ActionExecutionConflictError(
+                "Action execution cannot transition from "
+                f"{ActionExecutionService._status_value(execution.status)}"
+            )
+
+    @staticmethod
+    def _same_outcome(
+        current: ActionExecutionRecord,
+        requested: ActionExecutionRecord,
+    ) -> bool:
+        return (
+            current.id == requested.id
+            and current.status == requested.status
+            and current.result == requested.result
+            and current.error_type == requested.error_type
+            and current.error_message
+            == requested.error_message
+        )
+
+    @staticmethod
+    def _optional_string(
+        value: object,
+    ) -> str | None:
+        if not isinstance(value, str):
+            return None
+
+        normalized = value.strip()
+
+        if not normalized:
+            return None
+
+        return normalized
+
+    @staticmethod
+    def _status_value(
+        status: ActionExecutionStatus | str,
+    ) -> str:
+        if isinstance(
+            status,
+            ActionExecutionStatus,
+        ):
+            return status.value
+
+        return str(
+            status
+        )

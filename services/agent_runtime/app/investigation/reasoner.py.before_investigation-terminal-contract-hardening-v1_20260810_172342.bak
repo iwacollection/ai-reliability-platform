@@ -1,0 +1,177 @@
+﻿import json
+from abc import ABC, abstractmethod
+
+from pydantic import ValidationError
+
+from services.agent_runtime.app.investigation.llm_gateway_adapter import (
+    BaseInvestigationLLM,
+)
+from services.agent_runtime.app.investigation.models import (
+    InvestigationDecision,
+    InvestigationProbe,
+    InvestigationScope,
+    InvestigationState,
+)
+
+
+class InvestigationReasonerError(RuntimeError):
+    """
+    Sanitized reasoner failure.
+    """
+
+
+class BaseInvestigationReasoner(ABC):
+    """
+    Select the next symbolic read-only probe or stop with a conclusion.
+    """
+
+    @abstractmethod
+    async def decide(
+        self,
+        scope: InvestigationScope,
+        state: InvestigationState,
+    ) -> InvestigationDecision:
+        ...
+
+
+class LLMInvestigationReasoner(
+    BaseInvestigationReasoner
+):
+    """
+    Structured LLM reasoner for the bounded InvestigationCoordinator.
+
+    The reasoner depends only on the Investigation-owned LLM abstraction.
+    Gateway routing, provider selection, fallback, rate limiting and circuit
+    breaking remain outside this class.
+
+    It can select only an InvestigationProbe enum value. It cannot construct
+    tool calls, resource scope, PromQL, URLs or credentials.
+    """
+
+    _SYSTEM_PROMPT = (
+        "You are a bounded SRE investigation reasoner. "
+        "Maintain competing hypotheses, use only supplied "
+        "evidence, and select only one allowed symbolic "
+        "read-only probe. Never propose or execute a write."
+    )
+
+    def __init__(
+        self,
+        investigation_llm: BaseInvestigationLLM,
+    ) -> None:
+        if not isinstance(
+            investigation_llm,
+            BaseInvestigationLLM,
+        ):
+            raise TypeError(
+                "Investigation LLM adapter is invalid"
+            )
+
+        self.investigation_llm = (
+            investigation_llm
+        )
+
+    async def decide(
+        self,
+        scope: InvestigationScope,
+        state: InvestigationState,
+    ) -> InvestigationDecision:
+        content = await self.investigation_llm.complete(
+            system_prompt=self._SYSTEM_PROMPT,
+            prompt=self._build_prompt(
+                scope=scope,
+                state=state,
+            ),
+        )
+
+        if not isinstance(
+            content,
+            str,
+        ):
+            raise InvestigationReasonerError(
+                "Investigation reasoner returned no JSON"
+            )
+
+        try:
+            payload = json.loads(
+                content
+            )
+
+            return InvestigationDecision.model_validate(
+                payload
+            )
+
+        except (
+            json.JSONDecodeError,
+            ValidationError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise InvestigationReasonerError(
+                "Investigation reasoner returned an invalid decision"
+            ) from exc
+
+    @staticmethod
+    def _build_prompt(
+        scope: InvestigationScope,
+        state: InvestigationState,
+    ) -> str:
+        state_payload = {
+            "scope": scope.model_dump(
+                mode="json"
+            ),
+            "iteration_count": (
+                state.iteration_count
+            ),
+            "tool_call_count": (
+                state.tool_call_count
+            ),
+            "attempted_probes": [
+                probe.value
+                for probe in state.attempted_probes
+            ],
+            "hypotheses": [
+                item.model_dump(
+                    mode="json"
+                )
+                for item in state.hypotheses
+            ],
+            "evidence": [
+                item.model_dump(
+                    mode="json"
+                )
+                for item in state.evidence
+            ],
+            "allowed_probes": [
+                probe.value
+                for probe in InvestigationProbe
+            ],
+        }
+
+        return (
+            "Investigate the incident using the bounded state below.\n"
+            "Return JSON only. Do not return markdown.\n"
+            "A continuing decision requires next_probe and stop=false.\n"
+            "A terminal decision requires stop=true, stop_reason, and no "
+            "next_probe. sufficient_evidence also requires conclusion.\n"
+            "The response schema is:\n"
+            "{\n"
+            '  "hypotheses": [{"hypothesis_id": "", "cause": "", '
+            '"confidence": 0.0, "supporting_evidence_ids": [], '
+            '"conflicting_evidence_ids": [], "missing_evidence": []}],\n'
+            '  "rationale_summary": "bounded explanation",\n'
+            '  "stop": false,\n'
+            '  "stop_reason": null,\n'
+            '  "next_probe": "kubernetes_pod_state",\n'
+            '  "conclusion": null\n'
+            "}\n"
+            "State:\n"
+            f"{json.dumps(state_payload, ensure_ascii=True, sort_keys=True)}"
+        )
+
+
+__all__ = [
+    "BaseInvestigationReasoner",
+    "InvestigationReasonerError",
+    "LLMInvestigationReasoner",
+]

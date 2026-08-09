@@ -1,0 +1,920 @@
+import asyncio
+from typing import Any
+from uuid import uuid4
+
+import httpx
+import pytest
+from fastapi import FastAPI
+
+from services.agent_runtime.app.action.execution_models import (
+    ActionExecutionStatus,
+)
+from services.agent_runtime.app.action.models import (
+    ActionPlan,
+    ActionRisk,
+    ActionType,
+)
+from services.agent_runtime.app.incident.enums import (
+    IncidentStatus,
+)
+from services.agent_runtime.app.incident.state import (
+    IncidentState,
+)
+from services.agent_runtime.app.runtime.runtime import (
+    AgentRuntime,
+)
+from services.agent_runtime.app.verification.models import (
+    VerificationCheck,
+)
+
+
+class CountingCollector:
+    """Return deterministic evidence and count real probe collection."""
+
+    def __init__(
+        self,
+        *,
+        required_passed: bool | None = True,
+    ) -> None:
+        self.required_passed = (
+            required_passed
+        )
+        self.calls = 0
+
+    async def collect(
+        self,
+        probes,
+        context=None,
+    ) -> list[VerificationCheck]:
+        self.calls += 1
+
+        return [
+            VerificationCheck(
+                name=probe.name,
+                source=probe.source,
+                passed=(
+                    self.required_passed
+                    if probe.required
+                    else True
+                ),
+                required=probe.required,
+                observed_value=(
+                    "reconciliation-api-evidence"
+                ),
+                expected_value=(
+                    "verification-profile-rule"
+                ),
+                message=(
+                    "Deterministic reconciliation API evidence"
+                ),
+            )
+            for probe in probes
+        ]
+
+
+@pytest.fixture
+def api_environment(
+    monkeypatch,
+    tmp_path,
+):
+    """Create an isolated API and temporary SQLite persistence."""
+
+    monkeypatch.chdir(
+        tmp_path
+    )
+
+    for name in (
+        "PROMETHEUS_URL",
+        "KUBERNETES_API_URL",
+        "KUBERNETES_SERVICE_HOST",
+        "KUBERNETES_SERVICE_PORT",
+        "KUBERNETES_SERVICE_PORT_HTTPS",
+    ):
+        monkeypatch.delenv(
+            name,
+            raising=False,
+        )
+
+    monkeypatch.setenv(
+        "PROMETHEUS_ALLOW_MOCK_FALLBACK",
+        "true",
+    )
+    monkeypatch.setenv(
+        "KUBERNETES_ALLOW_DRY_RUN_FALLBACK",
+        "true",
+    )
+
+    from services.agent_runtime.app.api import (
+        runtime as api_module,
+    )
+
+    isolated_runtime = AgentRuntime()
+    monkeypatch.setattr(
+        api_module,
+        "runtime",
+        isolated_runtime,
+    )
+
+    app = FastAPI()
+    app.include_router(
+        api_module.router
+    )
+
+    return (
+        app,
+        isolated_runtime,
+    )
+
+
+def api_client(
+    app: FastAPI,
+) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(
+            app=app
+        ),
+        base_url="http://test",
+    )
+
+
+def reconciliation_headers(
+    *,
+    idempotency_key: str = (
+        "api-reconciliation-key-1"
+    ),
+) -> dict[str, str]:
+    return {
+        "X-Operator-ID": "sre-reconciler",
+        "Idempotency-Key": idempotency_key,
+    }
+
+
+def success_body(
+    **overrides,
+) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "outcome": "succeeded",
+        "reason": (
+            "Kubernetes evidence confirms the Action succeeded"
+        ),
+        "result": {
+            "success": True,
+            "evidence": "kubernetes_audit",
+        },
+        "metadata": {
+            "ticket": "INC-2026-0004",
+        },
+    }
+    body.update(
+        overrides
+    )
+
+    return body
+
+
+def failure_body(
+    **overrides,
+) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "outcome": "failed",
+        "reason": (
+            "Kubernetes evidence confirms the Action failed"
+        ),
+        "result": {
+            "success": False,
+            "evidence": "kubernetes_audit",
+        },
+        "error_type": "MutationNotObserved",
+        "error_message": (
+            "Deployment generation and Pod UID were unchanged"
+        ),
+        "metadata": {
+            "ticket": "INC-2026-0005",
+        },
+    }
+    body.update(
+        overrides
+    )
+
+    return body
+
+
+def reconciliation_path(
+    execution_id,
+) -> str:
+    return (
+        "/action-executions/"
+        f"{execution_id}"
+        "/reconcile"
+    )
+
+
+async def create_indeterminate_workflow(
+    runtime: AgentRuntime,
+    *,
+    incident_status: IncidentStatus = (
+        IncidentStatus.HEALING
+    ),
+):
+    incident = IncidentState()
+    incident.update(
+        incident_status,
+        reason=(
+            "Action outcome requires operator reconciliation"
+        ),
+    )
+    incident = await runtime.incident_store.save(
+        incident
+    )
+
+    pending_plan = ActionPlan(
+        type=(
+            ActionType.INCREASE_MEMORY_LIMIT
+        ),
+        target="payment-api",
+        namespace="payment",
+        cluster="production-tw",
+        risk=ActionRisk.MEDIUM,
+        approved=False,
+        metadata={
+            "memory_limit": "1Gi",
+        },
+    )
+    approval = await runtime.approval.create_approval(
+        action=pending_plan,
+        reason="Operator approval is required",
+        incident_id=incident.id,
+    )
+    approval = await runtime.approval.approve(
+        approval.id,
+        operator_id="approval-operator",
+        idempotency_key=(
+            f"approve:{approval.id}"
+        ),
+        reason="Approved for controlled execution",
+    )
+    claim = await (
+        runtime.action_execution_service.claim(
+            approval_id=approval.id,
+            incident_id=incident.id,
+            operator_id="executor-operator",
+            idempotency_key=(
+                f"execute:{approval.id}"
+            ),
+            action=approval.action,
+            metadata={
+                "source": "api-reconciliation-test",
+            },
+        )
+    )
+    execution = await (
+        runtime.action_execution_service
+        .mark_indeterminate(
+            str(
+                claim.execution.id
+            ),
+            "Executor connection closed before a result was received",
+        )
+    )
+
+    return (
+        incident,
+        approval,
+        execution,
+    )
+
+
+def install_forbidden_executor(
+    monkeypatch,
+    runtime: AgentRuntime,
+):
+    calls = {
+        "count": 0
+    }
+
+    async def forbidden_execute(
+        *args,
+        **kwargs,
+    ):
+        calls["count"] += 1
+        pytest.fail(
+            "Reconciliation API attempted to execute the Action"
+        )
+
+    monkeypatch.setattr(
+        runtime.action_runtime.executor,
+        "execute",
+        forbidden_execute,
+    )
+
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_unknown_and_non_healing_execution_fail_closed(
+    api_environment,
+):
+    app, runtime = api_environment
+    _, _, non_healing_execution = (
+        await create_indeterminate_workflow(
+            runtime,
+            incident_status=(
+                IncidentStatus.CONFIRMED
+            ),
+        )
+    )
+
+    async with api_client(
+        app
+    ) as client:
+        unknown = await client.post(
+            reconciliation_path(
+                uuid4()
+            ),
+            json=success_body(),
+            headers=reconciliation_headers(),
+        )
+        non_healing = await client.post(
+            reconciliation_path(
+                non_healing_execution.id
+            ),
+            json=success_body(),
+            headers=reconciliation_headers(),
+        )
+
+    assert unknown.status_code == 404
+    assert unknown.json()["detail"] == (
+        "Action execution not found"
+    )
+    assert non_healing.status_code == 409
+    assert "Incident to be healing" in (
+        non_healing.json()["detail"]
+    )
+
+    persisted = await (
+        runtime.action_execution_service.get(
+            str(
+                non_healing_execution.id
+            )
+        )
+    )
+    assert persisted is not None
+    assert persisted.status == (
+        ActionExecutionStatus.INDETERMINATE
+    )
+    assert persisted.reconciliation is None
+
+
+@pytest.mark.asyncio
+async def test_success_reconciliation_and_replay_verify_once(
+    api_environment,
+    monkeypatch,
+):
+    app, runtime = api_environment
+    incident, approval, execution = (
+        await create_indeterminate_workflow(
+            runtime
+        )
+    )
+    executor_calls = install_forbidden_executor(
+        monkeypatch,
+        runtime,
+    )
+    collector = CountingCollector(
+        required_passed=True
+    )
+    runtime.verification_coordinator.collector = (
+        collector
+    )
+    path = reconciliation_path(
+        execution.id
+    )
+    headers = reconciliation_headers()
+    body = success_body()
+
+    async with api_client(
+        app
+    ) as client:
+        first_response = await client.post(
+            path,
+            json=body,
+            headers=headers,
+        )
+        replay_response = await client.post(
+            path,
+            json=body,
+            headers=headers,
+        )
+        workflow_response = await client.get(
+            f"/workflows/approvals/{approval.id}"
+        )
+
+    assert first_response.status_code == 200
+    assert replay_response.status_code == 200
+    assert workflow_response.status_code == 200
+    assert executor_calls["count"] == 0
+    assert collector.calls == 1
+
+    first = first_response.json()
+    replay = replay_response.json()
+    workflow = workflow_response.json()
+
+    assert first["success"] is True
+    assert first["workflow_success"] is True
+    assert first["workflow_status"] == "resolved"
+    assert first["reconciliation_applied"] is True
+    assert first["idempotent_replay"] is False
+    assert first["execution"]["status"] == (
+        "succeeded"
+    )
+    assert first["reconciliation"]["outcome"] == (
+        "succeeded"
+    )
+    assert first["verification"]["status"] == (
+        "passed"
+    )
+    assert first["incident"]["id"] == str(
+        incident.id
+    )
+    assert first["incident"]["status"] == (
+        "resolved"
+    )
+    assert first["verification_required"] is True
+    assert first[
+        "verification_follow_up_required"
+    ] is False
+    assert first["verification_error"] is None
+    assert first["incident_sync_error"] is None
+    assert first[
+        "manual_reconciliation_required"
+    ] is False
+
+    assert replay["reconciliation_applied"] is False
+    assert replay["idempotent_replay"] is True
+    assert replay["execution"]["id"] == (
+        first["execution"]["id"]
+    )
+    assert replay["verification"]["id"] == (
+        first["verification"]["id"]
+    )
+    assert workflow["workflow_status"] == "resolved"
+    assert workflow["workflow_success"] is True
+    assert workflow["consistency"] == {
+        "passed": True,
+        "issues": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_failure_reconciliation_never_starts_verification(
+    api_environment,
+    monkeypatch,
+):
+    app, runtime = api_environment
+    incident, approval, execution = (
+        await create_indeterminate_workflow(
+            runtime
+        )
+    )
+    executor_calls = install_forbidden_executor(
+        monkeypatch,
+        runtime,
+    )
+    collector = CountingCollector()
+    runtime.verification_coordinator.collector = (
+        collector
+    )
+
+    async with api_client(
+        app
+    ) as client:
+        response = await client.post(
+            reconciliation_path(
+                execution.id
+            ),
+            json=failure_body(),
+            headers=reconciliation_headers(),
+        )
+        workflow_response = await client.get(
+            f"/workflows/approvals/{approval.id}"
+        )
+
+    assert response.status_code == 200
+    assert workflow_response.status_code == 200
+    assert executor_calls["count"] == 0
+    assert collector.calls == 0
+
+    body = response.json()
+    workflow = workflow_response.json()
+    assert body["success"] is True
+    assert body["workflow_success"] is False
+    assert body["workflow_status"] == "action_failed"
+    assert body["execution"]["status"] == "failed"
+    assert body["reconciliation"]["outcome"] == (
+        "failed"
+    )
+    assert body["verification"] is None
+    assert body["verification_required"] is False
+    assert body[
+        "verification_follow_up_required"
+    ] is False
+    assert body["incident"]["id"] == str(
+        incident.id
+    )
+    assert body["incident"]["status"] == "failed"
+    assert body["incident_sync_error"] is None
+    assert body[
+        "manual_reconciliation_required"
+    ] is False
+    assert workflow["workflow_status"] == (
+        "action_failed"
+    )
+    assert workflow["consistency"] == {
+        "passed": True,
+        "issues": [],
+    }
+
+    verification = await (
+        runtime.verification
+        .get_by_action_execution(
+            execution.id
+        )
+    )
+    assert verification is None
+
+
+@pytest.mark.asyncio
+async def test_invalid_and_conflicting_decisions_do_not_mutate_audit(
+    api_environment,
+):
+    app, runtime = api_environment
+    _, _, execution = (
+        await create_indeterminate_workflow(
+            runtime
+        )
+    )
+    path = reconciliation_path(
+        execution.id
+    )
+
+    async with api_client(
+        app
+    ) as client:
+        invalid = await client.post(
+            path,
+            json=success_body(
+                result={
+                    "success": "true",
+                }
+            ),
+            headers=reconciliation_headers(),
+        )
+
+        assert invalid.status_code == 422
+
+        first = await client.post(
+            path,
+            json=failure_body(),
+            headers=reconciliation_headers(),
+        )
+        same_key_conflict = await client.post(
+            path,
+            json=failure_body(
+                reason="Changed decision payload"
+            ),
+            headers=reconciliation_headers(),
+        )
+        second_key_conflict = await client.post(
+            path,
+            json=failure_body(),
+            headers=reconciliation_headers(
+                idempotency_key=(
+                    "second-reconciliation-key"
+                )
+            ),
+        )
+
+    assert first.status_code == 200
+    assert same_key_conflict.status_code == 409
+    assert second_key_conflict.status_code == 409
+    assert "key was reused" in (
+        same_key_conflict.json()["detail"]
+    )
+    assert "already reconciled" in (
+        second_key_conflict.json()["detail"]
+    )
+
+    persisted = await (
+        runtime.action_execution_service.get(
+            str(
+                execution.id
+            )
+        )
+    )
+    assert persisted is not None
+    assert persisted.reconciliation is not None
+    assert persisted.reconciliation.reason == (
+        failure_body()["reason"]
+    )
+    assert persisted.status == (
+        ActionExecutionStatus.FAILED
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_success_reconciliation_collects_once(
+    api_environment,
+    monkeypatch,
+):
+    app, runtime = api_environment
+    _, _, execution = (
+        await create_indeterminate_workflow(
+            runtime
+        )
+    )
+    executor_calls = install_forbidden_executor(
+        monkeypatch,
+        runtime,
+    )
+    collector = CountingCollector(
+        required_passed=True
+    )
+    runtime.verification_coordinator.collector = (
+        collector
+    )
+    path = reconciliation_path(
+        execution.id
+    )
+    headers = reconciliation_headers(
+        idempotency_key=(
+            "concurrent-reconciliation-key"
+        )
+    )
+    body = success_body()
+
+    async with api_client(
+        app
+    ) as client:
+        first, second = await asyncio.gather(
+            client.post(
+                path,
+                json=body,
+                headers=headers,
+            ),
+            client.post(
+                path,
+                json=body,
+                headers=headers,
+            ),
+        )
+        converged = await client.post(
+            path,
+            json=body,
+            headers=headers,
+        )
+
+    assert first.status_code in {
+        200,
+        202,
+    }
+    assert second.status_code in {
+        200,
+        202,
+    }
+    assert converged.status_code == 200
+    assert executor_calls["count"] == 0
+    assert collector.calls == 1
+
+    concurrent_bodies = [
+        first.json(),
+        second.json(),
+    ]
+    assert sum(
+        item["reconciliation_applied"]
+        for item in concurrent_bodies
+    ) == 1
+    assert sum(
+        item["idempotent_replay"]
+        for item in concurrent_bodies
+    ) == 1
+    assert converged.json()[
+        "idempotent_replay"
+    ] is True
+    assert converged.json()[
+        "workflow_status"
+    ] == "resolved"
+
+
+@pytest.mark.asyncio
+async def test_verification_incident_sync_failure_recovers_on_replay(
+    api_environment,
+    monkeypatch,
+):
+    app, runtime = api_environment
+    _, _, execution = (
+        await create_indeterminate_workflow(
+            runtime
+        )
+    )
+    executor_calls = install_forbidden_executor(
+        monkeypatch,
+        runtime,
+    )
+    collector = CountingCollector(
+        required_passed=True
+    )
+    runtime.verification_coordinator.collector = (
+        collector
+    )
+    original_update = (
+        runtime.incident_store.update
+    )
+    failed_once = {
+        "value": False
+    }
+
+    async def fail_first_resolved_update(
+        incident_state,
+        *args,
+        **kwargs,
+    ):
+        if (
+            incident_state.status
+            == IncidentStatus.RESOLVED
+            and not failed_once["value"]
+        ):
+            failed_once["value"] = True
+            raise RuntimeError(
+                "Injected resolved Incident synchronization failure"
+            )
+
+        return await original_update(
+            incident_state,
+            *args,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(
+        runtime.incident_store,
+        "update",
+        fail_first_resolved_update,
+    )
+    path = reconciliation_path(
+        execution.id
+    )
+    headers = reconciliation_headers()
+    body = success_body()
+
+    async with api_client(
+        app
+    ) as client:
+        first_response = await client.post(
+            path,
+            json=body,
+            headers=headers,
+        )
+        replay_response = await client.post(
+            path,
+            json=body,
+            headers=headers,
+        )
+
+    assert first_response.status_code == 503
+    assert replay_response.status_code == 200
+    assert executor_calls["count"] == 0
+    assert collector.calls == 1
+    assert failed_once["value"] is True
+
+    first = first_response.json()
+    replay = replay_response.json()
+    assert first["reconciliation_applied"] is True
+    assert first["workflow_success"] is False
+    assert first["workflow_status"] == (
+        "verification_reconciliation_required"
+    )
+    assert first["verification"]["status"] == (
+        "passed"
+    )
+    assert first["verification_error"]["type"] == (
+        "VerificationIncidentSyncError"
+    )
+    assert first[
+        "manual_reconciliation_required"
+    ] is True
+
+    assert replay["reconciliation_applied"] is False
+    assert replay["idempotent_replay"] is True
+    assert replay["workflow_success"] is True
+    assert replay["workflow_status"] == "resolved"
+    assert replay["verification_error"] is None
+    assert replay["incident"]["status"] == (
+        "resolved"
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_incident_sync_recovers_without_verification(
+    api_environment,
+    monkeypatch,
+):
+    app, runtime = api_environment
+    _, _, execution = (
+        await create_indeterminate_workflow(
+            runtime
+        )
+    )
+    executor_calls = install_forbidden_executor(
+        monkeypatch,
+        runtime,
+    )
+    collector = CountingCollector()
+    runtime.verification_coordinator.collector = (
+        collector
+    )
+    original_update = (
+        runtime.incident_store.update
+    )
+    failed_once = {
+        "value": False
+    }
+
+    async def fail_first_failed_update(
+        incident_state,
+        *args,
+        **kwargs,
+    ):
+        if (
+            incident_state.status
+            == IncidentStatus.FAILED
+            and not failed_once["value"]
+        ):
+            failed_once["value"] = True
+            raise RuntimeError(
+                "Injected failed Incident synchronization failure"
+            )
+
+        return await original_update(
+            incident_state,
+            *args,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(
+        runtime.incident_store,
+        "update",
+        fail_first_failed_update,
+    )
+    path = reconciliation_path(
+        execution.id
+    )
+    headers = reconciliation_headers()
+    body = failure_body()
+
+    async with api_client(
+        app
+    ) as client:
+        first_response = await client.post(
+            path,
+            json=body,
+            headers=headers,
+        )
+        replay_response = await client.post(
+            path,
+            json=body,
+            headers=headers,
+        )
+
+    assert first_response.status_code == 503
+    assert replay_response.status_code == 200
+    assert executor_calls["count"] == 0
+    assert collector.calls == 0
+    assert failed_once["value"] is True
+
+    first = first_response.json()
+    replay = replay_response.json()
+    assert first["reconciliation_applied"] is True
+    assert first["workflow_status"] == (
+        "incident_reconciliation_required"
+    )
+    assert first["incident"]["status"] == (
+        "healing"
+    )
+    assert first["incident_sync_error"]["type"] == (
+        "RuntimeError"
+    )
+    assert first[
+        "manual_reconciliation_required"
+    ] is True
+
+    assert replay["reconciliation_applied"] is False
+    assert replay["idempotent_replay"] is True
+    assert replay["workflow_status"] == (
+        "action_failed"
+    )
+    assert replay["incident"]["status"] == (
+        "failed"
+    )
+    assert replay["incident_sync_error"] is None
+    assert replay[
+        "manual_reconciliation_required"
+    ] is False
