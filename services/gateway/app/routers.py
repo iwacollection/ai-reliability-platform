@@ -20,12 +20,13 @@ from services.gateway.app.api.evidence import (
     router as evidence_router,
 )
 
+from services.gateway.app.api.graph import (
+    router as graph_router,
+)
 
 api_router = APIRouter()
 
-api_router.include_router(
-    health_router,
-)
+api_router.include_router(health_router)
 
 api_router.include_router(
     runtime_router,
@@ -49,4 +50,10 @@ api_router.include_router(
     evidence_router,
     prefix="/api",
     tags=["Evidence"],
+)
+
+api_router.include_router(
+    graph_router,
+    prefix="/api",
+    tags=["Investigation Graph"],
 )
