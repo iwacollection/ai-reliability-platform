@@ -1,181 +1,34 @@
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Callable
 
-from datetime import UTC, datetime
 
+@dataclass
+class MCPServer:
+    name: str
+    endpoint: str
+    capabilities: list[str]
 
-from services.agent_runtime.app.mcp.base import (
-    BaseMCPClient,
-)
 
+class MCPServerRegistry:
+    def __init__(self):
+        self.servers: dict[str, MCPServer] = {}
 
-from services.agent_runtime.app.observability.models import (
-    TraceSpan,
-)
+    def register(self, server: MCPServer):
+        self.servers[server.name] = server
 
+    def discover(self):
+        return list(self.servers.values())
 
 
-class MockMCPClient(BaseMCPClient):
-    """
-    Mock MCP client.
+class MCPClient:
+    def __init__(self, registry: MCPServerRegistry):
+        self.registry = registry
 
-    First version:
-    simulate MCP server call.
-    """
-
-
-
-    @property
-    def name(
-        self,
-    ) -> str:
-
-        return "mock_mcp"
-
-
-
-    async def call(
-        self,
-        tool: str,
-        context=None,
-        **kwargs: Any,
-    ) -> dict:
-        """
-        Call MCP tool.
-
-        Later this will become:
-        MCP protocol request.
-        """
-
-
-
-        span = None
-
-
-
-        #
-        # MCP Trace
-        #
-
-        if context and context.trace:
-
-
-            span = TraceSpan(
-
-                type="mcp",
-
-                name=(
-
-                    f"{self.name}:"
-
-                    f"{tool}"
-
-                ),
-
-                start_time=datetime.now(
-                    UTC
-                ),
-
-                input_data=kwargs,
-
-            )
-
-
-            context.trace.spans.append(
-                span
-            )
-
-
-
-        try:
-
-
-            result = {
-
-
-                "success": True,
-
-
-                "mcp_client":
-                    self.name,
-
-
-                "tool":
-                    tool,
-
-
-                "arguments":
-                    kwargs,
-
-
-                "message":
-                    "MCP call simulated",
-
-            }
-
-
-
-            if span:
-
-
-                span.end_time = datetime.now(
-                    UTC
-                )
-
-
-                span.duration_ms = (
-
-                    span.end_time
-
-                    -
-
-                    span.start_time
-
-                ).total_seconds() * 1000
-
-
-
-                span.success = True
-
-
-                span.output_data = result
-
-
-
-            return result
-
-
-
-        except Exception as exc:
-
-
-
-            if span:
-
-
-                span.end_time = datetime.now(
-                    UTC
-                )
-
-
-                span.duration_ms = (
-
-                    span.end_time
-
-                    -
-
-                    span.start_time
-
-                ).total_seconds() * 1000
-
-
-
-                span.success = False
-
-
-                span.error = str(
-                    exc
-                )
-
-
-
-            raise
+    def call_tool(self, server: str, tool: str, payload: dict[str, Any]):
+        target = self.registry.servers[server]
+        return {
+            "server": target.name,
+            "tool": tool,
+            "payload": payload,
+            "status": "dispatched"
+        }

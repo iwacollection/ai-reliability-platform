@@ -1,5 +1,5 @@
-"""MCP registry boundary for agent tools."""
+"""MCP production connectivity layer."""
+from .client import MCPClient
+from .registry import MCPServerRegistry
 
-from .registry import MCPRegistry, MCPToolSpec
-
-__all__ = ["MCPRegistry", "MCPToolSpec"]
+__all__ = ["MCPClient", "MCPServerRegistry"]
