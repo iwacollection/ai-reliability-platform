@@ -1,4 +1,4 @@
-﻿from abc import ABC, abstractmethod
+from abc import ABC, abstractmethod
 
 from services.agent_runtime.app.llm.gateway.circuit_breaker import (
     CircuitBreakerOpen,

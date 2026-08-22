@@ -91,7 +91,7 @@ def test_runbook_locks_live_pilot_safety_contract():
         "tls_handshake_performed=false",
         "requires_guarded_startup_credential_validation=true",
         "requires_live_tls_recheck_before_enablement=true",
-        "security_route_count=22",
+        "security_route_count=25",
         "network_call_count=2",
         "kubernetes_read_count=2",
         "kubernetes_write_count=0",

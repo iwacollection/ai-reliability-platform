@@ -460,3 +460,38 @@ def test_loop_requires_one_shared_service(tmp_path):
             session_service=first_service,
             session_driver=driver,
         )
+
+
+@pytest.mark.asyncio
+async def test_loop_stale_expected_version_never_advances_next_phase(
+    tmp_path,
+):
+    loop, service, reasoner, probe, now = await _components(
+        tmp_path
+    )
+    session = await _create(
+        service,
+        now=now,
+    )
+    first = await loop.run(
+        session.session_id,
+        context=SimpleNamespace(),
+        claimant="runtime-worker-1",
+        expected_version=0,
+    )
+
+    replay = await loop.run(
+        session.session_id,
+        context=SimpleNamespace(),
+        claimant="runtime-worker-2",
+        expected_version=0,
+    )
+
+    assert first.session.version == 2
+    assert replay.outcome == InvestigationSessionLoopOutcome.BLOCKED
+    assert replay.stop_reason == (
+        InvestigationSessionLoopStopReason.DRIVER_BLOCKED
+    )
+    assert replay.external_calls_made == 0
+    assert reasoner.calls == 1
+    assert probe.calls == 0

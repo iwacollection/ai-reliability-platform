@@ -1,4 +1,5 @@
 from copy import deepcopy
+from pathlib import Path
 from typing import Any
 
 from services.agent_runtime.app.registry.factory import (
@@ -64,6 +65,9 @@ from services.agent_runtime.app.investigation.comparison import (
 from services.agent_runtime.app.investigation.factory import (
     create_investigation_coordinator,
 )
+from services.agent_runtime.app.investigation.probes import (
+    ReadOnlyInvestigationProbeExecutor,
+)
 from services.agent_runtime.app.investigation.llm_gateway_adapter import (
     InvestigationLLMGatewayAdapter,
 )
@@ -73,6 +77,47 @@ from services.agent_runtime.app.investigation.reasoner import (
 )
 from services.agent_runtime.app.investigation.settings import (
     InvestigationSettings,
+)
+from services.agent_runtime.app.investigation.session_runtime_factory import (
+    InvestigationSessionRuntimeFactoryError,
+    create_investigation_session_runtime,
+)
+from services.agent_runtime.app.investigation.session_runtime_settings import (
+    InvestigationSessionRuntimeSettings,
+)
+from services.agent_runtime.app.investigation.dsh_reasoner_factory import (
+    create_dsh_investigation_reasoner,
+)
+from services.agent_runtime.app.investigation.dsh_reasoner_runtime_settings import (
+    DshInvestigationReasonerRuntimeSettings,
+)
+from services.agent_runtime.app.investigation.engine_shadow_gate import (
+    InvestigationEngineShadowEvidence,
+    InvestigationEngineShadowSettings,
+)
+from services.agent_runtime.app.investigation.engine_shadow_runtime_factory import (
+    InvestigationEngineShadowRuntimeFactoryError,
+    create_investigation_engine_shadow_runtime,
+    plan_investigation_engine_shadow_runtime,
+)
+from services.agent_runtime.app.investigation.engine_shadow_runner import (
+    InvestigationEngineShadowRunner,
+)
+from services.agent_runtime.app.investigation.engine_shadow_orchestration import (
+    InvestigationEngineShadowOrchestrationSettings,
+    create_investigation_engine_shadow_orchestrator,
+)
+from services.agent_runtime.app.investigation.engine_shadow_observation import (
+    InvestigationEngineShadowObservationService,
+)
+from services.agent_runtime.app.investigation.engine_shadow_evaluation_models import (
+    InvestigationEngineShadowPromotionPolicy,
+)
+from services.agent_runtime.app.investigation.engine_shadow_evaluation_service import (
+    InvestigationEngineShadowEvaluationService,
+)
+from services.agent_runtime.app.investigation.engine_shadow_evaluation_store import (
+    InvestigationEngineShadowEvaluationStore,
 )
 from services.agent_runtime.app.investigation.multi_cluster_readiness import (
     ProductionMultiClusterReadinessError,
@@ -283,8 +328,23 @@ class AgentRuntime:
         investigation_reasoner: (
             BaseInvestigationReasoner | None
         ) = None,
+        dsh_investigation_reasoner_runtime_settings: (
+            DshInvestigationReasonerRuntimeSettings | None
+        ) = None,
         investigation_settings: (
             InvestigationSettings | None
+        ) = None,
+        investigation_session_runtime_settings: (
+            InvestigationSessionRuntimeSettings | None
+        ) = None,
+        investigation_engine_shadow_settings: (
+            InvestigationEngineShadowSettings | None
+        ) = None,
+        investigation_engine_shadow_evidence: (
+            InvestigationEngineShadowEvidence | None
+        ) = None,
+        investigation_engine_shadow_orchestration_settings: (
+            InvestigationEngineShadowOrchestrationSettings | None
         ) = None,
     ) -> None:
         # Validate every injected security component before factories, stores
@@ -411,6 +471,18 @@ class AgentRuntime:
             )
 
         if (
+            dsh_investigation_reasoner_runtime_settings is not None
+            and not isinstance(
+                dsh_investigation_reasoner_runtime_settings,
+                DshInvestigationReasonerRuntimeSettings,
+            )
+        ):
+            raise TypeError(
+                "AgentRuntime DSH Investigation reasoner runtime settings "
+                "are invalid"
+            )
+
+        if (
             investigation_settings is not None
             and not isinstance(
                 investigation_settings,
@@ -421,6 +493,54 @@ class AgentRuntime:
                 "AgentRuntime Investigation settings are invalid"
             )
 
+        if (
+            investigation_session_runtime_settings is not None
+            and not isinstance(
+                investigation_session_runtime_settings,
+                InvestigationSessionRuntimeSettings,
+            )
+        ):
+            raise TypeError(
+                "AgentRuntime Investigation Session Runtime settings "
+                "are invalid"
+            )
+
+        if (
+            investigation_engine_shadow_settings is not None
+            and not isinstance(
+                investigation_engine_shadow_settings,
+                InvestigationEngineShadowSettings,
+            )
+        ):
+            raise TypeError(
+                "AgentRuntime Investigation Engine Shadow settings "
+                "are invalid"
+            )
+
+        if (
+            investigation_engine_shadow_evidence is not None
+            and not isinstance(
+                investigation_engine_shadow_evidence,
+                InvestigationEngineShadowEvidence,
+            )
+        ):
+            raise TypeError(
+                "AgentRuntime Investigation Engine Shadow evidence "
+                "is invalid"
+            )
+
+        if (
+            investigation_engine_shadow_orchestration_settings is not None
+            and not isinstance(
+                investigation_engine_shadow_orchestration_settings,
+                InvestigationEngineShadowOrchestrationSettings,
+            )
+        ):
+            raise TypeError(
+                "AgentRuntime Investigation Engine Shadow orchestration "
+                "settings are invalid"
+            )
+
         # Resolve disabled-default Investigation configuration before any
         # Runtime store, tool, credential, network or LLM component is created.
         self.investigation_settings = (
@@ -428,6 +548,103 @@ class AgentRuntime:
             if investigation_settings is not None
             else InvestigationSettings.from_environment()
         )
+        self.investigation_session_runtime_settings = (
+            investigation_session_runtime_settings
+            if investigation_session_runtime_settings is not None
+            else InvestigationSessionRuntimeSettings.from_environment()
+        )
+        self.dsh_investigation_reasoner_runtime_settings = (
+            dsh_investigation_reasoner_runtime_settings
+            if dsh_investigation_reasoner_runtime_settings is not None
+            else DshInvestigationReasonerRuntimeSettings.from_environment()
+        )
+        self.investigation_engine_shadow_settings = (
+            investigation_engine_shadow_settings
+            if investigation_engine_shadow_settings is not None
+            else InvestigationEngineShadowSettings.from_environment()
+        )
+        self.investigation_engine_shadow_orchestration_settings = (
+            investigation_engine_shadow_orchestration_settings
+            if investigation_engine_shadow_orchestration_settings is not None
+            else InvestigationEngineShadowOrchestrationSettings.from_environment()
+        )
+        investigation_engine_shadow_plan = (
+            plan_investigation_engine_shadow_runtime(
+                settings=(
+                    self.investigation_engine_shadow_settings
+                ),
+                evidence=investigation_engine_shadow_evidence,
+                primary_settings=(
+                    self.investigation_session_runtime_settings
+                ),
+            )
+        )
+        self.investigation_engine_shadow_evidence = (
+            investigation_engine_shadow_plan.evidence
+        )
+        self.investigation_engine_shadow_decision = (
+            investigation_engine_shadow_plan.decision
+        )
+
+        investigation_capability_enabled = (
+            self.investigation_settings.enabled
+            or self.investigation_session_runtime_settings.enabled
+            or self.investigation_engine_shadow_decision.allowed
+        )
+
+        resolved_investigation_reasoner = investigation_reasoner
+
+        if (
+            investigation_capability_enabled
+            and self.dsh_investigation_reasoner_runtime_settings.enabled
+        ):
+            if resolved_investigation_reasoner is not None:
+                raise TypeError(
+                    "AgentRuntime enabled DSH Investigation reasoner conflicts "
+                    "with explicitly injected Investigation reasoner"
+                )
+
+            resolved_investigation_reasoner = (
+                create_dsh_investigation_reasoner(
+                    settings=(
+                        self.dsh_investigation_reasoner_runtime_settings
+                    ),
+                    cwd=Path.cwd(),
+                )
+            )
+            if not isinstance(
+                resolved_investigation_reasoner,
+                BaseInvestigationReasoner,
+            ):
+                raise InvestigationSessionRuntimeFactoryError(
+                    "Enabled DSH Investigation Reasoner did not produce "
+                    "a valid reasoner"
+                )
+
+        self.investigation_reasoner = (
+            resolved_investigation_reasoner
+        )
+
+        # Fail before authentication, stores, tools or other Runtime
+        # components can create side effects. Disabled Session Runtime does
+        # not inspect the supplied dependency.
+        if (
+            (
+                self.investigation_session_runtime_settings.enabled
+                or self.investigation_engine_shadow_decision.allowed
+            )
+            and not isinstance(
+                resolved_investigation_reasoner,
+                BaseInvestigationReasoner,
+            )
+        ):
+            if self.investigation_engine_shadow_decision.allowed:
+                raise InvestigationEngineShadowRuntimeFactoryError(
+                    "Allowed LangGraph Shadow requires a reasoner"
+                )
+            raise InvestigationSessionRuntimeFactoryError(
+                "Enabled Investigation Session Runtime requires a reasoner"
+            )
 
         investigation_shared_gateway = None
 
@@ -437,14 +654,14 @@ class AgentRuntime:
         # Disabled Investigation deliberately does not inspect or touch the
         # supplied reasoner's LLM adapter.
         if (
-            self.investigation_settings.enabled
+            investigation_capability_enabled
             and isinstance(
-                investigation_reasoner,
+                resolved_investigation_reasoner,
                 LLMInvestigationReasoner,
             )
         ):
             investigation_llm = (
-                investigation_reasoner.investigation_llm
+                resolved_investigation_reasoner.investigation_llm
             )
 
             if not isinstance(
@@ -477,13 +694,23 @@ class AgentRuntime:
                     "AgentRuntime Investigation LLM gateway must be shared"
                 )
 
+        # The two disabled-default Investigation capabilities share one
+        # bounded read-only Probe executor when either capability is enabled.
+        # Constructing it does not call a Tool or touch the network.
+        self.investigation_probe_executor = (
+            ReadOnlyInvestigationProbeExecutor()
+            if investigation_capability_enabled
+            else None
+        )
+
         # Preserve the existing fail-closed Investigation assembly boundary.
         # Enabled mode without an explicit reasoner still fails here before
         # any Runtime or LLM infrastructure is constructed.
         self.investigation_coordinator = (
             create_investigation_coordinator(
-                reasoner=investigation_reasoner,
+                reasoner=resolved_investigation_reasoner,
                 settings=self.investigation_settings,
+                probe_executor=self.investigation_probe_executor,
             )
         )
 
@@ -668,6 +895,85 @@ class AgentRuntime:
             is not None
         )
 
+        investigation_session_components = (
+            create_investigation_session_runtime(
+                settings=(
+                    self.investigation_session_runtime_settings
+                ),
+                reasoner=resolved_investigation_reasoner,
+                probe_executor=(
+                    self.investigation_probe_executor
+                ),
+                require_cluster_verified_evidence=(
+                    self.cluster_verified_evidence_required
+                ),
+            )
+        )
+        self.investigation_session_store = (
+            investigation_session_components.store
+            if investigation_session_components is not None
+            else None
+        )
+        self.investigation_session_service = (
+            investigation_session_components.service
+            if investigation_session_components is not None
+            else None
+        )
+        self.investigation_session_driver = (
+            investigation_session_components.driver
+            if investigation_session_components is not None
+            else None
+        )
+        self.investigation_session_loop = (
+            investigation_session_components.loop
+            if investigation_session_components is not None
+            else None
+        )
+        self.investigation_engine = (
+            investigation_session_components.engine
+            if investigation_session_components is not None
+            else None
+        )
+
+        investigation_engine_shadow_components = (
+            create_investigation_engine_shadow_runtime(
+                plan=investigation_engine_shadow_plan,
+                primary_components=(
+                    investigation_session_components
+                ),
+                reasoner=resolved_investigation_reasoner,
+                probe_executor=(
+                    self.investigation_probe_executor
+                ),
+                require_cluster_verified_evidence=(
+                    self.cluster_verified_evidence_required
+                ),
+            )
+        )
+        self.investigation_engine_shadow_runtime = (
+            investigation_engine_shadow_components
+        )
+        self.investigation_engine_shadow_store = (
+            investigation_engine_shadow_components.store
+            if investigation_engine_shadow_components is not None
+            else None
+        )
+        self.investigation_engine_shadow_service = (
+            investigation_engine_shadow_components.service
+            if investigation_engine_shadow_components is not None
+            else None
+        )
+        self.investigation_engine_shadow_driver = (
+            investigation_engine_shadow_components.driver
+            if investigation_engine_shadow_components is not None
+            else None
+        )
+        self.investigation_engine_shadow_engine = (
+            investigation_engine_shadow_components.engine
+            if investigation_engine_shadow_components is not None
+            else None
+        )
+
         if (
             self.investigation_coordinator
             is not None
@@ -700,6 +1006,78 @@ class AgentRuntime:
             )
         else:
             self.tools = create_tool_manager()
+
+        self.investigation_engine_shadow_runner = (
+            InvestigationEngineShadowRunner(
+                runtime=(
+                    investigation_engine_shadow_components
+                ),
+                settings=(
+                    self.investigation_engine_shadow_settings
+                ),
+                tools=self.tools,
+            )
+            if investigation_engine_shadow_components is not None
+            else None
+        )
+        self.investigation_engine_shadow_orchestrator = (
+            create_investigation_engine_shadow_orchestrator(
+                settings=(
+                    self.investigation_engine_shadow_orchestration_settings
+                ),
+                runner=self.investigation_engine_shadow_runner,
+            )
+        )
+        # Pure read model: constructing this service never opens a database.
+        # Disabled mode therefore remains zero-store, while authenticated API
+        # callers can still observe the bounded Gate No-Go reason.
+        self.investigation_engine_shadow_observation = (
+            InvestigationEngineShadowObservationService(
+                primary_service=(
+                    self.investigation_session_service
+                ),
+                shadow_service=(
+                    self.investigation_engine_shadow_service
+                ),
+                decision=(
+                    self.investigation_engine_shadow_decision
+                ),
+                orchestration_settings=(
+                    self.investigation_engine_shadow_orchestration_settings
+                ),
+                orchestrator=(
+                    self.investigation_engine_shadow_orchestrator
+                ),
+            )
+        )
+        self.investigation_engine_shadow_promotion_policy = (
+            InvestigationEngineShadowPromotionPolicy()
+        )
+        self.investigation_engine_shadow_evaluation_store = None
+        self.investigation_engine_shadow_evaluation_service = None
+        if self.investigation_engine_shadow_orchestrator is not None:
+            shadow_db_path = Path(
+                self.investigation_engine_shadow_settings.shadow_db_path
+            )
+            evaluation_db_path = shadow_db_path.with_name(
+                f"{shadow_db_path.stem}_evaluations.db"
+            )
+            self.investigation_engine_shadow_evaluation_store = (
+                InvestigationEngineShadowEvaluationStore(
+                    evaluation_db_path
+                )
+            )
+            self.investigation_engine_shadow_evaluation_service = (
+                InvestigationEngineShadowEvaluationService(
+                    store=(
+                        self.investigation_engine_shadow_evaluation_store
+                    ),
+                    primary_service=self.investigation_session_service,
+                    shadow_service=self.investigation_engine_shadow_service,
+                    decision=self.investigation_engine_shadow_decision,
+                    policy=self.investigation_engine_shadow_promotion_policy,
+                )
+            )
 
         readiness_registry_types_valid = (
             (
@@ -1142,14 +1520,16 @@ class AgentRuntime:
         context: AgentContext,
     ):
         """
-        Execute the primary PlannerPipeline and, when explicitly enabled,
-        run Investigation automatically as a best-effort Shadow.
+        Execute the primary PlannerPipeline and explicitly enabled Shadows.
 
         Ordering is deliberate:
 
         1. PlannerPipeline completes first.
         2. Investigation receives an isolated AgentContext.
         3. Only the bounded investigation_shadow snapshot is copied back.
+
+        The guarded LangGraph experiment is submitted only at the final
+        response boundary and is never awaited by this request.
 
         Investigation can never change the Pipeline result, Incident,
         variables, results, trace, Approval, executions or evaluations.
@@ -1206,6 +1586,9 @@ class AgentRuntime:
         )
 
         if self.investigation_coordinator is None:
+            self._submit_engine_shadow_orchestration(
+                context
+            )
             return results
 
         shadow_context = (
@@ -1342,7 +1725,37 @@ class AgentRuntime:
             context
         )
 
+        self._submit_engine_shadow_orchestration(
+            context
+        )
+
         return results
+
+    def _submit_engine_shadow_orchestration(
+        self,
+        context: AgentContext,
+    ) -> None:
+        """
+        Submit detached LangGraph Shadow work at the final response boundary.
+
+        No LLM or Tool work is awaited here. A future Orchestrator defect is
+        deliberately swallowed because this experiment is weaker than the
+        already-completed primary result and existing evaluation projections.
+        """
+
+        engine_shadow_orchestrator = getattr(
+            self,
+            "investigation_engine_shadow_orchestrator",
+            None,
+        )
+        if engine_shadow_orchestrator is None:
+            return
+        try:
+            engine_shadow_orchestrator.submit(
+                context
+            )
+        except Exception:
+            return
 
     async def _persist_incident_analysis(
         self,

@@ -26,6 +26,7 @@ READ_OPERATIONS = frozenset(
         ProtectedOperation.READ_APPROVAL_WORKFLOW,
         ProtectedOperation.READ_VERIFICATION,
         ProtectedOperation.READ_REMEDIATION_PREPARATION,
+        ProtectedOperation.READ_INVESTIGATION_SESSION,
     }
 )
 
@@ -37,6 +38,8 @@ WRITE_OPERATIONS = frozenset(
         ProtectedOperation.DECIDE_APPROVAL,
         ProtectedOperation.RESUME_ACTION,
         ProtectedOperation.RECONCILE_ACTION,
+        ProtectedOperation.CREATE_INVESTIGATION_SESSION,
+        ProtectedOperation.ADVANCE_INVESTIGATION_SESSION,
     }
 )
 
@@ -108,6 +111,7 @@ def test_default_role_permissions_are_least_privilege():
             RuntimePermission.APPROVAL_READ,
             RuntimePermission.VERIFICATION_READ,
             RuntimePermission.REMEDIATION_PREPARATION_READ,
+            RuntimePermission.INVESTIGATION_READ,
         }
     )
 
@@ -121,6 +125,7 @@ def test_default_role_permissions_are_least_privilege():
         | {
             RuntimePermission.RUNTIME_EXECUTE,
             RuntimePermission.REMEDIATION_PREPARE,
+            RuntimePermission.INVESTIGATION_ADVANCE,
         }
     )
     assert DEFAULT_ROLE_PERMISSIONS[
@@ -153,6 +158,7 @@ def test_default_role_permissions_are_least_privilege():
         {
             RuntimePermission.RUNTIME_EXECUTE,
             RuntimePermission.REMEDIATION_PREPARE,
+            RuntimePermission.INVESTIGATION_ADVANCE,
         }
     )
     assert DEFAULT_ROLE_PERMISSIONS[
@@ -240,6 +246,27 @@ def test_operation_permissions_match_route_boundaries():
             frozenset(
                 {
                     RuntimePermission.VERIFICATION_READ,
+                }
+            )
+        ),
+        ProtectedOperation.CREATE_INVESTIGATION_SESSION: (
+            frozenset(
+                {
+                    RuntimePermission.INVESTIGATION_ADVANCE,
+                }
+            )
+        ),
+        ProtectedOperation.READ_INVESTIGATION_SESSION: (
+            frozenset(
+                {
+                    RuntimePermission.INVESTIGATION_READ,
+                }
+            )
+        ),
+        ProtectedOperation.ADVANCE_INVESTIGATION_SESSION: (
+            frozenset(
+                {
+                    RuntimePermission.INVESTIGATION_ADVANCE,
                 }
             )
         ),
@@ -353,6 +380,10 @@ def test_analyst_and_service_have_bounded_runtime_access():
     ).allowed is True
     assert engine.authorize(
         analyst,
+        ProtectedOperation.ADVANCE_INVESTIGATION_SESSION,
+    ).allowed is True
+    assert engine.authorize(
+        analyst,
         ProtectedOperation.RESUME_ACTION,
     ).allowed is False
 
@@ -363,6 +394,10 @@ def test_analyst_and_service_have_bounded_runtime_access():
     assert engine.authorize(
         service,
         ProtectedOperation.PREPARE_REMEDIATION,
+    ).allowed is True
+    assert engine.authorize(
+        service,
+        ProtectedOperation.ADVANCE_INVESTIGATION_SESSION,
     ).allowed is True
     assert engine.authorize(
         service,

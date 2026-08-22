@@ -1,0 +1,286 @@
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
+from common.config.settings import AuthenticationConfig
+from services.agent_runtime.app.security.factory import (
+    create_authentication_service,
+)
+
+import services.agent_runtime.app.runtime.runtime as runtime_module
+from services.agent_runtime.app.investigation.engine import (
+    CustomInvestigationEngine,
+)
+from services.agent_runtime.app.investigation.engine_shadow_gate import (
+    INVESTIGATION_LANGGRAPH_SHADOW_ACKNOWLEDGEMENT,
+    InvestigationEngineShadowEvidence,
+    InvestigationEngineShadowGateCode,
+    InvestigationEngineShadowSettings,
+)
+from services.agent_runtime.app.investigation.engine_shadow_runner import (
+    InvestigationEngineShadowRunner,
+)
+from services.agent_runtime.app.investigation.engine_shadow_runtime_factory import (
+    InvestigationEngineShadowRuntimeFactoryError,
+)
+from services.agent_runtime.app.investigation.langgraph_engine import (
+    LangGraphInvestigationEngine,
+)
+from services.agent_runtime.app.investigation.reasoner import (
+    BaseInvestigationReasoner,
+)
+from services.agent_runtime.app.investigation.session_runtime_settings import (
+    INVESTIGATION_SESSION_RUNTIME_ACKNOWLEDGEMENT,
+    InvestigationSessionRuntimeSettings,
+)
+
+MATRIX_DIGEST = "c" * 64
+RELEASE_DIGEST = "d" * 64
+SHADOW_ENV_NAMES = [
+    "AGENT_INVESTIGATION_LANGGRAPH_SHADOW_ENABLED",
+    "AGENT_INVESTIGATION_LANGGRAPH_SHADOW_ACKNOWLEDGEMENT",
+    "AGENT_INVESTIGATION_LANGGRAPH_SHADOW_KILL_SWITCH_ENGAGED",
+    "AGENT_INVESTIGATION_LANGGRAPH_SHADOW_DB_PATH",
+    "AGENT_INVESTIGATION_LANGGRAPH_SHADOW_SAMPLE_RATE",
+    "AGENT_INVESTIGATION_LANGGRAPH_SHADOW_MAX_CONCURRENT",
+    "AGENT_INVESTIGATION_LANGGRAPH_SHADOW_EVIDENCE_MAX_AGE_SECONDS",
+    "AGENT_INVESTIGATION_LANGGRAPH_SHADOW_MATRIX_DIGEST",
+    "AGENT_INVESTIGATION_LANGGRAPH_SHADOW_RELEASE_DIGEST",
+]
+
+
+class FakeReasoner(BaseInvestigationReasoner):
+    async def decide(self, scope, state):
+        raise AssertionError("Runtime wiring ran the reasoner")
+
+
+def disabled_authentication_service():
+    return create_authentication_service(AuthenticationConfig())
+
+
+def isolate_runtime(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    for name in SHADOW_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(
+        runtime_module,
+        "create_kubernetes_preflight_resolver",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "create_kubernetes_production_executor",
+        lambda **_: None,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "create_production_pilot_live_readiness_probe",
+        lambda: None,
+    )
+
+
+def create_runtime(monkeypatch, tmp_path: Path, **kwargs):
+    isolate_runtime(monkeypatch, tmp_path)
+    return runtime_module.AgentRuntime(
+        authentication_service=disabled_authentication_service(),
+        **kwargs,
+    )
+
+
+def primary_settings(path: Path) -> InvestigationSessionRuntimeSettings:
+    return InvestigationSessionRuntimeSettings(
+        enabled=True,
+        acknowledgement=(INVESTIGATION_SESSION_RUNTIME_ACKNOWLEDGEMENT),
+        db_path=str(path),
+    )
+
+
+def shadow_settings(
+    path: Path,
+    **changes,
+) -> InvestigationEngineShadowSettings:
+    values = {
+        "enabled": True,
+        "acknowledgement": (INVESTIGATION_LANGGRAPH_SHADOW_ACKNOWLEDGEMENT),
+        "kill_switch_engaged": False,
+        "shadow_db_path": str(path),
+        "expected_matrix_digest": MATRIX_DIGEST,
+        "expected_release_digest": RELEASE_DIGEST,
+    }
+    values.update(changes)
+    return InvestigationEngineShadowSettings(**values)
+
+
+def evidence(now: datetime) -> InvestigationEngineShadowEvidence:
+    return InvestigationEngineShadowEvidence(
+        matrix_digest=MATRIX_DIGEST,
+        release_digest=RELEASE_DIGEST,
+        generated_at=now - timedelta(minutes=1),
+        expires_at=now + timedelta(minutes=30),
+    )
+
+
+def test_default_runtime_keeps_langgraph_shadow_absent_and_creates_no_store(
+    monkeypatch,
+    tmp_path,
+):
+    runtime = create_runtime(monkeypatch, tmp_path)
+
+    assert runtime.investigation_engine_shadow_settings.enabled is False
+    assert (
+        runtime.investigation_engine_shadow_decision.code
+        == InvestigationEngineShadowGateCode.DISABLED
+    )
+    assert runtime.investigation_engine_shadow_evidence is None
+    assert runtime.investigation_engine_shadow_runtime is None
+    assert runtime.investigation_engine_shadow_store is None
+    assert runtime.investigation_engine_shadow_service is None
+    assert runtime.investigation_engine_shadow_driver is None
+    assert runtime.investigation_engine_shadow_engine is None
+    assert runtime.investigation_engine_shadow_runner is None
+    assert runtime.investigation_probe_executor is None
+    assert not (tmp_path / "data/investigation_langgraph_shadow.db").exists()
+    assert not hasattr(
+        runtime.pipeline,
+        "investigation_engine_shadow_engine",
+    )
+
+
+def test_enabled_but_missing_evidence_fails_closed_without_dependencies(
+    monkeypatch,
+    tmp_path,
+):
+    shadow_path = tmp_path / "missing-evidence.db"
+    runtime = create_runtime(
+        monkeypatch,
+        tmp_path,
+        investigation_engine_shadow_settings=shadow_settings(shadow_path),
+    )
+
+    assert (
+        runtime.investigation_engine_shadow_decision.code
+        == InvestigationEngineShadowGateCode.EVIDENCE_MISSING
+    )
+    assert runtime.investigation_probe_executor is None
+    assert runtime.investigation_engine_shadow_runtime is None
+    assert runtime.investigation_engine_shadow_runner is None
+    assert not shadow_path.exists()
+
+
+def test_allowed_runtime_owns_isolated_shadow_without_pipeline_execution(
+    monkeypatch,
+    tmp_path,
+):
+    now = datetime.now(UTC)
+    primary_path = tmp_path / "primary.db"
+    shadow_path = tmp_path / "shadow.db"
+    reasoner = FakeReasoner()
+    runtime = create_runtime(
+        monkeypatch,
+        tmp_path,
+        investigation_reasoner=reasoner,
+        investigation_session_runtime_settings=(primary_settings(primary_path)),
+        investigation_engine_shadow_settings=(shadow_settings(shadow_path)),
+        investigation_engine_shadow_evidence=evidence(now),
+    )
+
+    assert runtime.investigation_engine_shadow_decision.allowed is True
+    assert isinstance(
+        runtime.investigation_engine,
+        CustomInvestigationEngine,
+    )
+    assert isinstance(
+        runtime.investigation_engine_shadow_engine,
+        LangGraphInvestigationEngine,
+    )
+    assert runtime.investigation_engine_shadow_store.db_path == shadow_path
+    assert (
+        runtime.investigation_engine_shadow_store.db_path
+        != runtime.investigation_session_store.db_path
+    )
+    assert runtime.investigation_engine_shadow_service is not runtime.investigation_session_service
+    assert runtime.investigation_engine_shadow_driver.reasoner is reasoner
+    assert (
+        runtime.investigation_engine_shadow_driver.probe_executor
+        is runtime.investigation_probe_executor
+    )
+    assert isinstance(
+        runtime.investigation_engine_shadow_runner,
+        InvestigationEngineShadowRunner,
+    )
+    assert (
+        runtime.investigation_engine_shadow_runner.runtime
+        is runtime.investigation_engine_shadow_runtime
+    )
+    assert runtime.investigation_engine_shadow_runner.tools is runtime.tools
+    assert primary_path.exists()
+    assert shadow_path.exists()
+    assert not hasattr(
+        runtime.pipeline,
+        "investigation_engine_shadow_engine",
+    )
+    assert not hasattr(
+        runtime.pipeline,
+        "investigation_engine_shadow_runtime",
+    )
+    assert not hasattr(
+        runtime.pipeline,
+        "investigation_engine_shadow_runner",
+    )
+
+
+def test_allowed_shadow_without_primary_fails_before_runtime_side_effects(
+    monkeypatch,
+    tmp_path,
+):
+    isolate_runtime(monkeypatch, tmp_path)
+    now = datetime.now(UTC)
+    shadow_path = tmp_path / "must_not_exist.db"
+    memory_calls = 0
+
+    def unexpected_memory_store():
+        nonlocal memory_calls
+        memory_calls += 1
+        raise AssertionError("Invalid Shadow configuration created Memory")
+
+    monkeypatch.setattr(
+        runtime_module,
+        "MemoryStore",
+        unexpected_memory_store,
+    )
+
+    with pytest.raises(
+        InvestigationEngineShadowRuntimeFactoryError,
+        match="enabled Custom primary Runtime",
+    ):
+        runtime_module.AgentRuntime(
+            authentication_service=disabled_authentication_service(),
+            investigation_reasoner=FakeReasoner(),
+            investigation_engine_shadow_settings=(shadow_settings(shadow_path)),
+            investigation_engine_shadow_evidence=evidence(now),
+        )
+
+    assert memory_calls == 0
+    assert not shadow_path.exists()
+
+
+def test_invalid_shadow_injection_fails_before_authentication_factory(
+    monkeypatch,
+):
+    authentication_calls = 0
+
+    def unexpected_authentication_factory():
+        nonlocal authentication_calls
+        authentication_calls += 1
+        raise AssertionError("Invalid Shadow input created Authentication")
+
+    monkeypatch.setattr(
+        runtime_module,
+        "create_authentication_service",
+        unexpected_authentication_factory,
+    )
+
+    with pytest.raises(TypeError, match="Shadow evidence"):
+        runtime_module.AgentRuntime(investigation_engine_shadow_evidence=object())
+
+    assert authentication_calls == 0

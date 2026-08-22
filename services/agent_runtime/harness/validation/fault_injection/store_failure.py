@@ -1,0 +1,1 @@
+# Store failure injection scenario

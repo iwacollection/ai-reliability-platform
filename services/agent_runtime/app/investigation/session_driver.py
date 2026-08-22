@@ -135,9 +135,14 @@ class DurableInvestigationSessionDriver:
         session_id: UUID | str,
         *,
         claimant: str,
+        expected_version: int | None = None,
     ) -> InvestigationSessionDriverResult:
         current = await self.session_service.require(
             session_id
+        )
+        self._assert_expected_version(
+            current,
+            expected_version=expected_version,
         )
         replay = self._latest_step_replay(
             current,
@@ -253,9 +258,14 @@ class DurableInvestigationSessionDriver:
         *,
         context,
         claimant: str,
+        expected_version: int | None = None,
     ) -> InvestigationSessionDriverResult:
         current = await self.session_service.require(
             session_id
+        )
+        self._assert_expected_version(
+            current,
+            expected_version=expected_version,
         )
         replay = self._latest_step_replay(
             current,
@@ -336,6 +346,35 @@ class DurableInvestigationSessionDriver:
             external_call_made=True,
             replayed=completion.replayed,
         )
+
+    @staticmethod
+    def _assert_expected_version(
+        session: InvestigationSessionRecord,
+        *,
+        expected_version: int | None,
+    ) -> None:
+        """
+        Bind one external step to the caller's observed durable version.
+
+        The Store CAS still resolves races after this check. This additional
+        precondition prevents an API retry that arrives after a completed
+        step from silently advancing the next protocol phase.
+        """
+
+        if expected_version is None:
+            return
+        if (
+            not isinstance(expected_version, int)
+            or isinstance(expected_version, bool)
+            or expected_version < 0
+        ):
+            raise InvestigationSessionDriverBlockedError(
+                "Investigation Session expected version is invalid"
+            )
+        if session.version != expected_version:
+            raise InvestigationSessionDriverBlockedError(
+                "Investigation Session version changed before execution"
+            )
 
     def _assert_reasoner_sequence(
         self,

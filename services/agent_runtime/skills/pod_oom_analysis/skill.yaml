@@ -1,0 +1,3 @@
+name: pod_oom_analysis
+version: v1
+description: Kubernetes Pod OOM analysis skill

@@ -1,0 +1,130 @@
+from pathlib import Path
+
+from services.agent_runtime.app.action.production_pilot import (
+    KUBERNETES_PRODUCTION_KILL_SWITCH_DISENGAGED,
+    KUBERNETES_PRODUCTION_KILL_SWITCH_ENGAGED,
+    KUBERNETES_PRODUCTION_RUNBOOK_ACKNOWLEDGEMENT,
+)
+from services.agent_runtime.app.action.production_pilot_ceremony_models import (
+    PRODUCTION_PILOT_ACTIVATION_ACKNOWLEDGEMENT,
+)
+from services.agent_runtime.app.action.production_pilot_pre_enable_evidence import (
+    PRODUCTION_PILOT_PRE_ENABLE_SIGN_OFF_ACKNOWLEDGEMENT,
+)
+from services.agent_runtime.app.action.production_pilot_final_handoff import (
+    PRODUCTION_PILOT_FINAL_HANDOFF_ACKNOWLEDGEMENT,
+)
+from services.agent_runtime.app.action.production_pilot_go_no_go_models import (
+    PRODUCTION_PILOT_GO_NO_GO_ACKNOWLEDGEMENT,
+    PRODUCTION_PILOT_LIVE_PROBE_ACKNOWLEDGEMENT,
+)
+from services.agent_runtime.app.action.production_pilot_live_probe import (
+    PRODUCTION_PILOT_LIVE_PROBE_GATE_ACKNOWLEDGEMENT,
+)
+
+
+def runbook_path() -> Path:
+    return (
+        Path(__file__)
+        .resolve()
+        .parents[3]
+        / "docs"
+        / "runbooks"
+        / "oomkilled-production-pilot-v1.md"
+    )
+
+
+def test_runbook_locks_live_pilot_safety_contract():
+    content = runbook_path().read_text(
+        encoding="utf-8"
+    )
+
+    for required in (
+        KUBERNETES_PRODUCTION_KILL_SWITCH_ENGAGED,
+        KUBERNETES_PRODUCTION_KILL_SWITCH_DISENGAGED,
+        KUBERNETES_PRODUCTION_RUNBOOK_ACKNOWLEDGEMENT,
+        "GET /production-actions/pilot-readiness",
+        "POST /production-actions/pilot-rehearsal",
+        "POST /production-actions/pilot-crash-recovery-rehearsal",
+        "POST /production-actions/{approval_id}/pilot-activation-checklist",
+        "GET /production-actions/{approval_id}/pilot-pre-enable-evidence",
+        "POST /production-actions/{approval_id}/pilot-pre-enable-sign-off",
+        "POST /production-actions/{approval_id}/pilot-final-handoff-rehearsal",
+        "POST /production-actions/{approval_id}/pilot-live-readiness-probe",
+        "POST /production-actions/{approval_id}/pilot-go-no-go-decision",
+        "GET /production-actions/{approval_id}/pilot-go-no-go-decision",
+        PRODUCTION_PILOT_ACTIVATION_ACKNOWLEDGEMENT,
+        PRODUCTION_PILOT_PRE_ENABLE_SIGN_OFF_ACKNOWLEDGEMENT,
+        PRODUCTION_PILOT_FINAL_HANDOFF_ACKNOWLEDGEMENT,
+        PRODUCTION_PILOT_LIVE_PROBE_GATE_ACKNOWLEDGEMENT,
+        PRODUCTION_PILOT_LIVE_PROBE_ACKNOWLEDGEMENT,
+        PRODUCTION_PILOT_GO_NO_GO_ACKNOWLEDGEMENT,
+        "ready_for_execution=true",
+        "budget_state=available",
+        "durable_claim_created=false",
+        "external_call_count=0",
+        "action_execution_created=false",
+        "real_write_attempted=false",
+        "ceremony.status=ready",
+        "ceremony.status=activated",
+        "RUNNING + ACTIVATED",
+        "激活重放永远不能获得 Executor 调用权限",
+        "production_pilot_ceremony_audit",
+        "binding_consistent=true",
+        "clock_consistent=true",
+        "automatic_resume_allowed=false",
+        "checkpoint_count=13",
+        "storage_read_count=0",
+        "storage_write_count=0",
+        "ready_for_sign_off=true",
+        "evidence_blockers",
+        "action_execution_state=not_created",
+        "verification_state=not_created",
+        "production_execution_enabled=false",
+        "production_executor_configured=false",
+        "crash_recovery_checkpoint_count=13",
+        "sign_off_passed=true",
+        "persisted=false",
+        "sign_off_sha256",
+        "credential_content_read_count=0",
+        "credential_content_validated=false",
+        "tls_handshake_performed=false",
+        "requires_guarded_startup_credential_validation=true",
+        "requires_live_tls_recheck_before_enablement=true",
+        "security_route_count=22",
+        "network_call_count=2",
+        "kubernetes_read_count=2",
+        "kubernetes_write_count=0",
+        "patch_request_count=0",
+        "dry_run_request_count=0",
+        "probe_record_sha256",
+        "allows_guarded_enablement_procedure=true",
+        "authorizes_action_execution=false",
+        "automatic_enablement_allowed=false",
+        "feature_gate_changed=false",
+        "kill_switch_changed=false",
+        "最长有效期五分钟",
+        "禁止自动重试实时探测",
+        "network_call_count=0",
+        "configuration_sha256",
+        "authorizes_feature_enablement=false",
+        "production_executor_call_count=0",
+        "authorizes_execution=false",
+        "report_sha256",
+        "approval_approved_ceremony_ready",
+        "pilot_budget_consumed",
+        "verification_not_passed",
+        "claim_not_activated",
+        "activated_outcome_unconfirmed",
+        "inspect_deployment_state_read_only",
+        "reconcile_existing_action_execution",
+        "INDETERMINATE",
+        "Idempotency-Key",
+        "Exactly-once Verification",
+    ):
+        assert required in content
+
+    lowered = content.lower()
+    assert "bearer " not in lowered
+    assert "api_key " not in lowered
+    assert "password=" not in lowered

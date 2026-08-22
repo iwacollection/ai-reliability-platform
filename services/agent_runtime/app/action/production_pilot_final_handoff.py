@@ -208,7 +208,7 @@ class ProductionPilotFinalHandoffReport(BaseModel):
     executor_handoff_owners_separated: bool
     operator_attestations_complete: bool
     deployment_release_evidence_reviewed: bool
-    security_route_count: Literal[22] = 22
+    security_route_count: Literal[25] = 25
     security_role_count: Literal[7] = 7
     security_matrix_reviewed: bool
 

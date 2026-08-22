@@ -112,7 +112,7 @@ async def test_final_handoff_passes_without_writes_or_secret_reads(
     assert first == replay
     assert first.passed is True
     assert first.blockers == ()
-    assert first.security_route_count == 22
+    assert first.security_route_count == 25
     assert first.security_role_count == 7
     assert first.credential_references_separate is True
     assert first.credential_content_read_count == 0

@@ -1,0 +1,293 @@
+from pathlib import Path
+
+import pytest
+
+import services.agent_runtime.app.runtime.runtime as runtime_module
+
+from common.config.settings import AuthenticationConfig
+from services.agent_runtime.app.investigation.reasoner import (
+    BaseInvestigationReasoner,
+)
+from services.agent_runtime.app.investigation.engine import (
+    CustomInvestigationEngine,
+)
+from services.agent_runtime.app.investigation.session_runtime_factory import (
+    InvestigationSessionRuntimeFactoryError,
+)
+from services.agent_runtime.app.investigation.session_runtime_settings import (
+    INVESTIGATION_LANGGRAPH_ENGINE_ACKNOWLEDGEMENT,
+    INVESTIGATION_SESSION_RUNTIME_ACKNOWLEDGEMENT,
+    InvestigationEngineBackend,
+    InvestigationSessionRuntimeSettings,
+)
+from services.agent_runtime.app.investigation.settings import (
+    INVESTIGATION_ENABLE_ACKNOWLEDGEMENT,
+    InvestigationSettings,
+)
+from services.agent_runtime.app.security.factory import (
+    create_authentication_service,
+)
+
+
+SESSION_ENV_NAMES = [
+    "AGENT_INVESTIGATION_SESSION_RUNTIME_ENABLED",
+    "AGENT_INVESTIGATION_SESSION_RUNTIME_ACKNOWLEDGEMENT",
+    "AGENT_INVESTIGATION_SESSION_DB_PATH",
+    "AGENT_INVESTIGATION_SESSION_ENGINE",
+    "AGENT_INVESTIGATION_LANGGRAPH_ACKNOWLEDGEMENT",
+]
+SHADOW_ENV_NAMES = [
+    "AGENT_INVESTIGATION_SHADOW_ENABLED",
+    "AGENT_INVESTIGATION_SHADOW_ACKNOWLEDGEMENT",
+    "AGENT_INVESTIGATION_MAX_ITERATIONS",
+    "AGENT_INVESTIGATION_MAX_TOOL_CALLS",
+    "AGENT_INVESTIGATION_TIMEOUT_SECONDS",
+]
+
+
+class FakeReasoner(BaseInvestigationReasoner):
+    async def decide(self, scope, state):
+        raise AssertionError("Runtime wiring must not run the reasoner")
+
+
+def disabled_authentication_service():
+    return create_authentication_service(AuthenticationConfig())
+
+
+def isolate_runtime(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    for name in SESSION_ENV_NAMES + SHADOW_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(
+        runtime_module,
+        "create_kubernetes_preflight_resolver",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "create_kubernetes_production_executor",
+        lambda **_: None,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "create_production_pilot_live_readiness_probe",
+        lambda: None,
+    )
+
+
+def create_runtime(monkeypatch, tmp_path: Path, **kwargs):
+    isolate_runtime(monkeypatch, tmp_path)
+    return runtime_module.AgentRuntime(
+        authentication_service=disabled_authentication_service(),
+        **kwargs,
+    )
+
+
+def enabled_session_settings(db_path: Path):
+    return InvestigationSessionRuntimeSettings(
+        enabled=True,
+        acknowledgement=(
+            INVESTIGATION_SESSION_RUNTIME_ACKNOWLEDGEMENT
+        ),
+        db_path=str(db_path),
+    )
+
+
+def test_default_runtime_keeps_session_runtime_disabled_without_database(
+    monkeypatch,
+    tmp_path,
+):
+    runtime = create_runtime(monkeypatch, tmp_path)
+
+    assert runtime.investigation_session_runtime_settings.enabled is False
+    assert runtime.investigation_probe_executor is None
+    assert runtime.investigation_session_store is None
+    assert runtime.investigation_session_service is None
+    assert runtime.investigation_session_driver is None
+    assert runtime.investigation_session_loop is None
+    assert runtime.investigation_engine is None
+    assert not (tmp_path / "data/investigation_sessions.db").exists()
+    assert not hasattr(runtime.pipeline, "investigation_session_loop")
+
+
+def test_enabled_runtime_owns_shared_session_components_without_pipeline_call(
+    monkeypatch,
+    tmp_path,
+):
+    db_path = tmp_path / "session_runtime.db"
+    reasoner = FakeReasoner()
+    settings = enabled_session_settings(db_path)
+
+    runtime = create_runtime(
+        monkeypatch,
+        tmp_path,
+        investigation_reasoner=reasoner,
+        investigation_session_runtime_settings=settings,
+    )
+
+    assert runtime.investigation_session_runtime_settings is settings
+    assert runtime.investigation_session_store.db_path == db_path
+    assert (
+        runtime.investigation_session_service.store
+        is runtime.investigation_session_store
+    )
+    assert (
+        runtime.investigation_session_driver.session_service
+        is runtime.investigation_session_service
+    )
+    assert runtime.investigation_session_driver.reasoner is reasoner
+    assert (
+        runtime.investigation_session_driver.probe_executor
+        is runtime.investigation_probe_executor
+    )
+    assert (
+        runtime.investigation_session_loop.session_service
+        is runtime.investigation_session_service
+    )
+    assert (
+        runtime.investigation_session_loop.session_driver
+        is runtime.investigation_session_driver
+    )
+    assert isinstance(
+        runtime.investigation_engine,
+        CustomInvestigationEngine,
+    )
+    assert (
+        runtime.investigation_engine.session_service
+        is runtime.investigation_session_service
+    )
+    assert (
+        runtime.investigation_engine.session_loop
+        is runtime.investigation_session_loop
+    )
+    assert db_path.exists()
+    assert not hasattr(runtime.pipeline, "investigation_session_loop")
+
+
+def test_shadow_and_session_share_reasoner_and_probe_executor(
+    monkeypatch,
+    tmp_path,
+):
+    reasoner = FakeReasoner()
+    runtime = create_runtime(
+        monkeypatch,
+        tmp_path,
+        investigation_reasoner=reasoner,
+        investigation_settings=InvestigationSettings(
+            enabled=True,
+            acknowledgement=INVESTIGATION_ENABLE_ACKNOWLEDGEMENT,
+        ),
+        investigation_session_runtime_settings=(
+            enabled_session_settings(tmp_path / "shared.db")
+        ),
+    )
+
+    assert runtime.investigation_coordinator.reasoner is reasoner
+    assert runtime.investigation_session_driver.reasoner is reasoner
+    assert (
+        runtime.investigation_coordinator.probe_executor
+        is runtime.investigation_probe_executor
+    )
+    assert (
+        runtime.investigation_session_driver.probe_executor
+        is runtime.investigation_probe_executor
+    )
+
+
+def test_runtime_can_select_langgraph_without_pipeline_ownership(
+    monkeypatch,
+    tmp_path,
+):
+    from services.agent_runtime.app.investigation.langgraph_engine import (
+        LangGraphInvestigationEngine,
+    )
+
+    runtime = create_runtime(
+        monkeypatch,
+        tmp_path,
+        investigation_reasoner=FakeReasoner(),
+        investigation_session_runtime_settings=(
+            InvestigationSessionRuntimeSettings(
+                enabled=True,
+                acknowledgement=(
+                    INVESTIGATION_SESSION_RUNTIME_ACKNOWLEDGEMENT
+                ),
+                db_path=str(
+                    tmp_path / "langgraph-runtime.db"
+                ),
+                engine_backend=(
+                    InvestigationEngineBackend.LANGGRAPH
+                ),
+                langgraph_acknowledgement=(
+                    INVESTIGATION_LANGGRAPH_ENGINE_ACKNOWLEDGEMENT
+                ),
+            )
+        ),
+    )
+
+    assert isinstance(
+        runtime.investigation_engine,
+        LangGraphInvestigationEngine,
+    )
+    assert (
+        runtime.investigation_engine.session_service
+        is runtime.investigation_session_service
+    )
+    assert not hasattr(
+        runtime.pipeline,
+        "investigation_engine",
+    )
+
+
+def test_enabled_session_without_reasoner_fails_before_components(
+    monkeypatch,
+    tmp_path,
+):
+    isolate_runtime(monkeypatch, tmp_path)
+    db_path = tmp_path / "must_not_exist.db"
+    memory_calls = 0
+
+    def unexpected_memory_store():
+        nonlocal memory_calls
+        memory_calls += 1
+        raise AssertionError("Session failure created a Runtime component")
+
+    monkeypatch.setattr(runtime_module, "MemoryStore", unexpected_memory_store)
+
+    with pytest.raises(
+        InvestigationSessionRuntimeFactoryError,
+        match="requires a reasoner",
+    ):
+        runtime_module.AgentRuntime(
+            authentication_service=disabled_authentication_service(),
+            investigation_session_runtime_settings=(
+                enabled_session_settings(db_path)
+            ),
+        )
+
+    assert memory_calls == 0
+    assert not db_path.exists()
+
+
+def test_invalid_session_settings_fail_before_authentication_factory(
+    monkeypatch,
+):
+    authentication_calls = 0
+
+    def unexpected_authentication_factory():
+        nonlocal authentication_calls
+        authentication_calls += 1
+        raise AssertionError("Invalid settings created Authentication")
+
+    monkeypatch.setattr(
+        runtime_module,
+        "create_authentication_service",
+        unexpected_authentication_factory,
+    )
+
+    with pytest.raises(TypeError, match="Session Runtime settings"):
+        runtime_module.AgentRuntime(
+            investigation_session_runtime_settings=object()
+        )
+
+    assert authentication_calls == 0

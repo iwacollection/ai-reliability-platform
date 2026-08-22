@@ -1,0 +1,1 @@
+# Duplicate event validation scenario

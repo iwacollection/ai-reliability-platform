@@ -1,0 +1,16 @@
+{
+  "feature": "Harness Release Gate Integration v1",
+  "status": "RELEASE_GATE_READY",
+  "time": "2026-08-22T11:27:19.784037",
+  "created_files": [
+    "C:\\Users\\94941\\Desktop\\大模型学习\\ai-reliability-platform\\services\\agent_runtime\\harness\\validation\\pipeline.py",
+    "C:\\Users\\94941\\Desktop\\大模型学习\\ai-reliability-platform\\services\\agent_runtime\\harness\\validation\\release_gate.py",
+    "C:\\Users\\94941\\Desktop\\大模型学习\\ai-reliability-platform\\services\\agent_runtime\\harness\\tests\\test_release_gate.py"
+  ],
+  "acceptance": [
+    "validation pipeline",
+    "evidence collection flow",
+    "release gate decision"
+  ],
+  "rollback": "C:\\Users\\94941\\Desktop\\大模型学习\\ai-reliability-platform\\reports\\harness_release_gate_integration_v1_rollback.json"
+}

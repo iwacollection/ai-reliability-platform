@@ -99,6 +99,7 @@ class DurableInvestigationSessionLoop:
         context,
         claimant: str,
         max_external_steps: int = 1,
+        expected_version: int | None = None,
     ) -> InvestigationSessionLoopResult:
         if (
             not isinstance(max_external_steps, int)
@@ -107,6 +108,17 @@ class DurableInvestigationSessionLoop:
         ):
             raise ValueError(
                 "Investigation Session Loop step limit is invalid"
+            )
+        if (
+            expected_version is not None
+            and (
+                not isinstance(expected_version, int)
+                or isinstance(expected_version, bool)
+                or expected_version < 0
+            )
+        ):
+            raise ValueError(
+                "Investigation Session Loop expected version is invalid"
             )
 
         external_calls_made = 0
@@ -146,6 +158,11 @@ class DurableInvestigationSessionLoop:
                         await self.session_driver.execute_reasoner_step(
                             session.session_id,
                             claimant=claimant,
+                            expected_version=(
+                                expected_version
+                                if external_calls_made == 0
+                                else None
+                            ),
                         )
                     )
                 else:
@@ -154,6 +171,11 @@ class DurableInvestigationSessionLoop:
                             session.session_id,
                             context=context,
                             claimant=claimant,
+                            expected_version=(
+                                expected_version
+                                if external_calls_made == 0
+                                else None
+                            ),
                         )
                     )
             except InvestigationSessionDriverBlockedError:

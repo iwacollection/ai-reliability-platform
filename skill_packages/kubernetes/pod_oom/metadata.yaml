@@ -1,0 +1,19 @@
+name: kubernetes_pod_oom
+domain: kubernetes
+
+triggers:
+  - OOMKilled
+  - ContainerMemoryHigh
+
+required_evidence:
+  - container_status
+  - memory_limit
+  - memory_usage
+  - rss
+  - heap
+  - node_pressure
+
+tools:
+  - kubernetes.get_pod
+  - kubernetes.get_events
+  - prometheus.query

@@ -243,6 +243,11 @@ class InvestigationSessionRecord(BaseModel):
     session_id: UUID
     incident_id: UUID
     run_key: SessionKey
+    created_by: str = Field(
+        default="runtime",
+        min_length=1,
+        max_length=128,
+    )
     input_digest: Digest
     status: InvestigationSessionStatus
     state: InvestigationState
@@ -445,6 +450,7 @@ def build_investigation_session(
     incident_id: UUID | str,
     run_key: str,
     initial_state: InvestigationState,
+    created_by: str = "runtime",
     now: datetime | None = None,
 ) -> InvestigationSessionRecord:
     if not isinstance(
@@ -519,6 +525,7 @@ def build_investigation_session(
         session_id=session_id,
         incident_id=normalized_incident_id,
         run_key=normalized_run_key,
+        created_by=created_by,
         input_digest=investigation_session_input_digest(
             normalized_state
         ),

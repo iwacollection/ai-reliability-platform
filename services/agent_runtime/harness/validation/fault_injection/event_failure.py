@@ -1,0 +1,1 @@
+# Event failure injection scenario

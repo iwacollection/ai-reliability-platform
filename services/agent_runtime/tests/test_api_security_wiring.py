@@ -334,11 +334,43 @@ def test_api_module_preserves_complete_route_inventory(
                 }
             ),
         ),
+        (
+            "/incidents/{incident_id}/investigation-shadow",
+            frozenset(
+                {
+                    "GET",
+                }
+            ),
+        ),
+        (
+            "/incidents/{incident_id}/investigation-sessions",
+            frozenset(
+                {
+                    "POST",
+                }
+            ),
+        ),
+        (
+            "/investigation-sessions/{session_id}",
+            frozenset(
+                {
+                    "GET",
+                }
+            ),
+        ),
+        (
+            "/investigation-sessions/{session_id}/advance",
+            frozenset(
+                {
+                    "POST",
+                }
+            ),
+        ),
     }
 
     assert len(
         router.routes
-    ) == 22
+    ) == 26
     assert actual_routes == expected_routes
 
 

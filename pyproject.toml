@@ -17,6 +17,7 @@ dependencies = [
     "pyyaml>=6.0.3",
     "httpx>=0.28.1",
     "lark-channel-sdk==1.2.0",
+    "langgraph==1.2.11",
 ]
 
 [dependency-groups]

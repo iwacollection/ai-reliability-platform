@@ -504,3 +504,34 @@ async def test_driver_does_not_publish_context_or_invoke_write_workflows(tmp_pat
     )
 
     assert context.metadata == {"existing": "value"}
+
+
+@pytest.mark.asyncio
+async def test_stale_expected_version_blocks_next_phase_before_probe_call(
+    tmp_path,
+):
+    probe_executor = CountingProbeExecutor()
+    driver, _, session = await _driver(
+        tmp_path,
+        probe_executor=probe_executor,
+    )
+    reasoned = await driver.execute_reasoner_step(
+        session.session_id,
+        claimant="runtime-worker-1",
+        expected_version=0,
+    )
+
+    assert reasoned.session.version == 2
+
+    with pytest.raises(
+        InvestigationSessionDriverBlockedError,
+        match="version changed",
+    ):
+        await driver.execute_probe_step(
+            session.session_id,
+            context=SimpleNamespace(),
+            claimant="runtime-worker-1",
+            expected_version=0,
+        )
+
+    assert probe_executor.calls == 0

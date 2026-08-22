@@ -210,7 +210,7 @@ I_CONFIRM_OOM_PILOT_FINAL_ZERO_WRITE_HANDOFF_V1
 - Preflight 与 Production credential reference 类型有效、彼此不同，引用元数据可用。
 - `credential_content_read_count=0`、`credential_content_validated=false`、`tls_handshake_performed=false`。
 - 审批人、Ceremony 复核人、Executor 和三名 handoff owner 满足职责分离。
-- `security_route_count=22`、`security_role_count=7` 且 Security Matrix 已复核。
+- `security_route_count=25`、`security_role_count=7` 且 Security Matrix 已复核。
 - `storage_write_count=0`、`durable_claim_created=false`、`budget_reservation_count=0`。
 - `network_call_count=0`、`kubernetes_call_count=0`、`production_executor_call_count=0`、`verification_call_count=0`。
 - `authorizes_feature_enablement=false`、`authorizes_execution=false`、`automatic_resume_allowed=false`。

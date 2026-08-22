@@ -398,6 +398,67 @@ class InvestigationSessionStore:
             for row in rows
         ]
 
+    async def list_recent_by_incident(
+        self,
+        incident_id: UUID | str,
+        *,
+        limit: int = 20,
+    ) -> list[InvestigationSessionRecord]:
+        """Read only the newest bounded window, returned oldest to newest."""
+
+        normalized = str(
+            UUID(
+                str(
+                    incident_id
+                )
+            )
+        )
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or limit < 1
+            or limit > 101
+        ):
+            raise ValueError(
+                "Investigation Session query limit is invalid"
+            )
+        return await asyncio.to_thread(
+            self._list_recent_by_incident_sync,
+            normalized,
+            limit,
+        )
+
+    def _list_recent_by_incident_sync(
+        self,
+        incident_id: str,
+        limit: int,
+    ) -> list[InvestigationSessionRecord]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT session_data
+                FROM investigation_sessions
+                WHERE incident_id = ?
+                ORDER BY created_at DESC, session_id DESC
+                LIMIT ?
+                """,
+                (
+                    incident_id,
+                    limit,
+                ),
+            ).fetchall()
+        newest_first = [
+            self._deserialize(
+                row[0]
+            )
+            for row in rows
+        ]
+        return list(
+            reversed(
+                newest_first
+            )
+        )
+
     async def compare_and_swap(
         self,
         session: InvestigationSessionRecord,

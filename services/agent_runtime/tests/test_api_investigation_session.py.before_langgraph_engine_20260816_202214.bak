@@ -1,0 +1,597 @@
+from __future__ import annotations
+
+import asyncio
+
+from datetime import UTC, datetime
+from uuid import UUID
+
+import httpx
+import pytest
+import pytest_asyncio
+from fastapi import FastAPI
+
+from services.agent_runtime.app.incident.state import (
+    IncidentState,
+)
+from services.agent_runtime.app.investigation.models import (
+    EvidenceItem,
+    IncidentHypothesis,
+    InvestigationDecision,
+    InvestigationProbe,
+)
+from services.agent_runtime.app.investigation.reasoner import (
+    BaseInvestigationReasoner,
+)
+from services.agent_runtime.app.investigation.session_driver import (
+    DurableInvestigationSessionDriver,
+)
+from services.agent_runtime.app.investigation.session_loop import (
+    DurableInvestigationSessionLoop,
+)
+from services.agent_runtime.app.investigation.session_service import (
+    InvestigationSessionService,
+)
+from services.agent_runtime.app.investigation.session_store import (
+    InvestigationSessionStore,
+)
+from services.agent_runtime.app.runtime.runtime import (
+    AgentRuntime,
+)
+from services.agent_runtime.app.security.models import (
+    OperatorRole,
+)
+from services.agent_runtime.tests.api_security_support import (
+    wire_api_test_security,
+)
+
+
+INCIDENT_ID = UUID(
+    "00000000-0000-4000-8000-000000000711"
+)
+
+
+class CountingReasoner(BaseInvestigationReasoner):
+    def __init__(self, *, delay: float = 0.0):
+        self.delay = delay
+        self.calls = 0
+
+    async def decide(self, scope, state):
+        self.calls += 1
+        if self.delay:
+            await asyncio.sleep(
+                self.delay
+            )
+        return InvestigationDecision(
+            hypotheses=[
+                IncidentHypothesis(
+                    hypothesis_id="memory-pressure",
+                    cause="Container memory pressure may have caused OOMKill",
+                    confidence=0.5,
+                    missing_evidence=[
+                        "pod state",
+                    ],
+                )
+            ],
+            rationale_summary="Collect the bounded Pod state evidence",
+            stop=False,
+            next_probe=(
+                InvestigationProbe.KUBERNETES_POD_STATE
+            ),
+        )
+
+
+class CountingProbeExecutor:
+    def __init__(self):
+        self.calls = 0
+        self.expected_tools = None
+
+    def available_probes(self, context):
+        assert context.tools is self.expected_tools
+        return [
+            InvestigationProbe.KUBERNETES_POD_STATE,
+        ]
+
+    async def collect(self, context, scope, probe):
+        assert context.tools is self.expected_tools
+        self.calls += 1
+        return EvidenceItem(
+            evidence_id="api-evidence-1",
+            probe=probe,
+            source="kubernetes",
+            success=True,
+            trusted=True,
+            production_signal=True,
+            reliability=0.95,
+            observed_at=datetime.now(UTC),
+            cluster=scope.cluster,
+            cluster_verified=True,
+            facts={
+                "reason": "OOMKilled",
+            },
+        )
+
+
+def event_payload(
+    *,
+    message: str = "Container terminated with OOMKilled",
+) -> dict:
+    return {
+        "header": {
+            "source": "alertmanager",
+            # Keep the immutable event input stable across exact API replay.
+            # A new occurred_at value is correctly treated as a conflicting
+            # request when the same Idempotency-Key is reused.
+            "occurred_at": "2026-08-16T00:00:00+00:00",
+        },
+        "signal": {
+            "type": "alert",
+            "name": "PodOOMKilled",
+            "severity": "critical",
+            "message": message,
+        },
+        "resources": [
+            {
+                "kind": "pod",
+                "name": "payment-api-abc",
+                "namespace": "payment",
+                "cluster": "prod-a",
+            }
+        ],
+    }
+
+
+def api_client(
+    app: FastAPI,
+) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(
+            app=app
+        ),
+        base_url="http://test",
+    )
+
+
+@pytest_asyncio.fixture
+async def api_environment(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.chdir(
+        tmp_path
+    )
+    monkeypatch.setenv(
+        "AGENT_INVESTIGATION_SESSION_RUNTIME_ENABLED",
+        "false",
+    )
+
+    for name in (
+        "PROMETHEUS_URL",
+        "KUBERNETES_API_URL",
+        "KUBERNETES_SERVICE_HOST",
+        "KUBERNETES_SERVICE_PORT",
+        "KUBERNETES_SERVICE_PORT_HTTPS",
+    ):
+        monkeypatch.delenv(
+            name,
+            raising=False,
+        )
+
+    monkeypatch.setenv(
+        "PROMETHEUS_ALLOW_MOCK_FALLBACK",
+        "true",
+    )
+    monkeypatch.setenv(
+        "KUBERNETES_ALLOW_DRY_RUN_FALLBACK",
+        "true",
+    )
+
+    from services.agent_runtime.app.api import (
+        runtime as api_module,
+    )
+
+    isolated_runtime = AgentRuntime()
+    service = InvestigationSessionService(
+        InvestigationSessionStore(
+            tmp_path
+            / "investigation_sessions.db"
+        )
+    )
+    reasoner = CountingReasoner()
+    probe = CountingProbeExecutor()
+    probe.expected_tools = isolated_runtime.tools
+    driver = DurableInvestigationSessionDriver(
+        session_service=service,
+        reasoner=reasoner,
+        probe_executor=probe,
+    )
+    loop = DurableInvestigationSessionLoop(
+        session_service=service,
+        session_driver=driver,
+    )
+
+    isolated_runtime.investigation_probe_executor = probe
+    isolated_runtime.investigation_session_store = service.store
+    isolated_runtime.investigation_session_service = service
+    isolated_runtime.investigation_session_driver = driver
+    isolated_runtime.investigation_session_loop = loop
+
+    security = wire_api_test_security(
+        monkeypatch,
+        api_module,
+        isolated_runtime,
+    )
+    await isolated_runtime.incident_store.save(
+        IncidentState(
+            id=INCIDENT_ID
+        )
+    )
+
+    app = FastAPI()
+    app.include_router(
+        api_module.router
+    )
+
+    return (
+        app,
+        isolated_runtime,
+        security,
+        reasoner,
+        probe,
+        api_module,
+    )
+
+
+async def create_session(
+    client,
+    security,
+    *,
+    key="investigation-create-1",
+    message="Container terminated with OOMKilled",
+):
+    return await client.post(
+        (
+            f"/incidents/{INCIDENT_ID}"
+            "/investigation-sessions"
+        ),
+        json={
+            "event": event_payload(
+                message=message
+            ),
+        },
+        headers=security.headers(
+            OperatorRole.ANALYST,
+            include_operator_id=True,
+            idempotency_key=key,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_query_and_conflicting_replay_are_bounded(
+    api_environment,
+):
+    app, runtime, security, reasoner, probe, _ = (
+        api_environment
+    )
+    before = await runtime.incident_store.get(
+        INCIDENT_ID
+    )
+
+    async with api_client(app) as client:
+        created_response = await create_session(
+            client,
+            security,
+        )
+        replay_response = await create_session(
+            client,
+            security,
+        )
+        conflict_response = await create_session(
+            client,
+            security,
+            message="Different immutable event input",
+        )
+
+        assert created_response.status_code == 201
+        assert replay_response.status_code == 200
+        assert conflict_response.status_code == 409
+
+        created = created_response.json()
+        replay = replay_response.json()
+        session_id = created["session"]["session_id"]
+
+        assert created["created"] is True
+        assert created["idempotent_replay"] is False
+        assert replay["created"] is False
+        assert replay["idempotent_replay"] is True
+        assert replay["session"]["session_id"] == session_id
+        assert created["session"]["created_by"] == (
+            security.principal_id(
+                OperatorRole.ANALYST
+            )
+        )
+
+        query_response = await client.get(
+            f"/investigation-sessions/{session_id}",
+            headers=security.headers(
+                OperatorRole.VIEWER
+            ),
+        )
+        assert query_response.status_code == 200
+        query = query_response.json()
+        assert query["read_only"] is True
+        assert query["session"]["steps"] == []
+
+        serialized = query_response.text.lower()
+        assert "run_key" not in serialized
+        assert "claimant" not in serialized
+        assert "request_digest" not in serialized
+        assert "investigation-create-1" not in serialized
+
+    after = await runtime.incident_store.get(
+        INCIDENT_ID
+    )
+    assert before == after
+    assert reasoner.calls == 0
+    assert probe.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_advance_is_one_step_replay_safe_and_probe_bounded(
+    api_environment,
+):
+    app, _, security, reasoner, probe, _ = (
+        api_environment
+    )
+
+    async with api_client(app) as client:
+        created = (
+            await create_session(
+                client,
+                security,
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+
+        first_headers = security.headers(
+            OperatorRole.ANALYST,
+            include_operator_id=True,
+            idempotency_key="investigation-step-1",
+        )
+        first = await client.post(
+            f"/investigation-sessions/{session_id}/advance",
+            json={
+                "expected_version": 0,
+            },
+            headers=first_headers,
+        )
+        replay = await client.post(
+            f"/investigation-sessions/{session_id}/advance",
+            json={
+                "expected_version": 0,
+            },
+            headers=first_headers,
+        )
+        stale = await client.post(
+            f"/investigation-sessions/{session_id}/advance",
+            json={
+                "expected_version": 0,
+            },
+            headers=security.headers(
+                OperatorRole.ANALYST,
+                include_operator_id=True,
+                idempotency_key="investigation-stale-step",
+            ),
+        )
+
+        assert first.status_code == 200
+        assert first.json()["advanced"] is True
+        assert first.json()["session"]["version"] == 2
+        assert replay.status_code == 200
+        assert replay.json()["advanced"] is False
+        assert replay.json()["idempotent_replay"] is True
+        assert stale.status_code == 409
+        assert reasoner.calls == 1
+        assert probe.calls == 0
+
+        second = await client.post(
+            f"/investigation-sessions/{session_id}/advance",
+            json={
+                "expected_version": 2,
+            },
+            headers=security.headers(
+                OperatorRole.ANALYST,
+                include_operator_id=True,
+                idempotency_key="investigation-step-2",
+            ),
+        )
+
+        assert second.status_code == 200
+        assert second.json()["advanced"] is True
+        assert second.json()["session"]["version"] == 4
+        assert second.json()["session"]["state"]["tool_call_count"] == 1
+        assert reasoner.calls == 1
+        assert probe.calls == 1
+        assert "investigation-step-2" not in second.text
+
+
+@pytest.mark.asyncio
+async def test_concurrent_same_advance_claim_makes_one_reasoner_call(
+    api_environment,
+):
+    app, runtime, security, _, probe, api_module = (
+        api_environment
+    )
+    delayed_reasoner = CountingReasoner(
+        delay=0.03
+    )
+    driver = DurableInvestigationSessionDriver(
+        session_service=(
+            runtime.investigation_session_service
+        ),
+        reasoner=delayed_reasoner,
+        probe_executor=probe,
+    )
+    loop = DurableInvestigationSessionLoop(
+        session_service=(
+            runtime.investigation_session_service
+        ),
+        session_driver=driver,
+    )
+    runtime.investigation_session_driver = driver
+    runtime.investigation_session_loop = loop
+    api_module.runtime.investigation_session_driver = driver
+    api_module.runtime.investigation_session_loop = loop
+
+    async with api_client(app) as client:
+        created = (
+            await create_session(
+                client,
+                security,
+                key="concurrent-create",
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+        headers = security.headers(
+            OperatorRole.ANALYST,
+            include_operator_id=True,
+            idempotency_key="concurrent-step",
+        )
+
+        first, second = await asyncio.gather(
+            client.post(
+                f"/investigation-sessions/{session_id}/advance",
+                json={
+                    "expected_version": 0,
+                },
+                headers=headers,
+            ),
+            client.post(
+                f"/investigation-sessions/{session_id}/advance",
+                json={
+                    "expected_version": 0,
+                },
+                headers=headers,
+            ),
+        )
+
+        assert {
+            first.status_code,
+            second.status_code,
+        }.issubset(
+            {
+                200,
+                409,
+            }
+        )
+        assert delayed_reasoner.calls == 1
+
+        final = await client.get(
+            f"/investigation-sessions/{session_id}",
+            headers=security.headers(
+                OperatorRole.VIEWER
+            ),
+        )
+        assert final.status_code == 200
+        assert final.json()["session"]["version"] == 2
+        assert len(
+            final.json()["session"]["steps"]
+        ) == 1
+
+
+@pytest.mark.asyncio
+async def test_rbac_spoofing_and_disabled_runtime_fail_before_storage(
+    api_environment,
+    monkeypatch,
+    tmp_path,
+):
+    app, _, security, _, _, api_module = (
+        api_environment
+    )
+
+    async with api_client(app) as client:
+        viewer = await client.post(
+            (
+                f"/incidents/{INCIDENT_ID}"
+                "/investigation-sessions"
+            ),
+            json={
+                "event": event_payload(),
+            },
+            headers=security.headers(
+                OperatorRole.VIEWER,
+                include_operator_id=True,
+                idempotency_key="viewer-create",
+            ),
+        )
+        spoofed_headers = security.headers(
+            OperatorRole.ANALYST,
+            idempotency_key="spoofed-create",
+        )
+        spoofed_headers["X-Operator-ID"] = (
+            security.principal_id(
+                OperatorRole.ADMIN
+            )
+        )
+        spoofed = await client.post(
+            (
+                f"/incidents/{INCIDENT_ID}"
+                "/investigation-sessions"
+            ),
+            json={
+                "event": event_payload(),
+            },
+            headers=spoofed_headers,
+        )
+
+        assert viewer.status_code == 403
+        assert spoofed.status_code == 403
+
+    disabled_runtime = AgentRuntime()
+    disabled_security = wire_api_test_security(
+        monkeypatch,
+        api_module,
+        disabled_runtime,
+    )
+    storage_calls = 0
+
+    async def forbidden_get(*args, **kwargs):
+        nonlocal storage_calls
+        storage_calls += 1
+        raise AssertionError(
+            "Disabled Session Runtime reached Incident storage"
+        )
+
+    monkeypatch.setattr(
+        disabled_runtime.incident_store,
+        "get",
+        forbidden_get,
+    )
+
+    disabled_app = FastAPI()
+    disabled_app.include_router(
+        api_module.router
+    )
+    async with api_client(disabled_app) as client:
+        response = await client.post(
+            (
+                f"/incidents/{INCIDENT_ID}"
+                "/investigation-sessions"
+            ),
+            json={
+                "event": event_payload(),
+            },
+            headers=disabled_security.headers(
+                OperatorRole.ANALYST,
+                include_operator_id=True,
+                idempotency_key="disabled-create",
+            ),
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": (
+            "Investigation Session Runtime is unavailable"
+        )
+    }
+    assert storage_calls == 0

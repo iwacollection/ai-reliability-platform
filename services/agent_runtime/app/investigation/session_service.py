@@ -88,12 +88,14 @@ class InvestigationSessionService:
         incident_id: UUID | str,
         run_key: str,
         initial_state: InvestigationState,
+        created_by: str = "runtime",
         now: datetime | None = None,
     ) -> InvestigationSessionCreateResult:
         session = build_investigation_session(
             incident_id=incident_id,
             run_key=run_key,
             initial_state=initial_state,
+            created_by=created_by,
             now=now,
         )
         return await self.store.create_or_get(
@@ -138,6 +140,17 @@ class InvestigationSessionService:
     ) -> list[InvestigationSessionRecord]:
         return await self.store.list_by_incident(
             incident_id
+        )
+
+    async def list_recent_by_incident(
+        self,
+        incident_id: UUID | str,
+        *,
+        limit: int = 20,
+    ) -> list[InvestigationSessionRecord]:
+        return await self.store.list_recent_by_incident(
+            incident_id,
+            limit=limit,
         )
 
     async def claim_step(

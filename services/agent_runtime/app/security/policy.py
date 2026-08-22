@@ -101,6 +101,7 @@ _READ_PERMISSIONS = frozenset(
         RuntimePermission.APPROVAL_READ,
         RuntimePermission.VERIFICATION_READ,
         RuntimePermission.REMEDIATION_PREPARATION_READ,
+        RuntimePermission.INVESTIGATION_READ,
     }
 )
 
@@ -118,6 +119,7 @@ DEFAULT_ROLE_PERMISSIONS: Mapping[
             | {
                 RuntimePermission.RUNTIME_EXECUTE,
                 RuntimePermission.REMEDIATION_PREPARE,
+                RuntimePermission.INVESTIGATION_ADVANCE,
             }
         ),
         OperatorRole.APPROVER: (
@@ -145,6 +147,7 @@ DEFAULT_ROLE_PERMISSIONS: Mapping[
             {
                 RuntimePermission.RUNTIME_EXECUTE,
                 RuntimePermission.REMEDIATION_PREPARE,
+                RuntimePermission.INVESTIGATION_ADVANCE,
             }
         ),
     }
@@ -232,6 +235,27 @@ DEFAULT_OPERATION_PERMISSIONS: Mapping[
             frozenset(
                 {
                     RuntimePermission.VERIFICATION_READ,
+                }
+            )
+        ),
+        ProtectedOperation.CREATE_INVESTIGATION_SESSION: (
+            frozenset(
+                {
+                    RuntimePermission.INVESTIGATION_ADVANCE,
+                }
+            )
+        ),
+        ProtectedOperation.READ_INVESTIGATION_SESSION: (
+            frozenset(
+                {
+                    RuntimePermission.INVESTIGATION_READ,
+                }
+            )
+        ),
+        ProtectedOperation.ADVANCE_INVESTIGATION_SESSION: (
+            frozenset(
+                {
+                    RuntimePermission.INVESTIGATION_ADVANCE,
                 }
             )
         ),

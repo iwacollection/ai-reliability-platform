@@ -121,7 +121,7 @@ async def test_api_final_handoff_is_bounded_zero_write_and_replay_safe(
     assert body["zero_write"] is True
     assert report["passed"] is True
     assert report["operator_id"] == EXECUTOR_ID
-    assert report["security_route_count"] == 22
+    assert report["security_route_count"] == 25
     assert report["storage_write_count"] == 0
     assert report["network_call_count"] == 0
     assert report["kubernetes_call_count"] == 0

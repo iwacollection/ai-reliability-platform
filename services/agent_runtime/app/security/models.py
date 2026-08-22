@@ -48,6 +48,8 @@ class RuntimePermission(str, Enum):
     ACTION_EXECUTE = "action:execute"
     ACTION_RECONCILE = "action:reconcile"
     VERIFICATION_READ = "verification:read"
+    INVESTIGATION_READ = "investigation:read"
+    INVESTIGATION_ADVANCE = "investigation:advance"
 
 
 class ProtectedOperation(str, Enum):
@@ -74,6 +76,15 @@ class ProtectedOperation(str, Enum):
     RESUME_ACTION = "action.resume"
     RECONCILE_ACTION = "action.reconcile"
     READ_VERIFICATION = "verification.read"
+    CREATE_INVESTIGATION_SESSION = (
+        "investigation.session.create"
+    )
+    READ_INVESTIGATION_SESSION = (
+        "investigation.session.read"
+    )
+    ADVANCE_INVESTIGATION_SESSION = (
+        "investigation.session.advance"
+    )
 
 
 _SENSITIVE_ATTRIBUTE_FRAGMENTS = (

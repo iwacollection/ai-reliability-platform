@@ -25,6 +25,9 @@ from services.agent_runtime.app.action.production_pilot_go_no_go_models import (
     PRODUCTION_PILOT_GO_NO_GO_ACKNOWLEDGEMENT,
     PRODUCTION_PILOT_LIVE_PROBE_ACKNOWLEDGEMENT,
 )
+from services.agent_runtime.app.investigation.engine import (
+    BaseInvestigationEngine,
+)
 from services.agent_runtime.app.runtime.runtime import AgentRuntime
 from services.agent_runtime.app.security.api import ApiSecurityAdapter
 from services.agent_runtime.app.security.authentication import (
@@ -112,6 +115,21 @@ EXPECTED_OPERATION_ROLES = {
         }
     ),
     ProtectedOperation.READ_VERIFICATION: READ_ROLES,
+    ProtectedOperation.CREATE_INVESTIGATION_SESSION: frozenset(
+        {
+            OperatorRole.ANALYST,
+            OperatorRole.ADMIN,
+            OperatorRole.SERVICE,
+        }
+    ),
+    ProtectedOperation.READ_INVESTIGATION_SESSION: READ_ROLES,
+    ProtectedOperation.ADVANCE_INVESTIGATION_SESSION: frozenset(
+        {
+            OperatorRole.ANALYST,
+            OperatorRole.ADMIN,
+            OperatorRole.SERVICE,
+        }
+    ),
 }
 
 
@@ -137,6 +155,7 @@ class RouteSecurityContract:
             execution_id=resource_id,
             verification_id=resource_id,
             artifact_id=resource_id,
+            session_id=resource_id,
         )
 
 
@@ -316,6 +335,38 @@ ROUTE_CONTRACTS = (
         ProtectedOperation.READ_VERIFICATION,
         404,
     ),
+    RouteSecurityContract(
+        "GET",
+        "/incidents/{incident_id}/investigation-shadow",
+        "get_incident_investigation_shadow",
+        ProtectedOperation.READ_INVESTIGATION_SESSION,
+        404,
+    ),
+    RouteSecurityContract(
+        "POST",
+        "/incidents/{incident_id}/investigation-sessions",
+        "create_investigation_session",
+        ProtectedOperation.CREATE_INVESTIGATION_SESSION,
+        422,
+        body_kind="investigation_create",
+        audited_operator=True,
+    ),
+    RouteSecurityContract(
+        "GET",
+        "/investigation-sessions/{session_id}",
+        "get_investigation_session",
+        ProtectedOperation.READ_INVESTIGATION_SESSION,
+        404,
+    ),
+    RouteSecurityContract(
+        "POST",
+        "/investigation-sessions/{session_id}/advance",
+        "advance_investigation_session",
+        ProtectedOperation.ADVANCE_INVESTIGATION_SESSION,
+        404,
+        body_kind="investigation_advance",
+        audited_operator=True,
+    ),
 )
 
 
@@ -329,6 +380,41 @@ class EmptyProductionActionQuery:
         artifact_id,
     ):
         return None
+
+
+class EmptyInvestigationSessionService:
+    async def get(self, session_id):
+        return None
+
+    async def create_or_get(self, **kwargs):
+        raise AssertionError(
+            "Invalid matrix input reached Session creation"
+        )
+
+
+class EmptyInvestigationSessionLoop:
+    async def run(self, *args, **kwargs):
+        raise AssertionError(
+            "Missing matrix Session reached Loop execution"
+        )
+
+
+class EmptyInvestigationEngine(BaseInvestigationEngine):
+    def __init__(self, session_service):
+        self._session_service = session_service
+
+    @property
+    def name(self) -> str:
+        return "security_matrix_empty"
+
+    @property
+    def session_service(self):
+        return self._session_service
+
+    async def advance(self, *args, **kwargs):
+        raise AssertionError(
+            "Missing matrix Session reached Engine execution"
+        )
 
 
 class BlockedProductionPilotCeremony:
@@ -424,6 +510,13 @@ def api_environment(monkeypatch, tmp_path):
     )
     isolated_runtime.production_pilot_go_no_go = (
         MatrixProductionPilotGoNoGo()
+    )
+    session_service = EmptyInvestigationSessionService()
+    session_loop = EmptyInvestigationSessionLoop()
+    isolated_runtime.investigation_session_service = session_service
+    isolated_runtime.investigation_session_loop = session_loop
+    isolated_runtime.investigation_engine = EmptyInvestigationEngine(
+        session_service,
     )
     security = wire_api_test_security(
         monkeypatch,
@@ -534,6 +627,14 @@ def request_body(contract: RouteSecurityContract) -> dict | None:
             "acknowledgement": (
                 PRODUCTION_PILOT_GO_NO_GO_ACKNOWLEDGEMENT
             ),
+        }
+
+    if contract.body_kind == "investigation_create":
+        return {}
+
+    if contract.body_kind == "investigation_advance":
+        return {
+            "expected_version": 0,
         }
 
     return None
@@ -760,6 +861,41 @@ def block_all_domain_work(
         ),
     ]
 
+    session_service = getattr(
+        runtime,
+        "investigation_session_service",
+        None,
+    )
+    if session_service is not None:
+        targets.extend(
+            (
+                (
+                    session_service,
+                    "get",
+                    "investigation_session.get",
+                ),
+                (
+                    session_service,
+                    "create_or_get",
+                    "investigation_session.create_or_get",
+                ),
+            )
+        )
+
+    session_loop = getattr(
+        runtime,
+        "investigation_session_loop",
+        None,
+    )
+    if session_loop is not None:
+        targets.append(
+            (
+                session_loop,
+                "run",
+                "investigation_session_loop.run",
+            )
+        )
+
     preparation_service = getattr(
         runtime,
         "production_action_preparation",
@@ -918,13 +1054,13 @@ def test_security_contract_covers_every_role_operation_and_route():
     assert set(READ_ROLES) == (
         set(OperatorRole) - {OperatorRole.SERVICE}
     )
-    assert len(ROUTE_CONTRACTS) == 22
+    assert len(ROUTE_CONTRACTS) == 26
     assert len(
         {
             (contract.method, contract.path_template)
             for contract in ROUTE_CONTRACTS
         }
-    ) == 22
+    ) == 26
 
 
 def test_router_has_exactly_the_audited_security_contract(
@@ -1177,6 +1313,12 @@ async def test_write_routes_reject_operator_spoofing_before_domain_work(
                 ProtectedOperation.DECIDE_APPROVAL: OperatorRole.APPROVER,
                 ProtectedOperation.RESUME_ACTION: OperatorRole.EXECUTOR,
                 ProtectedOperation.RECONCILE_ACTION: OperatorRole.RECONCILER,
+                ProtectedOperation.CREATE_INVESTIGATION_SESSION: (
+                    OperatorRole.ANALYST
+                ),
+                ProtectedOperation.ADVANCE_INVESTIGATION_SESSION: (
+                    OperatorRole.ANALYST
+                ),
             }[contract.operation]
             headers = request_headers(
                 contract,
