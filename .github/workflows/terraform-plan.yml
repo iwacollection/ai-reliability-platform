@@ -19,4 +19,5 @@ jobs:
     with:
       working-directory: infrastructure/terraform/environments/azure-production
       operation: plan
-      environment: production-plan
+      checkout-ref: ${{ github.event.pull_request.head.sha }}
+      plan-artifact-name: terraform-pr-${{ github.event.pull_request.number }}-plan
