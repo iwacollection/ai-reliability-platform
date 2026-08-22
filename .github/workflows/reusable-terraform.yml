@@ -31,6 +31,9 @@ jobs:
     name: Terraform ${{ inputs.operation }}
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment != '' && inputs.environment || null }}
+    concurrency:
+      group: terraform-${{ inputs.environment != '' && inputs.environment || 'default' }}-${{ inputs.operation }}
+      cancel-in-progress: ${{ inputs.operation == 'plan' }}
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
@@ -40,6 +43,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           ref: ${{ inputs.checkout-ref != '' && inputs.checkout-ref || github.sha }}
+          fetch-depth: 0
 
       - name: Validate operation
         shell: bash
@@ -56,6 +60,7 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.13.0
+          terraform_wrapper: false
 
       - name: Azure login with OIDC
         uses: azure/login@v2
@@ -74,15 +79,20 @@ jobs:
         run: terraform validate -no-color
 
       - name: Terraform plan
-        run: terraform plan -input=false -no-color -out=tfplan
+        run: |
+          terraform plan -input=false -no-color -out=tfplan
+          terraform show -no-color tfplan > tfplan.txt
 
-      - name: Upload Terraform plan
+      - name: Upload Terraform plan evidence
         if: inputs.operation == 'plan'
         uses: actions/upload-artifact@v4
         with:
           name: terraform-plan-${{ github.sha }}
-          path: ${{ inputs.working-directory }}/tfplan
-          retention-days: 7
+          path: |
+            ${{ inputs.working-directory }}/tfplan
+            ${{ inputs.working-directory }}/tfplan.txt
+          retention-days: 14
+          if-no-files-found: error
 
       - name: Terraform apply reviewed revision
         if: inputs.operation == 'apply'
