@@ -1,23 +1,9 @@
 import { StatusBadge } from '../../components/console/status-badge';
+import { listIncidents } from '../../lib/api/incidents';
 
-const incidents = [
-  {
-    id: 'inc-001',
-    service: 'payment-api',
-    title: 'Memory pressure and OOMKilled',
-    severity: 'Critical',
-    status: 'Investigating',
-  },
-  {
-    id: 'inc-002',
-    service: 'gateway',
-    title: 'API latency spike',
-    severity: 'Warning',
-    status: 'Analyzing',
-  },
-];
+export default async function IncidentsPage() {
+  const incidents = await listIncidents();
 
-export default function IncidentsPage() {
   return (
     <main className="p-8">
       <h2 className="mb-6 text-2xl font-bold">Incident Center</h2>
@@ -28,6 +14,7 @@ export default function IncidentsPage() {
               <div>
                 <h3 className="font-semibold">{incident.title}</h3>
                 <p>{incident.service}</p>
+                <p className="text-sm">Agent: {incident.agent ?? 'unknown'}</p>
               </div>
               <StatusBadge status={incident.status} />
             </div>
