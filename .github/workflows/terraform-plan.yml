@@ -1,0 +1,105 @@
+name: Terraform Plan
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'infrastructure/terraform/**'
+      - '.github/workflows/terraform-plan.yml'
+      - '.github/workflows/terraform-apply.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: terraform-plan-azure-production-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  TF_IN_AUTOMATION: 'true'
+  TF_INPUT: 'false'
+  TF_ROOT: infrastructure/terraform/environments/azure-production
+  ARM_USE_OIDC: 'true'
+  ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate Azure OIDC configuration
+        shell: bash
+        run: |
+          test -n "${ARM_CLIENT_ID}" || { echo 'Missing repository variable AZURE_CLIENT_ID'; exit 1; }
+          test -n "${ARM_TENANT_ID}" || { echo 'Missing repository variable AZURE_TENANT_ID'; exit 1; }
+          test -n "${ARM_SUBSCRIPTION_ID}" || { echo 'Missing repository variable AZURE_SUBSCRIPTION_ID'; exit 1; }
+
+      - name: Azure login with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.9.8'
+
+      - name: Terraform fmt
+        run: terraform -chdir=${TF_ROOT} fmt -check -recursive
+
+      - name: Terraform init
+        run: terraform -chdir=${TF_ROOT} init -input=false
+
+      - name: Terraform validate
+        run: terraform -chdir=${TF_ROOT} validate
+
+      - name: Terraform plan
+        run: terraform -chdir=${TF_ROOT} plan -input=false -out=tfplan
+
+      - name: Export human-readable plan
+        run: terraform -chdir=${TF_ROOT} show -no-color tfplan > terraform-plan.txt
+
+      - name: Write immutable plan metadata
+        shell: bash
+        run: |
+          cat > terraform-plan-metadata.json <<EOF
+          {
+            "repository": "${GITHUB_REPOSITORY}",
+            "sha": "${GITHUB_SHA}",
+            "ref": "${GITHUB_REF}",
+            "run_id": "${GITHUB_RUN_ID}",
+            "terraform_root": "${TF_ROOT}"
+          }
+          EOF
+
+      - name: Publish plan summary
+        shell: bash
+        run: |
+          echo '## Terraform Plan — azure-production' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo "Commit: \`${GITHUB_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Run: \`${GITHUB_RUN_ID}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo '<details><summary>Plan output</summary>' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat terraform-plan.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo '</details>' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload immutable plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-azure-production
+          path: |
+            ${{ env.TF_ROOT }}/tfplan
+            terraform-plan.txt
+            terraform-plan-metadata.json
+          if-no-files-found: error
+          retention-days: 14
