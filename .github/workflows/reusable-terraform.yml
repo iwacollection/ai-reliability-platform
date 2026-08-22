@@ -12,14 +12,17 @@ on:
         required: true
         type: string
       environment:
-        description: GitHub Environment name
+        description: GitHub Environment name; use production only for the apply job
         required: false
         default: ""
         type: string
       checkout-ref:
-        description: Git ref or commit SHA to validate/apply
-        required: false
-        default: ""
+        description: Exact Git ref or commit SHA to validate/apply
+        required: true
+        type: string
+      plan-artifact-name:
+        description: Immutable Terraform plan artifact shared between plan and apply jobs
+        required: true
         type: string
 
 permissions:
@@ -32,17 +35,17 @@ jobs:
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment != '' && inputs.environment || null }}
     concurrency:
-      group: terraform-${{ inputs.environment != '' && inputs.environment || 'default' }}
+      group: terraform-${{ inputs.environment != '' && inputs.environment || 'validation' }}
       cancel-in-progress: false
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
 
     steps:
-      - name: Checkout
+      - name: Checkout reviewed revision
         uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.checkout-ref != '' && inputs.checkout-ref || github.sha }}
+          ref: ${{ inputs.checkout-ref }}
           fetch-depth: 0
 
       - name: Validate operation
@@ -78,22 +81,34 @@ jobs:
       - name: Terraform validate
         run: terraform validate -no-color
 
-      - name: Terraform plan
+      - name: Terraform plan reviewed revision
+        if: inputs.operation == 'plan'
         run: |
           terraform plan -input=false -no-color -out=tfplan
           terraform show -no-color tfplan > tfplan.txt
 
-      - name: Upload Terraform plan evidence
+      - name: Upload immutable Terraform plan evidence
         if: inputs.operation == 'plan'
         uses: actions/upload-artifact@v4
         with:
-          name: terraform-plan-${{ github.sha }}
+          name: ${{ inputs.plan-artifact-name }}
           path: |
             ${{ inputs.working-directory }}/tfplan
             ${{ inputs.working-directory }}/tfplan.txt
-          retention-days: 14
+          retention-days: 7
           if-no-files-found: error
 
-      - name: Terraform apply reviewed revision
+      - name: Download reviewed Terraform plan
+        if: inputs.operation == 'apply'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.plan-artifact-name }}
+          path: ${{ inputs.working-directory }}
+
+      - name: Verify reviewed Terraform plan is readable
+        if: inputs.operation == 'apply'
+        run: terraform show -no-color tfplan > /dev/null
+
+      - name: Terraform apply reviewed plan
         if: inputs.operation == 'apply'
         run: terraform apply -input=false -auto-approve tfplan
