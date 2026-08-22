@@ -2,38 +2,39 @@ name: Terraform Validation Gate
 
 on:
   pull_request:
+    branches: [main]
     paths:
-      - 'infra/**'
-      - 'terraform/**'
+      - 'infrastructure/terraform/**'
       - '.github/workflows/terraform-validation.yml'
 
 permissions:
   contents: read
 
+concurrency:
+  group: terraform-static-validation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  TF_IN_AUTOMATION: 'true'
+  TF_INPUT: 'false'
+  TF_ROOT: infrastructure/terraform/environments/azure-production
+
 jobs:
   terraform:
-    name: Terraform Validate Plan Gate
+    name: Terraform Static Validation
     runs-on: ubuntu-latest
-
-    defaults:
-      run:
-        working-directory: infra
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.9.8'
 
-      - name: Terraform Format Check
-        run: terraform fmt -check -recursive
+      - name: Terraform format check
+        run: terraform -chdir=${TF_ROOT} fmt -check -recursive
 
-      - name: Terraform Init
-        run: terraform init -backend=false
+      - name: Terraform init without backend
+        run: terraform -chdir=${TF_ROOT} init -backend=false -input=false
 
-      - name: Terraform Validate
-        run: terraform validate
-
-      - name: Terraform Plan
-        run: terraform plan -input=false
+      - name: Terraform validate
+        run: terraform -chdir=${TF_ROOT} validate

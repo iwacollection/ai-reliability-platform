@@ -1,0 +1,35 @@
+name: Agent Runtime Image
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'services/agent_runtime/**'
+      - 'packages/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.dockerignore'
+      - '.github/workflows/agent-runtime-image.yml'
+      - '.github/workflows/reusable-docker-build.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'services/agent_runtime/**'
+      - 'packages/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.dockerignore'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    uses: ./.github/workflows/reusable-docker-build.yml
+    with:
+      image_name: ai-reliability-agent-runtime
+      dockerfile: services/agent_runtime/Dockerfile
+      context: .
+      push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    secrets: inherit
