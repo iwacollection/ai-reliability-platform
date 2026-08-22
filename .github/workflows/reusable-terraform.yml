@@ -32,8 +32,8 @@ jobs:
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment != '' && inputs.environment || null }}
     concurrency:
-      group: terraform-${{ inputs.environment != '' && inputs.environment || 'default' }}-${{ inputs.operation }}
-      cancel-in-progress: ${{ inputs.operation == 'plan' }}
+      group: terraform-${{ inputs.environment != '' && inputs.environment || 'default' }}
+      cancel-in-progress: false
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
