@@ -1,0 +1,52 @@
+name: Container Build and Release
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'services/**'
+      - 'packages/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.dockerignore'
+      - '.github/workflows/container-release.yml'
+      - '.github/workflows/reusable-docker-build.yml'
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+    paths:
+      - 'services/**'
+      - 'packages/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.dockerignore'
+      - '.github/workflows/container-release.yml'
+      - '.github/workflows/reusable-docker-build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: ${{ matrix.service }} image
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: agent-runtime
+            dockerfile: services/agent_runtime/Dockerfile
+            image-name: ai-reliability-agent-runtime
+          - service: gateway
+            dockerfile: services/gateway/Dockerfile
+            image-name: ai-reliability-gateway
+    uses: ./.github/workflows/reusable-docker-build.yml
+    with:
+      context: .
+      dockerfile: ${{ matrix.dockerfile }}
+      image-name: ${{ matrix.image-name }}
+      push: ${{ github.event_name != 'pull_request' }}
