@@ -1,0 +1,33 @@
+name: Terraform Apply
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type APPLY to confirm the production change
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  confirm:
+    name: Confirm production apply
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate confirmation
+        run: |
+          if [ "${{ inputs.confirm }}" != "APPLY" ]; then
+            echo "Production apply requires confirm=APPLY"
+            exit 1
+          fi
+
+  azure-production-apply:
+    needs: confirm
+    uses: ./.github/workflows/reusable-terraform.yml
+    with:
+      working-directory: infrastructure/terraform/environments/azure-production
+      operation: apply
+      environment: production
