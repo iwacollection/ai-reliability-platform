@@ -1,0 +1,51 @@
+name: Enterprise Platform Release
+
+# Enterprise release flow:
+# 1. Build immutable container image
+# 2. Validate IaC
+# 3. Require GitHub Environment approval before production apply
+
+on:
+  workflow_dispatch:
+    inputs:
+      terraform_revision:
+        description: Exact commit SHA to apply after approval
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+jobs:
+  docker:
+    name: Build production images
+    uses: ./.github/workflows/reusable-docker-build.yml
+    with:
+      context: .
+      dockerfile: services/gateway/Dockerfile
+      image-name: ai-reliability-gateway
+      push: true
+
+  terraform-plan:
+    name: Terraform production plan
+    needs: docker
+    uses: ./.github/workflows/reusable-terraform.yml
+    with:
+      working-directory: infrastructure/terraform/environments/azure-production
+      operation: plan
+      checkout-ref: ${{ inputs.terraform_revision }}
+      plan-artifact-name: release-${{ inputs.terraform_revision }}
+
+  terraform-apply:
+    name: Approved production apply
+    needs: terraform-plan
+    uses: ./.github/workflows/reusable-terraform.yml
+    with:
+      working-directory: infrastructure/terraform/environments/azure-production
+      operation: apply
+      environment: production
+      checkout-ref: ${{ inputs.terraform_revision }}
+      plan-artifact-name: release-${{ inputs.terraform_revision }}
