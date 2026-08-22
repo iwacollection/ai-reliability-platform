@@ -8,11 +8,16 @@ on:
         required: true
         type: string
       operation:
-        description: Terraform operation to execute
+        description: Terraform operation to execute (plan or apply)
         required: true
         type: string
       environment:
         description: GitHub Environment name
+        required: false
+        default: ""
+        type: string
+      checkout-ref:
+        description: Git ref or commit SHA to validate/apply
         required: false
         default: ""
         type: string
@@ -31,8 +36,21 @@ jobs:
         working-directory: ${{ inputs.working-directory }}
 
     steps:
+      - name: Validate operation
+        shell: bash
+        run: |
+          case "${{ inputs.operation }}" in
+            plan|apply) ;;
+            *)
+              echo "Unsupported Terraform operation: ${{ inputs.operation }}"
+              exit 1
+              ;;
+          esac
+
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.checkout-ref != '' && inputs.checkout-ref || github.sha }}
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -56,7 +74,6 @@ jobs:
         run: terraform validate -no-color
 
       - name: Terraform plan
-        if: inputs.operation == 'plan'
         run: terraform plan -input=false -no-color -out=tfplan
 
       - name: Upload Terraform plan
@@ -67,12 +84,6 @@ jobs:
           path: ${{ inputs.working-directory }}/tfplan
           retention-days: 7
 
-      - name: Validate apply operation
-        if: inputs.operation != 'plan' && inputs.operation != 'apply'
-        run: |
-          echo "Unsupported Terraform operation: ${{ inputs.operation }}"
-          exit 1
-
-      - name: Terraform apply
+      - name: Terraform apply reviewed revision
         if: inputs.operation == 'apply'
-        run: terraform apply -input=false -auto-approve
+        run: terraform apply -input=false -auto-approve tfplan
