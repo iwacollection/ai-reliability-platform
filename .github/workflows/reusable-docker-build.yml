@@ -25,11 +25,15 @@ on:
 permissions:
   contents: read
   packages: write
+  id-token: write
+  attestations: write
 
 jobs:
   build:
     name: Build container image
     runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
 
     steps:
       - name: Checkout
@@ -57,6 +61,7 @@ jobs:
             type=ref,event=pr
 
       - name: Build and optionally push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: ${{ inputs.context }}
@@ -66,5 +71,13 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          provenance: true
+          provenance: mode=max
           sbom: true
+
+      - name: Attest pushed image provenance
+        if: inputs.push && steps.build.outputs.digest != ''
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
