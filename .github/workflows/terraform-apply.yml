@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       commit-sha:
-        description: Full commit SHA from main that was reviewed and merged
+        description: Full commit SHA from current main to plan and apply
         required: true
         type: string
       confirm:
-        description: Type APPLY to confirm the production change
+        description: Type APPLY to confirm production plan generation
         required: true
         type: string
 
@@ -18,10 +18,11 @@ permissions:
 
 jobs:
   confirm:
-    name: Confirm reviewed production revision
+    name: Confirm production revision
     runs-on: ubuntu-latest
     outputs:
       commit-sha: ${{ steps.guard.outputs.commit_sha }}
+      plan-artifact-name: ${{ steps.guard.outputs.plan_artifact_name }}
     steps:
       - name: Checkout main
         uses: actions/checkout@v5
@@ -34,7 +35,7 @@ jobs:
         shell: bash
         run: |
           if [ "${{ inputs.confirm }}" != "APPLY" ]; then
-            echo "Production apply requires confirm=APPLY"
+            echo "Production workflow requires confirm=APPLY"
             exit 1
           fi
 
@@ -52,12 +53,27 @@ jobs:
           fi
 
           echo "commit_sha=$requested" >> "$GITHUB_OUTPUT"
+          echo "plan_artifact_name=terraform-production-plan-$requested" >> "$GITHUB_OUTPUT"
 
-  azure-production-apply:
+  plan:
+    name: Generate production plan evidence
     needs: confirm
+    uses: ./.github/workflows/reusable-terraform.yml
+    with:
+      working-directory: infrastructure/terraform/environments/azure-production
+      operation: plan
+      checkout-ref: ${{ needs.confirm.outputs.commit-sha }}
+      plan-artifact-name: ${{ needs.confirm.outputs.plan-artifact-name }}
+
+  apply:
+    name: Apply approved production plan
+    needs:
+      - confirm
+      - plan
     uses: ./.github/workflows/reusable-terraform.yml
     with:
       working-directory: infrastructure/terraform/environments/azure-production
       operation: apply
       environment: production
       checkout-ref: ${{ needs.confirm.outputs.commit-sha }}
+      plan-artifact-name: ${{ needs.confirm.outputs.plan-artifact-name }}
