@@ -16,15 +16,17 @@ from services.gateway.app.api.traces import (
 )
 
 
+from services.gateway.app.api.incidents import (
+    router as incidents_router,
+)
+
 
 api_router = APIRouter()
-
 
 
 api_router.include_router(
     health_router,
 )
-
 
 
 api_router.include_router(
@@ -34,9 +36,15 @@ api_router.include_router(
 )
 
 
-
 api_router.include_router(
     traces_router,
     prefix="/observability",
     tags=["Observability"],
+)
+
+
+api_router.include_router(
+    incidents_router,
+    prefix="/api",
+    tags=["Incidents"],
 )
