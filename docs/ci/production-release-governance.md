@@ -2,58 +2,91 @@
 
 ## Scope
 
-This document defines the release controls for application containers and Azure Terraform changes.
+This document defines the repository-level release controls for application containers and Terraform-managed Azure infrastructure.
 
 ## Application containers
 
-- Pull requests build both `agent-runtime` and `gateway` images without pushing them.
-- Merges to `main` and version tags build and publish immutable SHA-tagged images to GHCR.
-- Docker builds use `uv.lock` with `uv sync --frozen --no-dev`.
+Pull requests build both `agent-runtime` and `gateway` images without publishing them. Pushes to `main`, version tags, and explicit manual runs may publish images to GHCR.
+
+The reusable Docker workflow must preserve these controls:
+
+- GHCR authentication uses `GITHUB_TOKEN`; no long-lived registry password is stored.
+- Docker Buildx and the GitHub Actions cache are used for repeatable CI performance.
+- SBOM generation is enabled.
+- Max-mode build provenance is enabled.
+- Published images receive GitHub build provenance attestations bound to the image digest.
+- Published image identity includes a commit-SHA-derived tag and immutable digest.
 - Runtime containers execute as a non-root user.
-- BuildKit cache, provenance and SBOM generation are enabled in the reusable Docker workflow.
+- Dependency installation uses the locked project state with `uv sync --frozen --no-dev`.
+
+Production deployment workflows should consume an immutable image digest instead of a mutable branch tag.
 
 ## Azure authentication
 
-Terraform workflows use GitHub Actions OIDC through `azure/login`.
+Terraform uses GitHub Actions OIDC federation through `azure/login`.
 
-Required GitHub Environment or repository variables:
+The GitHub Environments used by Terraform are expected to define:
 
 - `AZURE_CLIENT_ID`
 - `AZURE_TENANT_ID`
 - `AZURE_SUBSCRIPTION_ID`
 
-Long-lived Azure client secrets must not be stored for Terraform workflows.
+No Azure client secret should be required by the workflow.
 
-## Terraform plan
+## Terraform plan gate
 
-Pull requests that change `infrastructure/terraform/**` run Terraform formatting, initialization, validation and plan for the Azure production root.
+Terraform changes targeting production must first pass the pull-request plan workflow.
 
-The plan artifact is retained for review evidence.
+The plan workflow performs:
 
-## Terraform apply
+1. `terraform fmt -check -recursive`
+2. `terraform init -input=false`
+3. `terraform validate -no-color`
+4. `terraform plan -input=false -no-color -out=tfplan`
+5. `terraform show -no-color tfplan > tfplan.txt`
+6. upload of both the binary plan and human-readable plan as review evidence
 
-Production apply is manual and fail-closed:
+Plan evidence is retained for 14 days.
 
-1. The operator supplies the full 40-character commit SHA and `confirm=APPLY`.
-2. The workflow verifies that the SHA is the current `origin/main` revision.
-3. The production job enters the GitHub `production` Environment.
-4. Environment protection rules are expected to require human approval.
-5. Terraform checks out the exact approved revision.
-6. Terraform creates a plan and applies that exact `tfplan`, preventing plan/apply drift inside the job.
+## Terraform apply gate
 
-## Required repository configuration
+Production apply is intentionally separated from pull-request plan execution and fails closed.
+
+Apply requires all of the following:
+
+1. explicit `workflow_dispatch`
+2. the literal confirmation value `APPLY`
+3. a full 40-character commit SHA
+4. that SHA must equal current `origin/main`
+5. the reusable Terraform job must target the `production` GitHub Environment
+6. production Environment protection rules should require a human reviewer
+7. the exact approved revision is checked out before Terraform runs
+
+The apply job re-plans the exact reviewed `main` revision after approval and immediately applies that generated plan. This avoids applying a stale artifact whose provider state or remote infrastructure may have changed since PR review.
+
+## Concurrency
+
+Terraform operations targeting the same GitHub Environment are serialized with a shared concurrency group and `cancel-in-progress: false`.
+
+This prevents overlapping Plan/Apply operations from racing against the same remote state. Production changes must queue rather than cancel an in-flight infrastructure operation.
+
+## Required repository settings
 
 GitHub repository administrators should configure:
 
-- `production` Environment with required reviewers.
-- `production-plan` Environment for read-only Azure plan credentials if desired.
-- Azure federated identity credentials restricted to this repository and intended environment/ref conditions.
-- Branch protection on `main` with required CI, container build and Terraform plan checks.
+- branch protection on `main`
+- pull requests for changes to protected branches
+- required CI status checks
+- CODEOWNERS review for `.github/workflows/**` and `infrastructure/terraform/**`
+- a `production` Environment with required reviewers
+- a lower-privilege `production-plan` Environment for plan access
+- Azure federated credentials restricted to this repository and the intended GitHub Environment subjects
 
 ## Safety invariants
 
 - No production Terraform apply runs automatically on merge.
 - Production apply cannot target an arbitrary branch or stale SHA.
 - Terraform cloud access uses short-lived OIDC credentials.
-- Application PRs never push container images.
-- Release images are traceable to Git commit SHAs.
+- Application pull requests never push container images.
+- Release images are traceable to Git commit SHA and digest.
+- Missing OIDC variables, invalid revision input, failed Terraform validation, failed provenance attestation, or missing production approval stops the workflow.
