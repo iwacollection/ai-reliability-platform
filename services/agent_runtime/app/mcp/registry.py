@@ -1,65 +1,24 @@
-from services.agent_runtime.app.mcp.base import (
-    BaseMCPClient,
-)
+from dataclasses import dataclass
+from typing import Any, Callable
 
+
+@dataclass(frozen=True)
+class MCPToolSpec:
+    name: str
+    description: str
+    permission: str = "readonly"
+    handler: Callable[..., Any] | None = None
 
 
 class MCPRegistry:
-    """
-    Registry for MCP clients.
-    """
+    def __init__(self) -> None:
+        self._tools: dict[str, MCPToolSpec] = {}
 
+    def register(self, tool: MCPToolSpec) -> None:
+        self._tools[tool.name] = tool
 
-    def __init__(
-        self,
-    ) -> None:
+    def discover(self) -> list[MCPToolSpec]:
+        return list(self._tools.values())
 
-        self._clients: dict[str, BaseMCPClient] = {}
-
-
-
-    def register(
-        self,
-        client: BaseMCPClient,
-    ) -> None:
-
-        self._clients[
-            client.name
-        ] = client
-
-
-
-    def get(
-        self,
-        name: str,
-    ) -> BaseMCPClient:
-
-
-        if name not in self._clients:
-
-            raise KeyError(
-                f"MCP client '{name}' not found"
-            )
-
-
-        return self._clients[name]
-
-
-
-    def list_clients(
-        self,
-    ) -> list[BaseMCPClient]:
-
-        return list(
-            self._clients.values()
-        )
-
-
-
-    def names(
-        self,
-    ) -> list[str]:
-
-        return list(
-            self._clients.keys()
-        )
+    def get(self, name: str) -> MCPToolSpec | None:
+        return self._tools.get(name)
