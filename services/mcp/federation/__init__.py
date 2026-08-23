@@ -1,5 +1,5 @@
 """Enterprise MCP Federation runtime.
 
-Responsible for discovering MCP providers and routing tool calls
-across clusters and cloud environments.
+Phase 6.2.1 provides cluster registry, gateway routing and
+multi-environment MCP dispatch capabilities.
 """
