@@ -1,0 +1,22 @@
+scenario:
+  name: pod_oom_killed
+  category: kubernetes
+
+trigger:
+  alert:
+    name: ContainerOOMKilled
+
+expected_evidence:
+  - pod_status
+  - container_state
+  - kubernetes_event
+  - memory_signal
+
+expected_rca:
+  causes:
+    - container_memory_limit
+    - memory_leak
+
+verification:
+  conditions:
+    - restart_count_stable
