@@ -42,9 +42,18 @@ select = [
 [tool.pytest.ini_options]
 pythonpath = [
     ".",
-    "packages/common/src"
+    "packages/common/src",
+    "services"
 ]
-testpaths = ["tests"]
+testpaths = [
+    "services",
+    "tests"
+]
+norecursedirs = [
+    ".venv",
+    ".git",
+    "__pycache__"
+]
 
 [tool.mypy]
 python_version = "3.12"

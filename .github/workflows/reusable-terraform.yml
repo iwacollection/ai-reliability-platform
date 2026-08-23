@@ -1,0 +1,114 @@
+name: Reusable Terraform
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Terraform root module directory
+        required: true
+        type: string
+      operation:
+        description: Terraform operation to execute (plan or apply)
+        required: true
+        type: string
+      environment:
+        description: GitHub Environment name; use production only for the apply job
+        required: false
+        default: ""
+        type: string
+      checkout-ref:
+        description: Exact Git ref or commit SHA to validate/apply
+        required: true
+        type: string
+      plan-artifact-name:
+        description: Immutable Terraform plan artifact shared between plan and apply jobs
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  terraform:
+    name: Terraform ${{ inputs.operation }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment != '' && inputs.environment || null }}
+    concurrency:
+      group: terraform-${{ inputs.environment != '' && inputs.environment || 'validation' }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+
+    steps:
+      - name: Checkout reviewed revision
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.checkout-ref }}
+          fetch-depth: 0
+
+      - name: Validate operation
+        shell: bash
+        run: |
+          case "${{ inputs.operation }}" in
+            plan|apply) ;;
+            *)
+              echo "Unsupported Terraform operation: ${{ inputs.operation }}"
+              exit 1
+              ;;
+          esac
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.13.0
+          terraform_wrapper: false
+
+      - name: Azure login with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform format check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Terraform validate
+        run: terraform validate -no-color
+
+      - name: Terraform plan reviewed revision
+        if: inputs.operation == 'plan'
+        run: |
+          terraform plan -input=false -no-color -out=tfplan
+          terraform show -no-color tfplan > tfplan.txt
+
+      - name: Upload immutable Terraform plan evidence
+        if: inputs.operation == 'plan'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.plan-artifact-name }}
+          path: |
+            ${{ inputs.working-directory }}/tfplan
+            ${{ inputs.working-directory }}/tfplan.txt
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Download reviewed Terraform plan
+        if: inputs.operation == 'apply'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.plan-artifact-name }}
+          path: ${{ inputs.working-directory }}
+
+      - name: Verify reviewed Terraform plan is readable
+        if: inputs.operation == 'apply'
+        run: terraform show -no-color tfplan > /dev/null
+
+      - name: Terraform apply reviewed plan
+        if: inputs.operation == 'apply'
+        run: terraform apply -input=false -auto-approve tfplan

@@ -1,0 +1,11 @@
+# Default ownership
+* @iwacollection
+
+# Runtime and platform code
+/services/agent_runtime/ @iwacollection
+/services/gateway/ @iwacollection
+/packages/ @iwacollection
+
+# CI/CD and infrastructure require explicit ownership review
+/.github/workflows/ @iwacollection
+/infrastructure/terraform/ @iwacollection
