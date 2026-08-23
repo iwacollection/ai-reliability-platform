@@ -1,0 +1,42 @@
+{
+  "scenario": "payment-api-oom",
+  "service": "payment-api",
+  "signals": [
+    {
+      "type": "alert",
+      "name": "ContainerMemoryUsageHigh"
+    },
+    {
+      "type": "event",
+      "name": "OOMKilled"
+    }
+  ],
+  "evidence": {
+    "kubernetes": {
+      "restart_count": 8,
+      "reason": "OOMKilled"
+    },
+    "prometheus": {
+      "metric": "container_memory_usage_bytes",
+      "trend": "increasing"
+    },
+    "loki": {
+      "pattern": "out of memory"
+    }
+  },
+  "expected_rca": {
+    "cause": "memory_leak",
+    "confidence": 0.9
+  },
+  "remediation": {
+    "action": "restart_pod",
+    "requires_approval": true
+  },
+  "verification": {
+    "checks": [
+      "pod_ready",
+      "memory_recovered",
+      "error_rate_recovered"
+    ]
+  }
+}
