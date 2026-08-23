@@ -1,6 +1,6 @@
 """MCP Federation domain models.
 
-Defines MCP providers and their exposed capabilities.
+Defines MCP providers, cluster registration and environment topology.
 """
 
 from dataclasses import dataclass, field
@@ -18,13 +18,7 @@ class MCPCapability:
 
 @dataclass
 class MCPProvider:
-    """A registered MCP endpoint.
-
-    Example providers:
-    - Azure AKS MCP connector
-    - Kubernetes API MCP connector
-    - Prometheus/Loki evidence connector
-    """
+    """A registered MCP endpoint."""
 
     provider_id: str
     name: str
@@ -35,3 +29,25 @@ class MCPProvider:
 
     def supports(self, capability: str) -> bool:
         return any(item.name == capability for item in self.capabilities)
+
+
+@dataclass
+class ClusterRegistration:
+    """Registered runtime cluster in federation topology."""
+
+    cluster_id: str
+    name: str
+    provider: str
+    environment: str
+    region: str
+    endpoint: str | None = None
+    capabilities: List[str] = field(default_factory=list)
+    healthy: bool = True
+
+
+@dataclass
+class EnvironmentTopology:
+    """Environment to cluster mapping used by federation routing."""
+
+    environment: str
+    clusters: List[ClusterRegistration] = field(default_factory=list)
