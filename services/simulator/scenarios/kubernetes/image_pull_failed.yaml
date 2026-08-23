@@ -1,0 +1,21 @@
+scenario:
+  name: image_pull_failed
+  category: kubernetes
+
+trigger:
+  alert:
+    name: ImagePullBackOff
+
+expected_evidence:
+  - pod_status
+  - kubernetes_event
+  - image_reference
+
+expected_rca:
+  causes:
+    - image_not_found
+    - registry_auth_failure
+
+verification:
+  conditions:
+    - image_pull_success
