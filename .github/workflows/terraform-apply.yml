@@ -1,0 +1,126 @@
+name: Terraform Apply
+
+on:
+  workflow_dispatch:
+    inputs:
+      plan_run_id:
+        description: GitHub Actions run ID that produced the approved Terraform plan
+        required: true
+        type: string
+      expected_sha:
+        description: Commit SHA recorded by the approved plan
+        required: true
+        type: string
+      confirmation:
+        description: Type APPLY-AZURE-PRODUCTION to authorize the production change
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+
+concurrency:
+  group: terraform-apply-azure-production
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: 'true'
+  TF_INPUT: 'false'
+  TF_ROOT: infrastructure/terraform/environments/azure-production
+  ARM_USE_OIDC: 'true'
+  ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+jobs:
+  apply:
+    if: ${{ inputs.confirmation == 'APPLY-AZURE-PRODUCTION' }}
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Validate requested commit SHA
+        shell: bash
+        run: |
+          [[ "${{ inputs.expected_sha }}" =~ ^[0-9a-f]{40}$ ]] || {
+            echo 'expected_sha must be a full 40-character Git commit SHA'
+            exit 1
+          }
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.expected_sha }}
+
+      - name: Download approved Terraform plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan-azure-production
+          path: .
+          run-id: ${{ inputs.plan_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify plan provenance
+        shell: python
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          EXPECTED_RUN_ID: ${{ inputs.plan_run_id }}
+        run: |
+          import json
+          import os
+          from pathlib import Path
+
+          metadata_path = Path('terraform-plan-metadata.json')
+          if not metadata_path.exists():
+              raise SystemExit('terraform-plan-metadata.json is missing')
+
+          metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
+          expected_sha = os.environ['EXPECTED_SHA']
+          expected_run_id = os.environ['EXPECTED_RUN_ID']
+
+          if metadata.get('sha') != expected_sha:
+              raise SystemExit('Plan SHA does not match expected_sha')
+          if str(metadata.get('run_id')) != expected_run_id:
+              raise SystemExit('Plan run_id does not match plan_run_id')
+          if metadata.get('repository') != os.environ['GITHUB_REPOSITORY']:
+              raise SystemExit('Plan repository does not match current repository')
+          if metadata.get('terraform_root') != os.environ['TF_ROOT']:
+              raise SystemExit('Plan Terraform root does not match production root')
+
+          plan_path = Path(os.environ['TF_ROOT']) / 'tfplan'
+          if not plan_path.exists():
+              raise SystemExit(f'Approved plan file is missing: {plan_path}')
+
+      - name: Validate Azure OIDC configuration
+        shell: bash
+        run: |
+          test -n "${ARM_CLIENT_ID}" || { echo 'Missing repository variable AZURE_CLIENT_ID'; exit 1; }
+          test -n "${ARM_TENANT_ID}" || { echo 'Missing repository variable AZURE_TENANT_ID'; exit 1; }
+          test -n "${ARM_SUBSCRIPTION_ID}" || { echo 'Missing repository variable AZURE_SUBSCRIPTION_ID'; exit 1; }
+
+      - name: Azure login with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.9.8'
+
+      - name: Terraform init
+        run: terraform -chdir=${TF_ROOT} init -input=false
+
+      - name: Apply approved immutable plan
+        run: terraform -chdir=${TF_ROOT} apply -input=false -auto-approve tfplan
+
+      - name: Record deployment summary
+        if: always()
+        shell: bash
+        run: |
+          echo '## Terraform Apply — azure-production' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo "Plan run: \`${{ inputs.plan_run_id }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Commit: \`${{ inputs.expected_sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Environment: \`production\`" >> "$GITHUB_STEP_SUMMARY"
