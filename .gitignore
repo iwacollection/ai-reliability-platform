@@ -1,15 +1,37 @@
+# Python
 __pycache__/
-*.pyc
-
+*.py[cod]
+*.pyo
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
 
+# Virtual environments
 .venv/
+venv/
 
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Runtime-generated state
+/logs/
+/reports/
+/data/*.db
+/data/*.db-*
+/data/*.sqlite
+/data/*.sqlite-*
+/data/*.sqlite3
+/data/*.sqlite3-*
+*.bak
+*.log
+
+# Editors / OS
 .idea/
 .vscode/
-
 .DS_Store
-
-.env
+Thumbs.db

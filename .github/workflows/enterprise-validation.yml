@@ -10,6 +10,24 @@ permissions:
   contents: read
 
 jobs:
+  repository-hygiene:
+    name: Repository Hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Reject generated and archive files
+        shell: bash
+        run: |
+          set -euo pipefail
+          forbidden=$(git ls-files | grep -E '(^architecture_v2_archive/|^logs/|^reports/|^(-ContentType|-Method|-Uri)$|^data/.*\.(db|sqlite|sqlite3)(-wal|-shm)?$|\.bak$)' || true)
+          if [[ -n "$forbidden" ]]; then
+            echo "::error::Generated/archive files must not be tracked:"
+            printf '%s\n' "$forbidden"
+            exit 1
+          fi
+
   quality-gate:
     name: Quality Gate
     runs-on: ubuntu-latest
