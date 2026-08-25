@@ -48,7 +48,10 @@ class DiscoveryDetector:
             },
         )
 
-    def _evaluate_pod(self, observation: DiscoveryObservation) -> list[DiscoveryFinding]:
+    def _evaluate_pod(
+        self,
+        observation: DiscoveryObservation,
+    ) -> list[DiscoveryFinding]:
         signal = observation.signal
         findings: list[DiscoveryFinding] = []
         waiting_reason = str(signal.get("waiting_reason") or signal.get("reason") or "")
@@ -77,14 +80,20 @@ class DiscoveryDetector:
                     rule_id="k8s.pod.oomkilled",
                     severity="high",
                     title="Pod container was OOMKilled",
-                    summary="A container was terminated by the kernel because its memory limit was exceeded.",
+                    summary=(
+                        "A container was terminated by the kernel because its "
+                        "memory limit was exceeded."
+                    ),
                     score=0.95,
                 )
             )
 
         return findings
 
-    def _evaluate_event(self, observation: DiscoveryObservation) -> list[DiscoveryFinding]:
+    def _evaluate_event(
+        self,
+        observation: DiscoveryObservation,
+    ) -> list[DiscoveryFinding]:
         reason = str(observation.signal.get("reason") or "")
         if reason not in {"ImagePullBackOff", "ErrImagePull"}:
             return []
@@ -95,12 +104,18 @@ class DiscoveryDetector:
                 rule_id="k8s.image.pull_failure",
                 severity="high",
                 title="Container image pull is failing",
-                summary=f"Kubernetes reported {reason}; investigate image reference, registry reachability, and registry credentials.",
+                summary=(
+                    f"Kubernetes reported {reason}; investigate image reference, "
+                    "registry reachability, and registry credentials."
+                ),
                 score=0.93,
             )
         ]
 
-    def _evaluate_node(self, observation: DiscoveryObservation) -> list[DiscoveryFinding]:
+    def _evaluate_node(
+        self,
+        observation: DiscoveryObservation,
+    ) -> list[DiscoveryFinding]:
         signal = observation.signal
         pressure_names = ("MemoryPressure", "DiskPressure", "PIDPressure")
         active = [name for name in pressure_names if bool(signal.get(name))]
@@ -118,7 +133,10 @@ class DiscoveryDetector:
             )
         ]
 
-    def _evaluate_deployment(self, observation: DiscoveryObservation) -> list[DiscoveryFinding]:
+    def _evaluate_deployment(
+        self,
+        observation: DiscoveryObservation,
+    ) -> list[DiscoveryFinding]:
         signal = observation.signal
         desired = int(signal.get("desired_replicas") or 0)
         available = int(signal.get("available_replicas") or 0)
@@ -134,7 +152,10 @@ class DiscoveryDetector:
                 rule_id="k8s.deployment.replica_deficit",
                 severity=severity,
                 title="Deployment has unavailable replicas",
-                summary=f"Deployment desired_replicas={desired}, available_replicas={available}.",
+                summary=(
+                    f"Deployment desired_replicas={desired}, "
+                    f"available_replicas={available}."
+                ),
                 score=score,
             )
         ]
