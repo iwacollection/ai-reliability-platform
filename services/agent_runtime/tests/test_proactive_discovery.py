@@ -3,9 +3,11 @@ import asyncio
 from common.domain.event.enums import EventSource, ResourceKind
 from services.agent_runtime.app.discovery.detector import DiscoveryDetector
 from services.agent_runtime.app.discovery.event_bridge import finding_to_standard_event
+from services.agent_runtime.app.discovery.kubernetes_source import KubernetesDiscoverySource
 from services.agent_runtime.app.discovery.models import DiscoveryObservation
 from services.agent_runtime.app.discovery.runtime import ProactiveDiscoveryRuntime
 from services.agent_runtime.app.discovery.source import StaticDiscoverySource
+from services.connectors.kubernetes.client import KubernetesConnectorConfig
 
 
 def _observation(kind: str, signal: dict, *, name: str = "workload") -> DiscoveryObservation:
@@ -114,3 +116,43 @@ def test_promoted_finding_converts_to_standard_event() -> None:
     assert event.signal.labels["discovery"] == "proactive"
     assert event.resources[0].kind == ResourceKind.POD
     assert event.resources[0].name == "payments-0"
+
+
+def test_kubernetes_source_normalizes_readonly_connector_state() -> None:
+    class FakeConnector:
+        config = KubernetesConnectorConfig(context="dev-cluster", namespace="default")
+
+        def list_pods(self, namespace=None):
+            return [
+                {
+                    "metadata": {"name": "api-0", "namespace": "default"},
+                    "status": {
+                        "phase": "Running",
+                        "containerStatuses": [
+                            {
+                                "name": "api",
+                                "restartCount": 6,
+                                "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+                                "lastState": {"terminated": {"reason": "Error"}},
+                            }
+                        ],
+                    },
+                }
+            ]
+
+        def list_events(self, namespace=None):
+            return []
+
+        def list_nodes(self):
+            return []
+
+        def list_deployments(self, namespace=None):
+            return []
+
+    source = KubernetesDiscoverySource(FakeConnector())
+    observations = asyncio.run(source.collect())
+    findings = DiscoveryDetector().evaluate(observations[0])
+
+    assert observations[0].resource["cluster"] == "dev-cluster"
+    assert observations[0].signal["restart_count"] == 6
+    assert findings[0].rule_id == "k8s.pod.crashloop"
