@@ -6,7 +6,10 @@ from services.agent_runtime.app.discovery.models import (
     DiscoveryObservation,
 )
 from services.agent_runtime.app.discovery.runtime import ProactiveDiscoveryRuntime
-from services.agent_runtime.app.discovery.source import DiscoverySource, StaticDiscoverySource
+from services.agent_runtime.app.discovery.source import (
+    DiscoverySource,
+    StaticDiscoverySource,
+)
 
 __all__ = [
     "DiscoveryBatch",
