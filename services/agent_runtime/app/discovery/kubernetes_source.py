@@ -1,15 +1,32 @@
-from typing import Any
+from typing import Any, Protocol
 
 from services.agent_runtime.app.discovery.models import DiscoveryObservation
 from services.agent_runtime.app.discovery.source import DiscoverySource
-from services.connectors.kubernetes.client import KubernetesConnector
+from services.connectors.kubernetes.client import KubernetesConnectorConfig
 from services.connectors.kubernetes.evidence_adapter import KubernetesEvidenceAdapter
+
+
+class KubernetesDiscoveryConnector(Protocol):
+    """Read-only connector contract required by proactive discovery."""
+
+    config: KubernetesConnectorConfig
+
+    def list_pods(self, namespace: str | None = None) -> list[dict[str, Any]]: ...
+
+    def list_events(self, namespace: str | None = None) -> list[dict[str, Any]]: ...
+
+    def list_nodes(self) -> list[dict[str, Any]]: ...
+
+    def list_deployments(
+        self,
+        namespace: str | None = None,
+    ) -> list[dict[str, Any]]: ...
 
 
 class KubernetesDiscoverySource(DiscoverySource):
     """Collect read-only Kubernetes state for proactive discovery."""
 
-    def __init__(self, connector: KubernetesConnector):
+    def __init__(self, connector: KubernetesDiscoveryConnector):
         self.connector = connector
         self.adapter = KubernetesEvidenceAdapter()
 
@@ -48,7 +65,10 @@ class KubernetesDiscoverySource(DiscoverySource):
     def _pod_observation(self, pod: dict[str, Any]) -> DiscoveryObservation:
         evidence = self.adapter.pod_to_evidence(pod)
         containers = evidence.signal.get("containers", [])
-        restart_count = max((int(item.get("restartCount") or 0) for item in containers), default=0)
+        restart_count = max(
+            (int(item.get("restartCount") or 0) for item in containers),
+            default=0,
+        )
         waiting_reason = None
         last_termination_reason = None
 
@@ -103,7 +123,10 @@ class KubernetesDiscoverySource(DiscoverySource):
             signal={**active_conditions, "conditions": conditions},
         )
 
-    def _deployment_observation(self, deployment: dict[str, Any]) -> DiscoveryObservation:
+    def _deployment_observation(
+        self,
+        deployment: dict[str, Any],
+    ) -> DiscoveryObservation:
         evidence = self.adapter.deployment_to_evidence(deployment)
         return DiscoveryObservation(
             source="kubernetes",
