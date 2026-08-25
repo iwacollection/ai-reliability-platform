@@ -20,11 +20,14 @@ class KubernetesConnector:
 
     def get_pod(self, name: str, namespace: str | None = None) -> dict[str, Any]:
         """Read one pod. Real Kubernetes SDK wiring is injected at this boundary."""
+        resolved_namespace = namespace or self.config.namespace
         return {
             "kind": "Pod",
+            "name": name,
+            "namespace": resolved_namespace,
             "metadata": {
                 "name": name,
-                "namespace": namespace or self.config.namespace,
+                "namespace": resolved_namespace,
             },
             "mode": "readonly",
         }
