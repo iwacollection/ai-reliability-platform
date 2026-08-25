@@ -1,6 +1,3 @@
-#为什么这样写？
-#增加依赖：uv add httpx
-#开发依赖：开发依赖：
 [project]
 name = "ai-reliability-platform"
 version = "0.1.0"
@@ -33,18 +30,12 @@ line-length = 100
 target-version = "py312"
 
 [tool.ruff.lint]
-select = [
-    "E",
-    "F",
-    "I",
-]
+select = ["E", "F", "I"]
 
 [tool.pytest.ini_options]
-pythonpath = [
-    ".",
-    "packages/common/src"
-]
-testpaths = ["tests"]
+pythonpath = [".", "packages/common/src"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
 
 [tool.mypy]
 python_version = "3.12"
