@@ -1,4 +1,5 @@
 from services.agent_runtime.app.discovery.detector import DiscoveryDetector
+from services.agent_runtime.app.discovery.kubernetes_source import KubernetesDiscoverySource
 from services.agent_runtime.app.discovery.models import (
     DiscoveryBatch,
     DiscoveryFinding,
@@ -13,6 +14,7 @@ __all__ = [
     "DiscoveryFinding",
     "DiscoveryObservation",
     "DiscoverySource",
+    "KubernetesDiscoverySource",
     "ProactiveDiscoveryRuntime",
     "StaticDiscoverySource",
 ]
