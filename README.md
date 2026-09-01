@@ -193,10 +193,34 @@ because CPU pressure can have many causes: traffic growth, GC pressure, retry st
 
 ## 7. Documentation
 
-Start with the detailed design documents:
+### Architecture
 
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — overall architecture, lifecycle, reliability, security and production evolution.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — overall architecture, Incident lifecycle, module boundaries and production evolution.
 - [`docs/MODULES.md`](docs/MODULES.md) — module-by-module responsibilities, engineering problems and design trade-offs.
+
+### Agent Runtime
+
+- [`docs/AGENT_RUNTIME.md`](docs/AGENT_RUNTIME.md) — Agent Loop、主动发现问题、Evidence Gap、Harness、Context、Memory、Tool Registry、MCP、Retry、Fallback、Checkpoint、Idempotency、Approval、Multi-Agent 和 Verification。
+
+### Production Engineering
+
+- [`docs/PRODUCTION_DESIGN.md`](docs/PRODUCTION_DESIGN.md) — 生产可靠性、安全边界、权限、Prompt Injection、防重、并发、限流、降级、可观测性、灾备、SLO 和生产发布策略。
+
+阅读顺序建议：
+
+```text
+README
+  ↓
+ARCHITECTURE
+  ↓
+MODULES
+  ↓
+AGENT_RUNTIME
+  ↓
+PRODUCTION_DESIGN
+  ↓
+源码 + Tests + Scenario Replay
+```
 
 When adding a new major capability, update the relevant architecture documentation together with the implementation and tests.
 
