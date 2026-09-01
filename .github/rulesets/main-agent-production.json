@@ -8,32 +8,31 @@
       "exclude": []
     }
   },
-  "rules": {
-    "deletion": true,
-    "non_fast_forward": true,
-    "required_status_checks": {
-      "strict_required_status_checks_policy": true,
-      "required_status_checks": [
-        {
-          "context": "Agent Regression Gate",
-          "integration_id": null
-        },
-        {
-          "context": "Quality Gate",
-          "integration_id": null
-        },
-        {
-          "context": "Security Validation",
-          "integration_id": null
-        }
-      ]
+  "rules": [
+    {"type": "deletion"},
+    {"type": "non_fast_forward"},
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "strict_required_status_checks_policy": true,
+        "do_not_enforce_on_create": false,
+        "required_status_checks": [
+          {"context": "Agent Regression Gate", "integration_id": null},
+          {"context": "Quality Gate", "integration_id": null},
+          {"context": "Security Validation", "integration_id": null}
+        ]
+      }
     },
-    "pull_request": {
-      "required_approving_review_count": 1,
-      "dismiss_stale_reviews_on_push": true,
-      "require_code_owner_review": false,
-      "require_last_push_approval": true,
-      "required_review_thread_resolution": true
+    {
+      "type": "pull_request",
+      "parameters": {
+        "required_approving_review_count": 1,
+        "dismiss_stale_reviews_on_push": true,
+        "require_code_owner_review": false,
+        "require_last_push_approval": true,
+        "required_review_thread_resolution": true,
+        "required_reviewers": []
+      }
     }
-  }
+  ]
 }
