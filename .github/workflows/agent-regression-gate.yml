@@ -1,0 +1,44 @@
+name: Agent Regression Gate
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  agent-regression:
+    name: Agent Regression Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Policy fail-closed tests
+        run: uv run pytest services/agent_runtime/tests/test_policy_fail_closed.py -q
+
+      - name: Action fingerprint tests
+        run: uv run pytest services/agent_runtime/tests/test_action_fingerprint.py -q
+
+      - name: Connector contract tests
+        run: uv run pytest services/agent_runtime/tests/test_connectors_integration.py -q
+
+      - name: Action execution safety tests
+        run: uv run pytest services/agent_runtime/tests/test_action_execution_service.py services/agent_runtime/tests/test_action_runtime_execution_idempotency.py -q
+
+      - name: Existing production safety tests
+        run: uv run pytest services/agent_runtime/tests/test_action_runtime_kubernetes_production.py -q
